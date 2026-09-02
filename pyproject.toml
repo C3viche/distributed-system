@@ -10,7 +10,9 @@ requires-python = ">=3.13"
 dependencies = []
 
 [project.scripts]
-distributed-system = "distributed_system:main"
+distributed-system = "distributed_system:main" # we might not call this for milestone 1
+start-server = "distributed_system.server:main"
+start-client = "distributed_system.client:main"
 
 [build-system]
 requires = ["uv_build>=0.12.9,<0.13.0"]
