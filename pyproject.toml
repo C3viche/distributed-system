@@ -1,0 +1,17 @@
+[project]
+name = "distributed-system"
+version = "0.1.0"
+description = "A reliable distributed system with replication management, heartbeats, and local/global fault tolerance."
+readme = "README.md"
+authors = [
+    { name = "C3viche", email = "28328104+C3viche@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+distributed-system = "distributed_system:main"
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"

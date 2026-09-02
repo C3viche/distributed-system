@@ -1,0 +1,9 @@
+# Virtual Environment (Created by uv)
+# wildcard * exists in .venv .gitignore so technically this is optional, but just a little safety net
+.venv/
+
+# Python Cache Artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
