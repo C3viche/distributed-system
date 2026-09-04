@@ -7,11 +7,12 @@ authors = [
     { name = "C3viche", email = "28328104+C3viche@users.noreply.github.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "colored>=2.3.2",
+]
 
 [project.scripts]
 distributed-system = "distributed_system:main" # we might not call this for milestone 1
-start-server = "distributed_system.server:main"
 start-client = "distributed_system.client:main"
 
 [build-system]
