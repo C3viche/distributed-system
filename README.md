@@ -27,17 +27,17 @@ Configure default hosts and ports for nodes using environment variables. Create 
 
 ```python
 # Server Replicas
-S1_HOST=127.0.0.1
+S1_HOST="127.0.0.1"
 S1_PORT=8080
 
-S2_HOST=127.0.0.1
+S2_HOST="127.0.0.1"
 S2_PORT=8082
 
-S3_HOST=127.0.0.1
+S3_HOST="127.0.0.1"
 S3_PORT=8083
 
 # Local Fault Detectors
-LFD1_HOST=127.0.0.1
+LFD1_HOST="127.0.0.1"
 LFD1_PORT=8081
 ...
 ```
