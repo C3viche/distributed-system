@@ -6,7 +6,7 @@ No threads, timers, or randomness, it is deterministic per the guidelines
 
 
 To Run:
-    uv run server.py                # host/port from config.py
+    uv run server --id S1           # host/port from config.py
 """
 
 import argparse
@@ -17,9 +17,6 @@ from typing import cast
 
 from distributed_system.common import log, recv_json, send_json
 from distributed_system.config import get_address
-
-replica_id = "S1"
-my_state = 0
 
 class Server:
     def __init__(self, replica_id: str = "S1", port_override: int | None = None):
@@ -67,7 +64,6 @@ class Server:
 
 
     def handle_client(self, sock: socket.socket) -> None:
-        global my_state
         msg = self._read_or_none(sock)
         if msg is None:
             self._close_sock(sock, "client disconnected")
@@ -79,19 +75,19 @@ class Server:
         req = msg.get("request_num")
         payload = msg.get("payload", "")
     
-        log(f"Received <{client}, {replica_id}, {req}, {payload}>", kind="receive")
-        log(f"my_state = {my_state} before processing", kind="state")
-        my_state += 1
-        log(f"my_state = {my_state} after processing", kind="state")
+        log(f"Received <{client}, {self.replica_id}, {req}, {payload}>", kind="receive")
+        log(f"my_state = {self.state} before processing", kind="state")
+        self.state += 1
+        log(f"my_state = {self.state} after processing", kind="state")
     
         reply = {
             "type": "reply",
             "client_id": client,
-            "replica_id": replica_id,
+            "replica_id": self.replica_id,
             "request_num": req,
-            "state": my_state,
+            "state": self.state,
         }
-        log(f"Sending <{client}, {replica_id}, {req}, reply>", kind="send")
+        log(f"Sending <{client}, {self.replica_id}, {req}, reply>", kind="send")
         send_json(sock, reply)
 
 
@@ -116,7 +112,7 @@ class Server:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((self.host, self.port))
         listener.listen()
-        log(f"{replica_id} up, waiting for clients on {self.host}:{self.port}", kind="info")
+        log(f"{self.replica_id} up, waiting for clients on {self.host}:{self.port}", kind="info")
     
         lfd = self.connect_to_lfd()
     
