@@ -9,11 +9,13 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "colored>=2.3.2",
+    "dotenv>=0.9.9",
 ]
 
 [project.scripts]
 distributed-system = "distributed_system:main" # we might not call this for milestone 1
-start-client = "distributed_system.client:main"
+client = "distributed_system.client:main"
+server = "distributed_system.server.server:main"
 
 [build-system]
 requires = ["uv_build>=0.12.9,<0.13.0"]

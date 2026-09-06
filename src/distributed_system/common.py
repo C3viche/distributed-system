@@ -10,9 +10,12 @@ Wire format is one JSON object per line:
 """
 
 import json
-from datetime import datetime
-from colored import fg, attr
+import socket
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import cast
 
+from colored import attr, fg
 
 # Color used for each kind of console message.
 all_colors = {
@@ -26,7 +29,7 @@ all_colors = {
 }
 
 
-def send_json(sock, message):
+def send_json(sock: socket.socket, message: Mapping[str, object]) -> None:
     """
     Send one JSON message over a TCP socket.
 
@@ -37,7 +40,7 @@ def send_json(sock, message):
     sock.sendall(data.encode("utf-8"))
 
 
-def recv_json(sock):
+def recv_json(sock: socket.socket) -> dict[str, object] | None:
     """
     Receive one newline-delimited JSON message.
 
@@ -63,10 +66,9 @@ def recv_json(sock):
             break
         data.extend(chunk)
 
-    return json.loads(data.decode("utf-8"))
+    return cast(dict[str, object], json.loads(data.decode("utf-8")))
 
-
-def log(message, kind="info"):
+def log(message: str, kind: str = "info") -> None:
     """
     Print a timestamped, color-coded console message.
 
@@ -74,7 +76,7 @@ def log(message, kind="info"):
         log("Sent <C1,S1,1,request>", kind="send")
         -> [2026-09-03 20:45:30] Sent <C1,S1,1,request>
     """
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     color = all_colors.get(kind, all_colors["info"])
 
     style = attr("bold") if kind == "send" else ""
