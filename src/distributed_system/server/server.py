@@ -18,7 +18,6 @@ from typing import cast
 from distributed_system.common import log, recv_json, send_json
 from distributed_system.config import get_address
 
-sel = selectors.DefaultSelector()
 replica_id = "S1"
 my_state = 0
 
@@ -63,7 +62,7 @@ class Server:
         
         count = msg.get("count")
         log(f"{self.replica_id} got heartbeat [{count}] from LFD1", kind="heartbeat")
-        send_json(sock, {"type": "heartbeat_ack", "replica_id": self.replica_id, "count": str(count)})
+        send_json(sock, {"type": "heartbeat_ack", "replica_id": self.replica_id, "count": count})
         log(f"{self.replica_id} sent ack [{count}] back to LFD1", kind="heartbeat")
 
 
@@ -123,10 +122,10 @@ class Server:
     
         # tag each socket so the loop knows what it's looking at
         _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
-        _ = sel.register(lfd, selectors.EVENT_READ, "lfd")
+        _ = self.sel.register(lfd, selectors.EVENT_READ, "lfd")
     
         while True:
-            for key, _ in sel.select():
+            for key, _ in self.sel.select():
                 # Safely narrow key.fileobj to socket.socket
                 if not isinstance(key.fileobj, socket.socket):
                     continue
@@ -137,7 +136,7 @@ class Server:
                 if data == "listener":
                     conn, client_addr = cast(tuple[socket.socket, tuple[str, int]], listener.accept())
 
-                    _ = sel.register(conn, selectors.EVENT_READ, "client")
+                    _ = self.sel.register(conn, selectors.EVENT_READ, "client")
                     log(f"new client connection from {client_addr[0]}:{client_addr[1]}", kind="info")                
                 
                 elif data == "lfd":

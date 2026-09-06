@@ -1,7 +1,8 @@
 """Milestone 1 local fault detector for S1.
 
-Run: python lfd.py --heartbeat_freq 3 --timeout 2
-heartbeat_freq is the interval between heartbeat starts, in seconds.
+Run from the repository root:
+    uv run python -m distributed_system.lfd.lfd --id LFD1 --freq 2
+Frequency is measured in heartbeats per second (Hz).
 """
 
 import argparse
@@ -10,11 +11,11 @@ import math
 import socket
 import time
 
-from common import log, recv_json, send_json
-from config import get_address
+from distributed_system.common import log, recv_json, send_json
+from distributed_system.config import get_address
 
 
-def positive_seconds(value):
+def positive_number(value):
     value = float(value)
     if not math.isfinite(value) or value <= 0:
         raise argparse.ArgumentTypeError("must be a positive finite number")
@@ -59,8 +60,9 @@ def monitor(server, interval, timeout, counts):
         time.sleep(max(0, interval - elapsed))
 
 
-def run(interval, timeout):
-    host, port = get_address("LFD1")
+def run(frequency, timeout, lfd_id="LFD1"):
+    interval = 1.0 / frequency
+    host, port = get_address(lfd_id)
     # Keep numbering across registrations for the lifetime of this LFD.
     counts = itertools.count(1)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -88,18 +90,27 @@ def run(interval, timeout):
                     log(f"LFD1 connection error: {exc}", kind="failure")
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--heartbeat_freq", type=positive_seconds, required=True,
-        help="seconds between heartbeats",
+        "--id", choices=["LFD1"], default="LFD1",
+        help="local fault detector ID (Milestone 1 supports LFD1)",
     )
     parser.add_argument(
-        "--timeout", type=positive_seconds, default=2.0,
+        "--freq", "--heartbeat_freq", dest="frequency",
+        type=positive_number, required=True,
+        help="heartbeats per second (Hz); 2 means one every 0.5 seconds",
+    )
+    parser.add_argument(
+        "--timeout", type=positive_number, default=2.0,
         help="socket timeout in seconds (default: 2)",
     )
     args = parser.parse_args()
     try:
-        run(args.heartbeat_freq, args.timeout)
+        run(args.frequency, args.timeout, args.id)
     except KeyboardInterrupt:
         log("LFD1 shutting down", kind="info")
+
+
+if __name__ == "__main__":
+    main()
