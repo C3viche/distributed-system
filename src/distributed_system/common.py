@@ -68,6 +68,49 @@ def recv_json(sock: socket.socket) -> dict[str, object] | None:
 
     return cast(dict[str, object], json.loads(data.decode("utf-8")))
 
+
+class BufferedJsonConnection:
+    """JSON-line buffers for one nonblocking socket; the caller owns scheduling.
+
+    Call receive/flush on read/write readiness. BlockingIOError and parsing
+    errors propagate to the caller. Existing blocking helpers remain separate.
+    """
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.sock.setblocking(False)
+        self._incoming = bytearray()
+        self._outgoing = bytearray()
+
+    def receive(self) -> list[dict[str, object]] | None:
+        """Return complete messages, [] for a partial line, or None on EOF."""
+        chunk = self.sock.recv(4096)
+        if not chunk:
+            return None
+        self._incoming.extend(chunk)
+        messages = []
+        while b"\n" in self._incoming:
+            line, _, remainder = self._incoming.partition(b"\n")
+            self._incoming[:] = remainder
+            messages.append(cast(dict[str, object], json.loads(line.decode("utf-8"))))
+        return messages
+
+    def queue(self, message: Mapping[str, object]) -> None:
+        self._outgoing.extend((json.dumps(message) + "\n").encode("utf-8"))
+
+    @property
+    def has_pending_output(self) -> bool:
+        return bool(self._outgoing)
+
+    def flush(self) -> None:
+        """Attempt one send, retaining any bytes the socket cannot accept yet."""
+        if not self._outgoing:
+            return
+        sent = self.sock.send(self._outgoing)
+        if sent == 0:
+            raise ConnectionError("connection closed while sending")
+        del self._outgoing[:sent]
+
 def log(message: str, kind: str = "info") -> None:
     """
     Print a timestamped, color-coded console message.
