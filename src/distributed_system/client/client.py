@@ -1,6 +1,7 @@
 import socket
 
-from distributed_system.config import BUFFER_SIZE, ENCODING
+BUFFER_SIZE = 1024
+ENCODING = "utf-8"
 
 
 class SocketClient:

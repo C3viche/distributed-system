@@ -52,6 +52,10 @@ Run each command in a separate terminal tab/window:
 uv run python -m distributed_system.lfd.lfd --id LFD1 --freq 2
 ```
 
+`--freq` is in heartbeats per second (Hz): `2` targets a 0.5-second interval.
+`--timeout` is in seconds (default: `2`). Heartbeat ACKs echo the numeric count
+unchanged. S1 and LFD1 both read `LFD1_HOST` and `LFD1_PORT` from shared configuration.
+
 ### 2. Launch Server Replica (`S1`)
 
 ```bash
@@ -78,7 +82,7 @@ uv run client --id C3
 All network communication uses newline-delimited JSON payloads over TCP (\n framing)
 
 ```json
-JSON{"type": "request", "client_id": "C1", "replica_id": "S1", "request_num": 1, "payload": "Hello"}
+{"type": "request", "client_id": "C1", "replica_id": "S1", "request_num": 1, "payload": "Hello"}
 ```
 
 ### Protocol Tuple Specification
