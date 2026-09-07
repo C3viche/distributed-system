@@ -38,3 +38,27 @@ def get_address(process_id: str) -> tuple[str, int]:
 
     config = PROCESS_CONFIG[process_id]
     return str(config["host"]), int(config["port"])
+
+
+def resolve_address(
+    process_id: str,
+    host_override: str | None = None,
+    port_override: int | None = None,
+) -> tuple[str, int]:
+    """Return (host, port) with layered precedence.
+
+    Order (highest wins):
+        1. Explicit override args (typically from CLI flags)
+        2. Environment variables (S1_HOST/S1_PORT, LFD1_HOST/LFD1_PORT, ...)
+        3. Config defaults from ``PROCESS_CONFIG``
+
+    Env vars are already folded into ``PROCESS_CONFIG`` at import time
+    (including anything loaded from a local ``.env`` file), so callers
+    only need to think about their explicit overrides.
+    """
+    host, port = get_address(process_id)
+    if host_override is not None:
+        host = host_override
+    if port_override is not None:
+        port = int(port_override)
+    return host, port
