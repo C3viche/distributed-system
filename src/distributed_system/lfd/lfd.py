@@ -1,7 +1,7 @@
 """Milestone 1 local fault detector for S1.
 
 Run from the repository root:
-    uv run python -m distributed_system.lfd.lfd --id LFD1 --freq 2
+    uv run lfd --id LFD1 --freq 2
 Frequency is measured in heartbeats per second (Hz).
 """
 
