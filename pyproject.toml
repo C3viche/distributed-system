@@ -16,6 +16,7 @@ dependencies = [
 distributed-system = "distributed_system:main" # we might not call this for milestone 1
 client = "distributed_system.client:main"
 server = "distributed_system.server.server:main"
+lfd = "distributed_system.lfd.lfd:main"
 
 [build-system]
 requires = ["uv_build>=0.12.9,<0.13.0"]
