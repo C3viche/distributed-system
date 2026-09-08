@@ -16,7 +16,7 @@ import selectors
 import socket
 from typing import cast
 
-from distributed_system.common import BufferedJsonConnection, log
+from distributed_system.common import BufferedJsonConnection, log, log_block
 from distributed_system.config import get_address
 
 class Server:
@@ -60,7 +60,11 @@ class Server:
         self._lfd_warned = False
         self._register(s, "lfd")
         self._send_json(s, {"type": "registration", "replica_id": self.replica_id})
-        log(f"{self.replica_id} registered with LFD1", kind="registration")
+        log_block(
+            f"{self.replica_id} registered with LFD1",
+            [f"LFD1 at {lfd_host}:{lfd_port}"],
+            kind="registration",
+        )
 
 
     def handle_lfd(self, sock: socket.socket, msg: dict[str, object]) -> None:
@@ -115,7 +119,10 @@ class Server:
     def _read_messages(self, sock: socket.socket, kind: str) -> None:
         messages = self._connections[sock].receive()
         if messages is None:
-            self._close_sock(sock, "lost connection to LFD1" if kind == "lfd" else "client disconnected")
+            if kind == "lfd":
+                self._close_sock(sock, "lost connection to LFD1", log_kind="failure")
+            else:
+                self._close_sock(sock, "client disconnected", log_kind="info")
             return
         for msg in messages:
             if kind == "lfd":
@@ -123,14 +130,16 @@ class Server:
             else:
                 self.handle_client(sock, msg)
 
-    def _close_sock(self, sock: socket.socket, why: str):
+    def _close_sock(self, sock: socket.socket, why: str, log_kind: str = "failure"):
         # have to unregister or select() keeps waking up on the dead socket
         _ = self.sel.unregister(sock)
         self._connections.pop(sock, None)
         sock.close()
+        details = [f"my_state = {self.state}"]
         if sock is self._lfd:
             self._lfd = None  # serve loop will try to re-register
-        log(why, kind="failure")
+            details = ["retrying registration every second"]
+        log_block(why, details, kind=log_kind)
     
     
     def serve(self):
@@ -161,7 +170,10 @@ class Server:
                     conn, client_addr = cast(tuple[socket.socket, tuple[str, int]], listener.accept())
 
                     self._register(conn, "client")
-                    log(f"new client connection from {client_addr[0]}:{client_addr[1]}", kind="info")                
+                    log_block(
+                        "new client connection",
+                        [f"from {client_addr[0]}:{client_addr[1]}", f"my_state = {self.state}"],
+                    )
                 
                 else:
                     try:

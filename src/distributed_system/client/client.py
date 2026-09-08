@@ -14,7 +14,7 @@ No coordination between C1/C2/C3. Each holds its own request_num.
 import socket
 import time
 
-from distributed_system.common import log, recv_json, send_json
+from distributed_system.common import log, log_block, recv_json, send_json
 
 
 REPLICA_ID = "S1"
@@ -48,16 +48,16 @@ class Client:
         try:
             sock = socket.create_connection((self.server_host, self.server_port))
         except OSError as exc:
-            log(
-                f"{self.client_id} could not connect to {REPLICA_ID} at "
-                f"{self.server_host}:{self.server_port}: {exc}",
+            log_block(
+                f"{self.client_id} could not connect to {REPLICA_ID}",
+                [f"{self.server_host}:{self.server_port}", str(exc)],
                 kind="failure",
             )
             return
 
-        log(
-            f"{self.client_id} connected to {REPLICA_ID} at "
-            f"{self.server_host}:{self.server_port}",
+        log_block(
+            f"{self.client_id} connected to {REPLICA_ID}",
+            [f"{self.server_host}:{self.server_port}"],
             kind="registration",
         )
 
@@ -116,9 +116,9 @@ class Client:
             return False
 
         if reply is None:
-            log(
-                f"{REPLICA_ID} closed connection before replying to "
-                f"request {self.request_num}",
+            log_block(
+                f"{REPLICA_ID} closed connection",
+                [f"before replying to request {self.request_num}"],
                 kind="failure",
             )
             return False

@@ -12,7 +12,7 @@ import socket
 import time
 from typing import cast
 
-from distributed_system.common import log, recv_json, send_json
+from distributed_system.common import log, log_block, recv_json, send_json
 from distributed_system.config import get_address
 
 
@@ -74,8 +74,12 @@ class LocalFaultDetector:
                     f"[{heartbeat_count}] {self.lfd_id} receives heartbeat from {self.replica_id}",
                     kind="heartbeat",
                 )
-            except (OSError, ConnectionError):
-                log(f"{self.replica_id} has died", kind="failure")
+            except (OSError, ConnectionError) as exc:
+                log_block(
+                    f"{self.replica_id} has died",
+                    [f"heartbeat [{heartbeat_count}] failed: {exc}"],
+                    kind="failure",
+                )
                 return
 
             elapsed = time.monotonic() - started
@@ -91,7 +95,7 @@ class LocalFaultDetector:
 
             # Receive heartbeat acks from server until it stops or fails
             while True:
-                server, _ = cast(tuple[socket.socket, tuple[str, int]], listener.accept()) # connects with server
+                server, addr = cast(tuple[socket.socket, tuple[str, int]], listener.accept()) # connects with server
                 with server:
                     server.settimeout(self.timeout)
                     try:
@@ -103,7 +107,11 @@ class LocalFaultDetector:
                         ):
                             log("Invalid server registration", kind="failure")
                             continue
-                        log(f"{self.replica_id} registered with {self.lfd_id}", kind="registration")
+                        log_block(
+                            f"{self.replica_id} registered with {self.lfd_id}",
+                            [f"from {addr[0]}:{addr[1]}", f"heartbeat every {self.interval:g}s"],
+                            kind="registration",
+                        )
                         self.monitor(server)
                     except (OSError, ConnectionError, ValueError) as exc:
                         log(f"{self.lfd_id} connection error: {exc}", kind="failure")
