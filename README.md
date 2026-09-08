@@ -49,12 +49,16 @@ Run each command in a separate terminal tab/window:
 ### 1. Launch Local Fault Detector (`LFD1`)
 
 ```bash
-uv run python -m distributed_system.lfd.lfd --id LFD1 --freq 2
+uv run lfd --id LFD1 --freq 2
 ```
 
 `--freq` is in heartbeats per second (Hz): `2` targets a 0.5-second interval.
 `--timeout` is in seconds (default: `2`). Heartbeat ACKs echo the numeric count
 unchanged. S1 and LFD1 both read `LFD1_HOST` and `LFD1_PORT` from shared configuration.
+
+For M1, LFD1 monitors S1. `--replica-id S1` makes that assignment explicit
+(S1 is the default). S1 connects to the LFD to register; the LFD uses that
+connection for heartbeats and checks registrations and ACKs against its assigned replica ID.
 
 ### 2. Launch Server Replica (`S1`)
 
