@@ -17,7 +17,7 @@ import time
 from distributed_system.common import log, recv_json, send_json
 
 
-SERVER_ID = "S1"
+REPLICA_ID = "S1"
 
 
 class Client:
@@ -49,14 +49,14 @@ class Client:
             sock = socket.create_connection((self.server_host, self.server_port))
         except OSError as exc:
             log(
-                f"{self.client_id} could not connect to {SERVER_ID} at "
+                f"{self.client_id} could not connect to {REPLICA_ID} at "
                 f"{self.server_host}:{self.server_port}: {exc}",
                 kind="failure",
             )
             return
 
         log(
-            f"{self.client_id} connected to {SERVER_ID} at "
+            f"{self.client_id} connected to {REPLICA_ID} at "
             f"{self.server_host}:{self.server_port}",
             kind="registration",
         )
@@ -92,14 +92,14 @@ class Client:
         request = {
             "type": "request",
             "client_id": self.client_id,
-            "server_id": SERVER_ID,
+            "replica_id": REPLICA_ID,
             "request_num": self.request_num,
             "payload": payload,
         }
 
         # ---- send ----
         log(
-            f"Sent <{self.client_id}, {SERVER_ID}, {self.request_num}, {payload}>",
+            f"Sent <{self.client_id}, {REPLICA_ID}, {self.request_num}, {payload}>",
             kind="send",
         )
         try:
@@ -117,7 +117,7 @@ class Client:
 
         if reply is None:
             log(
-                f"{SERVER_ID} closed connection before replying to "
+                f"{REPLICA_ID} closed connection before replying to "
                 f"request {self.request_num}",
                 kind="failure",
             )
@@ -133,7 +133,7 @@ class Client:
 
         state = reply.get("state")
         log(
-            f"Received <{self.client_id}, {SERVER_ID}, "
+            f"Received <{self.client_id}, {REPLICA_ID}, "
             f"{self.request_num}, reply, state={state}>",
             kind="receive",
         )
@@ -144,5 +144,6 @@ class Client:
         return (
             reply.get("type") == "reply"
             and reply.get("client_id") == self.client_id
+            and reply.get("replica_id") == REPLICA_ID
             and reply.get("request_num") == self.request_num
         )
