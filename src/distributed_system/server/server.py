@@ -1,7 +1,9 @@
 """S1 server process for Milestone 1 18-749.
 
-On startup the server registers with the LFD
-Then serves client requests and answers LFD heartbeats in a loop.
+The server starts serving clients immediately. Registration with the LFD
+is non-blocking: if the LFD is not up yet the select loop wakes once a
+second and retries, and it re-registers if the LFD connection drops.
+Client requests and LFD heartbeats are handled in the same select loop.
 No threads, timers, or randomness, it is deterministic per the guidelines
 
 
@@ -12,10 +14,9 @@ To Run:
 import argparse
 import selectors
 import socket
-import time
 from typing import cast
 
-from distributed_system.common import BufferedJsonConnection, log, send_json
+from distributed_system.common import BufferedJsonConnection, log
 from distributed_system.config import get_address
 
 class Server:
@@ -34,20 +35,32 @@ class Server:
         if port_override:
             self.port: int = port_override
 
-    def connect_to_lfd(self) -> socket.socket:
-        # Connect outward to LFD1 as a client
+        # Outbound connection to LFD1; None while we have no LFD.
+        self._lfd: socket.socket | None = None
+        self._lfd_warned: bool = False
+
+    def try_connect_to_lfd(self) -> None:
+        """Attempt one registration with LFD1; never blocks the serve loop.
+
+        On failure the socket stays None and the serve loop retries on its
+        next tick. On success the socket joins the selector so heartbeats
+        are handled alongside client traffic.
+        """
         lfd_host, lfd_port = get_address("LFD1")
-        while True:
-            try:
-                s = socket.create_connection((lfd_host, lfd_port))
-                break
-            except OSError:
-                log(f"{self.replica_id}: no LFD at {lfd_host}:{lfd_port} yet, retrying", kind="info")
-                time.sleep(1)
-                
-        send_json(s, {"type": "registration", "replica_id": self.replica_id})
+        try:
+            # Short timeout bounds the TCP handshake if the LFD host is unreachable.
+            s = socket.create_connection((lfd_host, lfd_port), timeout=1.0)
+        except OSError:
+            if not self._lfd_warned:
+                log(f"{self.replica_id}: no LFD at {lfd_host}:{lfd_port} yet, retrying every second", kind="info")
+                self._lfd_warned = True
+            return
+
+        self._lfd = s
+        self._lfd_warned = False
+        self._register(s, "lfd")
+        self._send_json(s, {"type": "registration", "replica_id": self.replica_id})
         log(f"{self.replica_id} registered with LFD1", kind="registration")
-        return s
 
 
     def handle_lfd(self, sock: socket.socket, msg: dict[str, object]) -> None:
@@ -115,6 +128,8 @@ class Server:
         _ = self.sel.unregister(sock)
         self._connections.pop(sock, None)
         sock.close()
+        if sock is self._lfd:
+            self._lfd = None  # serve loop will try to re-register
         log(why, kind="failure")
     
     
@@ -126,14 +141,15 @@ class Server:
         listener.listen()
         log(f"{self.replica_id} up, waiting for clients on {self.host}:{self.port}", kind="info")
     
-        lfd = self.connect_to_lfd()
-    
         # tag each socket so the loop knows what it's looking at
         _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
-        self._register(lfd, "lfd")
     
         while True:
-            for key, events in self.sel.select():
+            if self._lfd is None:
+                self.try_connect_to_lfd()
+            # With no LFD, wake every second to retry; otherwise block until I/O.
+            timeout = None if self._lfd is not None else 1.0
+            for key, events in self.sel.select(timeout=timeout):
                 # Safely narrow key.fileobj to socket.socket
                 if not isinstance(key.fileobj, socket.socket):
                     continue
