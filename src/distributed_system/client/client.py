@@ -15,10 +15,7 @@ import socket
 import time
 
 from distributed_system.common import log, recv_json, send_json
-
-
-REPLICA_ID = "S1"
-
+from distributed_system.config import get_address, resolve_address
 
 class Client:
     """One independent client process (C1, C2, or C3)."""
@@ -31,33 +28,34 @@ class Client:
         interval: float = 1.0,
         count: int | None = None,
         payload_template: str = "hello from {client_id} #{request_num}",
-    ):
-        self.client_id = client_id
-        self.server_host = server_host
-        self.server_port = server_port
-        self.interval = interval
-        self.count = count  # None -> loop until Ctrl-C / server closes
-        self.payload_template = payload_template
-        self.request_num = 1
+    ) -> None:
+        """Initialize the client configuration and state."""
+        self.client_id: str = client_id
+        self.server_host: str = server_host
+        self.server_port: int = server_port
+        self.interval: float = interval
+        self.count: int | None = count  # None -> loop until Ctrl-C / server closes
+        self.payload_template: str = payload_template
+        self.request_num: int = 1
 
-    # ------------------------------------------------------------------
     # Public entry point
-    # ------------------------------------------------------------------
     def run(self) -> None:
+        """Connect to the server replica and start the request/reply loop.
+
+        Handles network exceptions and graceful shutdown on KeyboardInterrupt.
+        """
         log(f"{self.client_id} starting", kind="info")
         try:
             sock = socket.create_connection((self.server_host, self.server_port))
         except OSError as exc:
             log(
-                f"{self.client_id} could not connect to {REPLICA_ID} at "
-                f"{self.server_host}:{self.server_port}: {exc}",
+                f"{self.client_id} could not connect to {REPLICA_ID} at {self.server_host}:{self.server_port}: {exc}",
                 kind="failure",
             )
             return
 
         log(
-            f"{self.client_id} connected to {REPLICA_ID} at "
-            f"{self.server_host}:{self.server_port}",
+            f"{self.client_id} connected to {REPLICA_ID} at {self.server_host}:{self.server_port}",
             kind="registration",
         )
 
@@ -71,10 +69,9 @@ class Client:
             except OSError:
                 pass
 
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
+    # Internal functions
     def _loop(self, sock: socket.socket) -> None:
+        """Execute the continuous request loop over the active socket connection."""
         sent = 0
         while self.count is None or sent < self.count:
             if not self._send_and_await_reply(sock):
@@ -85,6 +82,11 @@ class Client:
                 time.sleep(self.interval)
 
     def _send_and_await_reply(self, sock: socket.socket) -> bool:
+        """Construct, send a JSON request payload, and wait for the matching reply.
+
+        Returns:
+            bool: True if a valid matching reply was received, False on error or disconnect.
+        """
         payload = self.payload_template.format(
             client_id=self.client_id,
             request_num=self.request_num,
@@ -97,7 +99,7 @@ class Client:
             "payload": payload,
         }
 
-        # ---- send ----
+        # Send the message to a replica
         log(
             f"Sent <{self.client_id}, {REPLICA_ID}, {self.request_num}, {payload}>",
             kind="send",
@@ -108,7 +110,7 @@ class Client:
             log(f"{self.client_id} send failed: {exc}", kind="failure")
             return False
 
-        # ---- receive ----
+        # Receive the reply packet
         try:
             reply = recv_json(sock)
         except (OSError, ConnectionError, ValueError) as exc:
@@ -117,30 +119,28 @@ class Client:
 
         if reply is None:
             log(
-                f"{REPLICA_ID} closed connection before replying to "
-                f"request {self.request_num}",
+                f"{REPLICA_ID} closed connection before replying to request {self.request_num}",
                 kind="failure",
             )
             return False
 
         if not self._reply_matches(reply):
             log(
-                f"{self.client_id} got unexpected reply "
-                f"(want request_num={self.request_num}): {reply}",
+                f"{self.client_id} got unexpected reply (want request_num={self.request_num}): {reply}",
                 kind="failure",
             )
             return False
 
         state = reply.get("state")
         log(
-            f"Received <{self.client_id}, {REPLICA_ID}, "
-            f"{self.request_num}, reply, state={state}>",
+            f"Received <{self.client_id}, {REPLICA_ID}, {self.request_num}, reply, state={state}>",
             kind="receive",
         )
         self.request_num += 1
         return True
 
-    def _reply_matches(self, reply: dict) -> bool:
+    def _reply_matches(self, reply: dict[str, object]) -> bool:
+        """Validate that the response header matches the expected request metadata."""
         return (
             reply.get("type") == "reply"
             and reply.get("client_id") == self.client_id
