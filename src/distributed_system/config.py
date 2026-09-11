@@ -7,6 +7,8 @@ Public API:
 
 # Network Settings
 import os
+import re
+from typing import cast
 
 from dotenv import load_dotenv
 
@@ -52,6 +54,19 @@ PROCESS_CONFIG = {
         "port": int(os.getenv("RM_PORT", "9002")),
     },
 }
+
+# Get all the server addresses from PROCESS_CONFIG and return as new dict
+def get_server_addresses() -> dict[str, tuple[str, int]]:
+    """Return a mapping of all server replica IDs to their (host, port) tuples."""
+    servers: dict[str, tuple[str, int]] = {}
+    for proc_id, cfg in PROCESS_CONFIG.items():
+        # Matches 'S' followed by one or more digits (e.g., S1, S2, S3)
+        if re.match(r"^S\d+$", proc_id):
+            host = cast(str, cfg["host"])
+            port = cast(int, cfg["port"])
+            servers[proc_id] = (host, port)
+            
+    return servers
 
 # Helper function to get the address info. Will make dynamic later
 def get_address(process_id: str) -> tuple[str, int]:
