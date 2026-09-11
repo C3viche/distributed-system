@@ -115,7 +115,7 @@ class Client:
         for replica_id, sock in socks.items():
             _ = sel.register(sock, selectors.EVENT_READ, data=replica_id)
 
-        received_any = False
+        received_first_reply = False
         try:
             # Wait up to 2.0 seconds for responses to arrive on registered sockets
             events = sel.select(timeout=3.0)
@@ -128,15 +128,19 @@ class Client:
                     continue
 
                 state = reply.get("state")
-                log(
-                    f"Received <{self.client_id}, {replica_id}, {self.request_num}, reply, state={state}>",
-                    kind="receive",
-                )
-                received_any = True
+
+                if not received_first_reply:
+                    # First reply triggers success for this request_num!
+                    state = reply.get("state")
+                    log(f"Received <{self.client_id}, {replica_id}, {self.request_num}, reply, state={state}>", kind="receive")
+                    received_first_reply = True
+                else:
+                    # Remaining responses are flagged and logged as duplicate replies
+                    log(f"request_num {self.request_num}: Discarded duplicate reply from {replica_id}", kind="info")
         finally:
             sel.close()
 
-        if received_any:
+        if received_first_reply:
             self.request_num += 1
             return True
 
