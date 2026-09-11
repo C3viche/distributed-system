@@ -1,15 +1,14 @@
-"""Host and port lookup for Milestone 1 processes.
+"""Host and port lookup for processes.
 
 Public API:
     get_address(process_id) -> (host, port)
-
-Clients C1/C2/C3 are not listed: they only connect out to S1.
-Change the S1 host here when moving off localhost onto the
-non-sacred machine; callers keep using get_address("S1").
+    resolve_address(process_id, host_override, port_override) -> (host, port)
 """
 
 # Network Settings
 import os
+import re
+from typing import cast
 
 from dotenv import load_dotenv
 
@@ -18,15 +17,56 @@ _ = load_dotenv()
 
 # Build the configuration using env vars, with sensible local fallbacks
 PROCESS_CONFIG = {
+    # Server Replicas
     "S1": {
         "host": os.getenv("S1_HOST", "127.0.0.1"),
         "port": int(os.getenv("S1_PORT", "8080")),
     },
+    "S2": {
+        "host": os.getenv("S2_HOST", "127.0.0.1"),
+        "port": int(os.getenv("S2_PORT", "8082")),
+    },
+    "S3": {
+        "host": os.getenv("S3_HOST", "127.0.0.1"),
+        "port": int(os.getenv("S3_PORT", "8083")),
+    },
+    # Local Fault Detectors
     "LFD1": {
         "host": os.getenv("LFD1_HOST", "127.0.0.1"),
         "port": int(os.getenv("LFD1_PORT", "8081")),
     },
+    "LFD2": {
+        "host": os.getenv("LFD2_HOST", "127.0.0.1"),
+        "port": int(os.getenv("LFD2_PORT", "8084")),
+    },
+    "LFD3": {
+        "host": os.getenv("LFD3_HOST", "127.0.0.1"),
+        "port": int(os.getenv("LFD3_PORT", "8085")),
+    },
+
+    # Infrastructure
+    "GFD": {
+        "host": os.getenv("GFD_HOST", "127.0.0.1"),
+        "port": int(os.getenv("GFD_PORT", "9001")),
+    },
+    "RM": {
+        "host": os.getenv("RM_HOST", "127.0.0.1"),
+        "port": int(os.getenv("RM_PORT", "9002")),
+    },
 }
+
+# Get all the server addresses from PROCESS_CONFIG and return as new dict
+def get_server_addresses() -> dict[str, tuple[str, int]]:
+    """Return a mapping of all server replica IDs to their (host, port) tuples."""
+    servers: dict[str, tuple[str, int]] = {}
+    for proc_id, cfg in PROCESS_CONFIG.items():
+        # Matches 'S' followed by one or more digits (e.g., S1, S2, S3)
+        if re.match(r"^S\d+$", proc_id):
+            host = cast(str, cfg["host"])
+            port = cast(int, cfg["port"])
+            servers[proc_id] = (host, port)
+            
+    return servers
 
 # Helper function to get the address info. Will make dynamic later
 def get_address(process_id: str) -> tuple[str, int]:
@@ -39,23 +79,14 @@ def get_address(process_id: str) -> tuple[str, int]:
     config = PROCESS_CONFIG[process_id]
     return str(config["host"]), int(config["port"])
 
-
+# Resolves the address with CLI overrides
 def resolve_address(
     process_id: str,
     host_override: str | None = None,
     port_override: int | None = None,
 ) -> tuple[str, int]:
-    """Return (host, port) with layered precedence.
+    """Return (host, port) with CLI overrides taking precedence over environment values."""
 
-    Order (highest wins):
-        1. Explicit override args (typically from CLI flags)
-        2. Environment variables (S1_HOST/S1_PORT, LFD1_HOST/LFD1_PORT, ...)
-        3. Config defaults from ``PROCESS_CONFIG``
-
-    Env vars are already folded into ``PROCESS_CONFIG`` at import time
-    (including anything loaded from a local ``.env`` file), so callers
-    only need to think about their explicit overrides.
-    """
     host, port = get_address(process_id)
     if host_override is not None:
         host = host_override
