@@ -17,9 +17,7 @@ import argparse
 from distributed_system.client.client import Client
 from distributed_system.config import resolve_address
 
-
-CLIENT_CHOICES = ("C1", "C2", "C3")
-
+# CLIENT_CHOICES = ("C1", "C2", "C3")
 
 def _positive_float(value: str) -> float:
     f = float(value)
