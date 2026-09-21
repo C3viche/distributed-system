@@ -26,13 +26,15 @@ class Client:
     def __init__(
         self,
         client_id: str,
+        num_replicas: int | None,
         interval: float = 1.0,
         count: int | None = None,
         payload_template: str = "hello from {client_id} #{request_num}",
     ) -> None:
         """Initialize the client configuration and state."""
         self.client_id: str = client_id
-        self.replicas: dict[str, tuple[str, int]] = get_server_addresses()
+        self.num_replicas: int | None = num_replicas
+        self.replicas: dict[str, tuple[str, int]] = get_server_addresses(num_replicas)
         self.interval: float = interval
         self.count: int | None = count  # None -> loop until Ctrl-C / server closes
         self.payload_template: str = payload_template
@@ -63,6 +65,7 @@ class Client:
 
         try:
             self._loop(socks)
+            print("done looping")
         except KeyboardInterrupt:
             log(f"{self.client_id} shutting down", kind="info")
         finally:
@@ -90,57 +93,70 @@ class Client:
         Returns:
             bool: True if a valid matching reply was received, False on error or disconnect.
         """
+        TTL = 3.0
+
         payload = self.payload_template.format(
             client_id=self.client_id,
             request_num=self.request_num,
         )
+        request = {
+            "type": "request",
+            "client_id": self.client_id,
+            "request_num": self.request_num,
+            "payload": payload,
+        }
 
-        # Broadcast request to all replica sockets
-        for replica_id, sock in socks.items():
-            request = {
-                "type": "request",
-                "client_id": self.client_id,
-                "replica_id": replica_id,
-                "request_num": self.request_num,
-                "payload": payload,
-            }
+        # Broadcast request to all replica sockets (Using list() allows safely popping failed sockets in-place)
+        for replica_id, sock in list(socks.items()):
+            request["replica_id"] = replica_id
             log(f"Sent <{self.client_id}, {replica_id}, {self.request_num}, {payload}>", kind="send")
             try:
                 send_json(sock, request)
             except OSError as exc:
                 log(f"{self.client_id} send to {replica_id} failed: {exc}", kind="failure")
 
-        # Use Selector to collect replies non-blockingly across open sockets
+        if not socks:
+            return False
+
+        # Register sockets with selector to collect replies non-blockingly across open sockets
         sel = selectors.DefaultSelector()
         for replica_id, sock in socks.items():
             _ = sel.register(sock, selectors.EVENT_READ, data=replica_id)
 
-        received_first_reply = False
+        success = False
+        deadline = time.time() + TTL
+
         try:
-            # Wait up to 2.0 seconds for responses to arrive on registered sockets
-            events = sel.select(timeout=3.0)
-            for key, _ in events:
-                sock = cast(socket.socket, key.fileobj)
-                replica_id = cast(str, key.data)
+            # Loop while we still have sockets registered AND time remaining on the clock
 
-                reply = recv_json(sock)
-                if reply is None or not self._reply_matches(reply, replica_id):
-                    continue
+                for key, _ in sel.select(timeout=timeout):
+                    sock = cast(socket.socket, key.fileobj)
+                    replica_id = cast(str, key.data)
 
-                state = reply.get("state")
+                    _ = sel.unregister(sock) # Unregister immediately so we only read once per cycle
 
-                if not received_first_reply:
-                    # First reply triggers success for this request_num!
+                    # Attempt collecting the reply
+                    try:
+                        reply = recv_json(sock)
+                    except (OSError, ConnectionError, ValueError):
+                        continue
+
+                    # Filter out malformed, disconnected, or stale replies
+                    if reply is None or not self._reply_matches(reply, replica_id):
+                        continue
+
+                    # Process first valid reply
                     state = reply.get("state")
-                    log(f"Received <{self.client_id}, {replica_id}, {self.request_num}, reply, state={state}>", kind="receive")
-                    received_first_reply = True
-                else:
-                    # Remaining responses are flagged and logged as duplicate replies
-                    log(f"request_num {self.request_num}: Discarded duplicate reply from {replica_id}", kind="info")
+
+                    if not success:
+                        log(f"Received <{self.client_id}, {replica_id}, {self.request_num}, reply, state={state}>", kind="receive")
+                        success = True
+                    # else:
+                        # log(f"request_num {self.request_num}: Discarded duplicate reply from {replica_id}", kind="info")
         finally:
             sel.close()
 
-        if received_first_reply:
+        if success:
             self.request_num += 1
             return True
 
