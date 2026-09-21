@@ -128,7 +128,7 @@ class Client:
 
         try:
             # Loop while we still have sockets registered AND time remaining on the clock
-
+            while sel.get_map() and (timeout := deadline - time.time() > 0):
                 for key, _ in sel.select(timeout=timeout):
                     sock = cast(socket.socket, key.fileobj)
                     replica_id = cast(str, key.data)
@@ -146,9 +146,9 @@ class Client:
                         continue
 
                     # Process first valid reply
-                    state = reply.get("state")
 
                     if not success:
+                        state = reply.get("state")
                         log(f"Received <{self.client_id}, {replica_id}, {self.request_num}, reply, state={state}>", kind="receive")
                         success = True
                     # else:
