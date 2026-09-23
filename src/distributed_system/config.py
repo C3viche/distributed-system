@@ -7,7 +7,6 @@ Public API:
 
 # Network Settings
 import os
-import re
 from typing import cast
 
 from dotenv import load_dotenv
@@ -15,9 +14,8 @@ from dotenv import load_dotenv
 # Load variables from .env file if it exists locally
 _ = load_dotenv()
 
-# Build the configuration using env vars, with sensible local fallbacks
-PROCESS_CONFIG = {
-    # Server Replicas
+# Dedicated mappings for each service component
+SERVERS: dict[str, dict[str, str | int]] = {
     "S1": {
         "host": os.getenv("S1_HOST", "127.0.0.1"),
         "port": int(os.getenv("S1_PORT", "8080")),
@@ -30,7 +28,9 @@ PROCESS_CONFIG = {
         "host": os.getenv("S3_HOST", "127.0.0.1"),
         "port": int(os.getenv("S3_PORT", "8083")),
     },
-    # Local Fault Detectors
+}
+
+LFDS: dict[str, dict[str, str | int]] = {
     "LFD1": {
         "host": os.getenv("LFD1_HOST", "127.0.0.1"),
         "port": int(os.getenv("LFD1_PORT", "8081")),
@@ -43,8 +43,9 @@ PROCESS_CONFIG = {
         "host": os.getenv("LFD3_HOST", "127.0.0.1"),
         "port": int(os.getenv("LFD3_PORT", "8085")),
     },
+}
 
-    # Infrastructure
+INFRASTRUCTURE: dict[str, dict[str, str | int]] = {
     "GFD": {
         "host": os.getenv("GFD_HOST", "127.0.0.1"),
         "port": int(os.getenv("GFD_PORT", "9001")),
@@ -55,18 +56,19 @@ PROCESS_CONFIG = {
     },
 }
 
+# Unified single lookup dictionary
+PROCESS_CONFIG = {**SERVERS, **LFDS, **INFRASTRUCTURE}
+
 # Get all the server addresses from PROCESS_CONFIG and return as new dict
-def get_server_addresses() -> dict[str, tuple[str, int]]:
-    """Return a mapping of all server replica IDs to their (host, port) tuples."""
-    servers: dict[str, tuple[str, int]] = {}
-    for proc_id, cfg in PROCESS_CONFIG.items():
-        # Matches 'S' followed by one or more digits (e.g., S1, S2, S3)
-        if re.match(r"^S\d+$", proc_id):
-            host = cast(str, cfg["host"])
-            port = cast(int, cfg["port"])
-            servers[proc_id] = (host, port)
-            
-    return servers
+def get_server_addresses(num: int | None = None) -> dict[str, tuple[str, int]]:
+    """Return a mapping of server replica IDs to their (host, port) tuples up to `num`."""
+    # Convert SERVERS.items() into a list and slice the first `num` elements
+    server_items = list(SERVERS.items())[:num] if num is not None else SERVERS.items()
+
+    return {
+        proc_id: (cast(str, cfg["host"]), cast(int, cfg["port"]))
+        for proc_id, cfg in server_items
+    }
 
 # Helper function to get the address info. Will make dynamic later
 def get_address(process_id: str) -> tuple[str, int]:

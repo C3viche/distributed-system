@@ -11,13 +11,13 @@ Console format matches server/LFD conventions in ``common.log``:
 No coordination between C1/C2/C3. Each holds its own request_num.
 """
 
+import selectors
 import socket
 import time
+from typing import cast
 
 from distributed_system.common import log, recv_json, send_json
-
-
-REPLICA_ID = "S1"
+from distributed_system.config import get_server_addresses
 
 
 class Client:
@@ -26,65 +26,75 @@ class Client:
     def __init__(
         self,
         client_id: str,
-        server_host: str,
-        server_port: int,
+        num_replicas: int | None,
         interval: float = 1.0,
         count: int | None = None,
         payload_template: str = "hello from {client_id} #{request_num}",
-    ):
-        self.client_id = client_id
-        self.server_host = server_host
-        self.server_port = server_port
-        self.interval = interval
-        self.count = count  # None -> loop until Ctrl-C / server closes
-        self.payload_template = payload_template
-        self.request_num = 1
+    ) -> None:
+        """Initialize the client configuration and state."""
+        self.client_id: str = client_id
+        self.num_replicas: int | None = num_replicas
+        self.replicas: dict[str, tuple[str, int]] = get_server_addresses(num_replicas)
+        self.interval: float = interval
+        self.count: int | None = count  # None -> loop until Ctrl-C / server closes
+        self.payload_template: str = payload_template
+        self.request_num: int = 1
 
-    # ------------------------------------------------------------------
     # Public entry point
-    # ------------------------------------------------------------------
     def run(self) -> None:
+        """Connect to the server replica and start the request/reply loop.
+
+        Handles network exceptions and graceful shutdown on KeyboardInterrupt.
+        """
         log(f"{self.client_id} starting", kind="info")
-        try:
-            sock = socket.create_connection((self.server_host, self.server_port))
-        except OSError as exc:
-            log(
-                f"{self.client_id} could not connect to {REPLICA_ID} at "
-                f"{self.server_host}:{self.server_port}: {exc}",
-                kind="failure",
-            )
+
+        # Open sockets to all replicas
+        socks: dict[str, socket.socket] = {}
+        for replica_id, (host, port) in self.replicas.items():
+            try:
+                sock = socket.create_connection((host, port))
+                log(f"{self.client_id} connected to {replica_id} at {host}:{port}", kind="registration")
+                socks[replica_id] = sock
+            except OSError as exc:
+                log(f"{self.client_id} could not connect to {replica_id} at {host}:{port}: {exc}", kind="failure")
+                return
+
+        if not socks: # Check if any were connected to
+            log(f"{self.client_id} could not connect to any server replicas", kind="failure")
             return
 
-        log(
-            f"{self.client_id} connected to {REPLICA_ID} at "
-            f"{self.server_host}:{self.server_port}",
-            kind="registration",
-        )
-
         try:
-            self._loop(sock)
+            self._loop(socks)
+            print("done looping")
         except KeyboardInterrupt:
             log(f"{self.client_id} shutting down", kind="info")
         finally:
-            try:
-                sock.close()
-            except OSError:
-                pass
+            for s in socks.values():
+                try:
+                    s.close()
+                except OSError:
+                    pass
 
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-    def _loop(self, sock: socket.socket) -> None:
+    # Internal functions
+    def _loop(self, socks: dict[str, socket.socket]) -> None:
+        """Execute the continuous request loop over the active socket connection."""
         sent = 0
         while self.count is None or sent < self.count:
-            if not self._send_and_await_reply(sock):
+            if not self._send_and_await_reply(socks):
                 return
             sent += 1
             # Skip the sleep after the final send so --count exits promptly.
             if self.count is None or sent < self.count:
                 time.sleep(self.interval)
 
-    def _send_and_await_reply(self, sock: socket.socket) -> bool:
+    def _send_and_await_reply(self, socks: dict[str, socket.socket]) -> bool:
+        """Construct, send a JSON request payload, and wait for the matching reply.
+
+        Returns:
+            bool: True if a valid matching reply was received, False on error or disconnect.
+        """
+        TTL = 3.0
+
         payload = self.payload_template.format(
             client_id=self.client_id,
             request_num=self.request_num,
@@ -92,58 +102,71 @@ class Client:
         request = {
             "type": "request",
             "client_id": self.client_id,
-            "replica_id": REPLICA_ID,
             "request_num": self.request_num,
             "payload": payload,
         }
 
-        # ---- send ----
-        log(
-            f"Sent <{self.client_id}, {REPLICA_ID}, {self.request_num}, {payload}>",
-            kind="send",
-        )
+        # Broadcast request to all replica sockets (Using list() allows safely popping failed sockets in-place)
+        for replica_id, sock in list(socks.items()):
+            request["replica_id"] = replica_id
+            log(f"Sent <{self.client_id}, {replica_id}, {self.request_num}, {payload}>", kind="send")
+            try:
+                send_json(sock, request)
+            except OSError as exc:
+                log(f"{self.client_id} send to {replica_id} failed: {exc}", kind="failure")
+
+        if not socks:
+            return False
+
+        # Register sockets with selector to collect replies non-blockingly across open sockets
+        sel = selectors.DefaultSelector()
+        for replica_id, sock in socks.items():
+            _ = sel.register(sock, selectors.EVENT_READ, data=replica_id)
+
+        success = False
+        deadline = time.time() + TTL
+
         try:
-            send_json(sock, request)
-        except OSError as exc:
-            log(f"{self.client_id} send failed: {exc}", kind="failure")
-            return False
+            # Loop while we still have sockets registered AND time remaining on the clock
+            while sel.get_map() and (timeout := deadline - time.time() > 0):
+                for key, _ in sel.select(timeout=timeout):
+                    sock = cast(socket.socket, key.fileobj)
+                    replica_id = cast(str, key.data)
 
-        # ---- receive ----
-        try:
-            reply = recv_json(sock)
-        except (OSError, ConnectionError, ValueError) as exc:
-            log(f"{self.client_id} recv failed: {exc}", kind="failure")
-            return False
+                    _ = sel.unregister(sock) # Unregister immediately so we only read once per cycle
 
-        if reply is None:
-            log(
-                f"{REPLICA_ID} closed connection before replying to "
-                f"request {self.request_num}",
-                kind="failure",
-            )
-            return False
+                    # Attempt collecting the reply
+                    try:
+                        reply = recv_json(sock)
+                    except (OSError, ConnectionError, ValueError):
+                        continue
 
-        if not self._reply_matches(reply):
-            log(
-                f"{self.client_id} got unexpected reply "
-                f"(want request_num={self.request_num}): {reply}",
-                kind="failure",
-            )
-            return False
+                    # Filter out malformed, disconnected, or stale replies
+                    if reply is None or not self._reply_matches(reply, replica_id):
+                        continue
 
-        state = reply.get("state")
-        log(
-            f"Received <{self.client_id}, {REPLICA_ID}, "
-            f"{self.request_num}, reply, state={state}>",
-            kind="receive",
-        )
-        self.request_num += 1
-        return True
+                    # Process first valid reply
 
-    def _reply_matches(self, reply: dict) -> bool:
+                    if not success:
+                        state = reply.get("state")
+                        log(f"Received <{self.client_id}, {replica_id}, {self.request_num}, reply, state={state}>", kind="receive")
+                        success = True
+                    # else:
+                        # log(f"request_num {self.request_num}: Discarded duplicate reply from {replica_id}", kind="info")
+        finally:
+            sel.close()
+
+        if success:
+            self.request_num += 1
+            return True
+
+        return False
+
+    def _reply_matches(self, reply: dict[str, object], expected_replica_id: str) -> bool:
+        """Validate that the response header matches the expected request metadata."""
         return (
             reply.get("type") == "reply"
             and reply.get("client_id") == self.client_id
-            and reply.get("replica_id") == REPLICA_ID
+            and reply.get("replica_id") == expected_replica_id
             and reply.get("request_num") == self.request_num
         )
