@@ -20,7 +20,7 @@ import time
 from typing import cast
 
 from distributed_system.common import BufferedJsonConnection, heartbeat, log
-from distributed_system.config import resolve_address
+from distributed_system.config import REPLICA_LFDS, resolve_address
 
 
 def positive_number(value: str) -> float:
@@ -35,9 +35,10 @@ def positive_number(value: str) -> float:
 
 
 def replica_id_for_lfd(lfd_id: str) -> str:
-    """Inverse of Sonia's lfd_id_for: LFD1→S1, LFD2→S2, LFD3→S3."""
-    if lfd_id.startswith("LFD") and lfd_id[3:].isdigit():
-        return f"S{lfd_id[3:]}"
+    """Use the same assignment as the server and LFD."""
+    for replica, assigned_lfd in REPLICA_LFDS.items():
+        if assigned_lfd == lfd_id:
+            return replica
     raise ValueError(f"No replica mapping for LFD id: {lfd_id}")
 
 
@@ -130,68 +131,57 @@ class GlobalFaultDetector:
         if not isinstance(lfd_id, str) or not lfd_id:
             log("Invalid register_lfd (missing lfd_id)", kind="failure")
             return
+        replica_id_for_lfd(lfd_id)  # Reject unconfigured LFD identities.
+        if session.lfd_id is not None and session.lfd_id != lfd_id:
+            raise ValueError("Cannot change the identity of a registered LFD")
         self._drop_existing(lfd_id, session.sock)
         session.lfd_id = lfd_id
         session.awaiting_ack = False
         session.next_due = time.monotonic()
         log(f"{lfd_id} registered with GFD", kind="registration")
 
+    def _owned_replica(self, session: LFDSession, msg: dict[str, object]) -> str:
+        if session.lfd_id is None:
+            raise ValueError("LFD must register before reporting membership")
+        replica_id = replica_id_for_lfd(session.lfd_id)
+        if (msg.get("lfd_id", session.lfd_id) != session.lfd_id
+            or msg.get("replica_id", replica_id) != replica_id):
+            raise ValueError("Membership message does not match the registered LFD")
+        return replica_id
+
     def _handle_add(self, session: LFDSession, msg: dict[str, object]) -> None:
-        lfd_id = msg.get("lfd_id") if isinstance(msg.get("lfd_id"), str) else session.lfd_id
-        replica_id = msg.get("replica_id")
-        if not isinstance(replica_id, str) or not replica_id:
-            if isinstance(lfd_id, str):
-                try:
-                    replica_id = replica_id_for_lfd(lfd_id)
-                except ValueError:
-                    log("Invalid add_replica (missing replica_id)", kind="failure")
-                    return
-            else:
-                log("Invalid add_replica (missing replica_id)", kind="failure")
-                return
-        if isinstance(lfd_id, str) and session.lfd_id is None:
-            session.lfd_id = lfd_id
-        lfd_label = session.lfd_id or "LFD?"
-        host = msg.get("host")
-        port = msg.get("port")
-        extra = f" at {host}:{port}" if host is not None and port is not None else ""
-        _ = self._add_replica(replica_id)
+        replica_id = self._owned_replica(session, msg)
         session.replica_id = replica_id
-        log(f"{lfd_label}: add replica {replica_id}{extra}", kind="membership")
-        self._print_membership()
+        if self._add_replica(replica_id):
+            log(f"{session.lfd_id}: add replica {replica_id}", kind="membership")
+            self._print_membership()
 
     def _handle_delete(self, session: LFDSession, msg: dict[str, object]) -> None:
-        lfd_id = msg.get("lfd_id") if isinstance(msg.get("lfd_id"), str) else session.lfd_id
-        replica_id = msg.get("replica_id")
-        if not isinstance(replica_id, str) or not replica_id:
-            replica_id = session.replica_id
-        if not isinstance(replica_id, str) or not replica_id:
-            log("Invalid delete_replica (missing replica_id)", kind="failure")
-            return
-        lfd_label = lfd_id if isinstance(lfd_id, str) else (session.lfd_id or "LFD?")
-        log(f"{lfd_label}: delete replica {replica_id}", kind="membership")
-        _ = self._delete_replica(replica_id)
-        if session.replica_id == replica_id:
-            session.replica_id = None
-        self._print_membership()
+        replica_id = self._owned_replica(session, msg)
+        session.replica_id = None
+        if self._delete_replica(replica_id):
+            log(f"{session.lfd_id}: delete replica {replica_id}", kind="membership")
+            self._print_membership()
 
     def _handle_ack(self, session: LFDSession, msg: dict[str, object]) -> None:
         if session.lfd_id is None or not session.awaiting_ack:
             return
-        if msg.get("count") != session.last_count:
+        if (msg.get("from") != session.lfd_id or msg.get("to") != "GFD"
+            or type(msg.get("count")) is not int or msg.get("count") != session.last_count):
             log(
                 f"Invalid heartbeat ACK from {session.lfd_id} (count {msg.get('count')})",
                 kind="failure",
             )
             return
         session.awaiting_ack = False
-        session.next_due = time.monotonic() + self.interval
         log(
             f"[{session.last_count}] GFD receives heartbeat from {session.lfd_id}",
             kind="heartbeat",
         )
 
     def _handle_message(self, session: LFDSession, msg: dict[str, object]) -> None:
+        if not isinstance(msg, dict):
+            raise ValueError("Expected a JSON object")
         kind = msg.get("type")
         if kind == "register_lfd":
             self._handle_register(session, msg)
@@ -211,6 +201,7 @@ class GlobalFaultDetector:
         session.last_count = count
         session.awaiting_ack = True
         session.ack_deadline = now + self.timeout
+        session.next_due = now + self.interval
         log(f"[{count}] GFD sending heartbeat to {session.lfd_id}", kind="heartbeat")
         self._send_json(session, heartbeat("GFD", session.lfd_id, count))
 
@@ -226,7 +217,7 @@ class GlobalFaultDetector:
             if now >= session.next_due:
                 try:
                     self._send_heartbeat(session, now)
-                except OSError as exc:
+                except (OSError, ValueError) as exc:
                     self._close_session(sock, f"{session.lfd_id} send failed: {exc}")
 
     def _select_timeout(self) -> float | None:
@@ -273,10 +264,10 @@ class GlobalFaultDetector:
     def serve(self) -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Bind all interfaces so LFDs on other machines can reach the sacred host.
-        listener.bind(("0.0.0.0", self.port))
+        listener.bind((self.host, self.port))
         listener.listen()
-        log(f"GFD listening on 0.0.0.0:{self.port} (config host {self.host})", kind="info")
+        listener.setblocking(False)
+        log(f"GFD listening on {self.host}:{self.port}", kind="info")
         self._print_membership()
         _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
 
@@ -298,7 +289,7 @@ class GlobalFaultDetector:
                         self._write_pending(sock)
                 except BlockingIOError:
                     pass
-                except OSError as exc:
+                except (OSError, ValueError) as exc:
                     self._close_session(sock, f"Connection lost: {exc}")
 
 
