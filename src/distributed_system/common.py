@@ -1,8 +1,9 @@
-"""Shared socket framing and console logging for Milestone 1.
+"""Shared socket framing and console logging.
 
 Public API can be called:
     send_json(sock, message)
     recv_json(sock)
+    heartbeat(from_id, to_id, count, ack=False)
     log(message, kind="info")
 
 Wire format is one JSON object per line:
@@ -24,9 +25,26 @@ all_colors = {
     "heartbeat": "magenta",
     "state": "green",
     "registration": "blue",
+    "membership": "cyan",
     "failure": "red",
     "info": "white",
 }
+
+
+def heartbeat(
+    from_id: str, to_id: str, count: int, *, ack: bool = False
+) -> dict[str, object]:
+    """Build a GFD↔LFD heartbeat or heartbeat_ack with from/to fields.
+
+    LFD→server heartbeats keep the M1 shape ({lfd_id, count} /
+    {replica_id, count}) so those console strings stay unchanged.
+    """
+    return {
+        "type": "heartbeat_ack" if ack else "heartbeat",
+        "from": from_id,
+        "to": to_id,
+        "count": count,
+    }
 
 
 def send_json(sock: socket.socket, message: Mapping[str, object]) -> None:
@@ -122,6 +140,6 @@ def log(message: str, kind: str = "info") -> None:
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     color = all_colors.get(kind, all_colors["info"])
 
-    style = attr("bold") if kind == "send" else ""
+    style = attr("bold") if kind in {"send", "membership"} else ""
 
     print(f"{style}{fg(color)}[{timestamp}] {message}{attr('reset')}", flush=True)
