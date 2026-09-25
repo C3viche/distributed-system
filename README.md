@@ -36,8 +36,7 @@ server and its LFD on the same machine. Use consistent addresses across machines
 Existing shell environment variables take precedence over `.env` values.
 
 Heartbeat frequency and timeout remain CLI options (`--heartbeat_freq` and
-`--timeout`); use the same frequency for all three LFDs. GFD and RM addresses
-are reserved for their future implementations.
+`--timeout`); use the same frequency for all three LFDs. GFD uses `GFD_HOST` and `GFD_PORT`; RM remains reserved for a future milestone.
 
 ## Milestone #1 Execution Guide
 Milestone #1 validates single-server communication and Local Fault Detector (LFD1) heartbeating.
@@ -75,6 +74,47 @@ uv run client --id C2
 
 # Client C3
 uv run client --id C3
+```
+
+## M2 LFD–GFD integration
+
+Run `uv sync` after pulling the GFD entry point. On one Mac, use the default
+addresses in `.env.example`. Run each command in a separate terminal:
+
+```bash
+uv run gfd --heartbeat_freq 2 --timeout 2
+uv run lfd --id LFD1 --heartbeat_freq 2 --timeout 2
+uv run lfd --id LFD2 --heartbeat_freq 2 --timeout 2
+uv run lfd --id LFD3 --heartbeat_freq 2 --timeout 2
+uv run server --id S1
+uv run server --id S2
+uv run server --id S3
+```
+
+For multiple Macs, set `GFD_HOST` to the GFD machine's reachable LAN IP on
+all machines. Each `S*_HOST` and matching `LFD*_HOST` should identify that
+pair's machine. GFD binds to its configured host (`--host` overrides it).
+
+Each LFD registers with GFD before reporting a replica. The first successful
+server heartbeat adds the replica; timeout or disconnection removes it.
+The LFD keeps answering GFD heartbeats while its server is absent. If GFD is
+unavailable, server monitoring continues; the LFD retries once per second
+and reports current healthy membership after reconnecting.
+
+The GFD channel uses these JSON-line messages (server heartbeats retain the M1 format):
+
+```json
+{"type":"register_lfd","lfd_id":"LFD1"}
+{"type":"heartbeat","from":"GFD","to":"LFD1","count":1}
+{"type":"heartbeat_ack","from":"LFD1","to":"GFD","count":1}
+{"type":"add_replica","lfd_id":"LFD1","replica_id":"S1"}
+{"type":"delete_replica","lfd_id":"LFD1","replica_id":"S1"}
+```
+
+Run the local integration tests with:
+
+```bash
+uv run python -m unittest discover -s tests -p 'test_gfd_integration.py' -v
 ```
 
 ## Wire Protocol & Logging Format

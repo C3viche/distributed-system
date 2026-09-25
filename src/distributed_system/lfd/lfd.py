@@ -1,11 +1,11 @@
-"""M2 LFD foundation: nonblocking monitoring of one assigned replica.
+"""M2 LFD: monitor one replica and report membership to the GFD.
 
 Run: uv run lfd --id LFD2 --heartbeat_freq 2
-Frequency is in Hz. GFD connection/registration, heartbeat ACKs, and membership
-messages remain TODO pending agreement on the GFD wire protocol.
+Frequency is in Hz. Server and GFD traffic share one nonblocking event loop.
 """
 
 import argparse
+import errno
 import itertools
 import math
 import selectors
@@ -13,7 +13,7 @@ import socket
 import time
 from typing import cast
 
-from distributed_system.common import BufferedJsonConnection, log
+from distributed_system.common import BufferedJsonConnection, heartbeat, log
 from distributed_system.config import REPLICA_LFDS, get_address
 
 
@@ -42,8 +42,8 @@ class LocalFaultDetector:
     ) -> None:
         self.lfd_id = lfd_id
         self.replica_id = REPLICA_ASSIGNMENTS[lfd_id] if replica_id is None else replica_id
-        if self.replica_id not in REPLICA_LFDS:
-            raise ValueError(f"Unknown replica: {self.replica_id}")
+        if self.replica_id != REPLICA_ASSIGNMENTS[lfd_id]:
+            raise ValueError(f"{lfd_id} must monitor {REPLICA_ASSIGNMENTS[lfd_id]}")
         self.interval = 1.0 / frequency
         self.timeout = timeout
         self.host, self.port = get_address(lfd_id)
@@ -56,14 +56,64 @@ class LocalFaultDetector:
         self._ack_deadline: float | None = None
         self._awaiting_count: int | None = None
         self._healthy = False
+        self._gfd: socket.socket | None = None
+        self._gfd_connecting = False
+        self._gfd_connect_deadline: float | None = None
+        self._gfd_retry_at = 0.0
+        self._gfd_address = get_address("GFD")
 
     def _membership_changed(self, added: bool) -> None:
-        """TODO: queue add_replica/delete_replica to GFD once its schema is agreed.
+        # A new GFD connection receives current health, not stale queued events.
+        if self._gfd is None or self._gfd_connecting:
+            return
+        kind = "add_replica" if added else "delete_replica"
+        self._queue(self._gfd, {
+            "type": kind, "lfd_id": self.lfd_id, "replica_id": self.replica_id,
+        })
+        action = "add" if added else "delete"
+        log(f"{self.lfd_id}: {action} replica {self.replica_id}", kind="membership")
 
-        Called once after the first valid ACK and once if that replica fails.
-        No membership notification is sent by this foundation yet.
-        """
-        pass
+    def _connect_gfd(self, now: float) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        try:
+            result = sock.connect_ex(self._gfd_address)
+        except OSError:
+            sock.close()
+            self._gfd_retry_at = now + 1.0
+            return
+        if result not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
+            sock.close()
+            self._gfd_retry_at = now + 1.0
+            return
+        self._gfd = sock
+        self._gfd_connecting = True
+        self._gfd_connect_deadline = now + self.timeout
+        self._connections[sock] = BufferedJsonConnection(sock)
+        self._selector.register(sock, selectors.EVENT_WRITE, "gfd")
+
+    def _finish_gfd_connect(self) -> None:
+        assert self._gfd is not None
+        error = self._gfd.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        if error:
+            self._drop(self._gfd)
+            return
+        self._gfd_connecting = False
+        self._gfd_connect_deadline = None
+        self._queue(self._gfd, {"type": "register_lfd", "lfd_id": self.lfd_id})
+        log(f"{self.lfd_id} connected to GFD; registration queued", kind="registration")
+        if self._healthy:
+            self._membership_changed(added=True)
+
+    def _handle_gfd(self, message: dict[str, object]) -> None:
+        count = message.get("count")
+        if (message.get("type") != "heartbeat" or message.get("from") != "GFD"
+            or message.get("to") != self.lfd_id or type(count) is not int or count < 1):
+            raise ValueError("Invalid GFD heartbeat")
+        assert self._gfd is not None
+        log(f"[{count}] {self.lfd_id} receives heartbeat from GFD", kind="heartbeat")
+        self._queue(self._gfd, heartbeat(self.lfd_id, "GFD", count, ack=True))
+        log(f"[{count}] {self.lfd_id} sending heartbeat ACK to GFD", kind="heartbeat")
 
     def _accept(self, listener: socket.socket) -> None:
         sock, _ = listener.accept()
@@ -73,13 +123,21 @@ class LocalFaultDetector:
 
     def _queue(self, sock: socket.socket, message: dict[str, object]) -> None:
         self._connections[sock].queue(message)
-        self._selector.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, "server")
+        self._selector.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE,
+                              self._selector.get_key(sock).data)
 
     def _drop(self, sock: socket.socket) -> None:
         self._selector.unregister(sock)
         self._connections.pop(sock)
         self._registration_deadlines.pop(sock, None)
         sock.close()
+        if sock is self._gfd:
+            self._gfd = None
+            self._gfd_connecting = False
+            self._gfd_connect_deadline = None
+            self._gfd_retry_at = time.monotonic() + 1.0
+            log(f"{self.lfd_id} lost GFD connection; retrying", kind="failure")
+            return
         if sock is self._server:
             log(f"{self.replica_id} has died", kind="failure")
             self._server = None
@@ -127,6 +185,11 @@ class LocalFaultDetector:
             self._membership_changed(added=True)
 
     def _tick(self, now: float) -> None:
+        if self._gfd is None and now >= self._gfd_retry_at:
+            self._connect_gfd(now)
+        elif (self._gfd is not None and self._gfd_connect_deadline is not None
+              and now >= self._gfd_connect_deadline):
+            self._drop(self._gfd)
         for sock, deadline in list(self._registration_deadlines.items()):
             if now >= deadline:
                 log("Server registration timed out", kind="failure")
@@ -149,6 +212,10 @@ class LocalFaultDetector:
 
     def _wait_timeout(self) -> float | None:
         deadlines = list(self._registration_deadlines.values())
+        if self._gfd is None:
+            deadlines.append(self._gfd_retry_at)
+        elif self._gfd_connect_deadline is not None:
+            deadlines.append(self._gfd_connect_deadline)
         if self._ack_deadline is not None:
             deadlines.append(self._ack_deadline)
         elif self._next_heartbeat is not None:
@@ -177,6 +244,9 @@ class LocalFaultDetector:
                                 continue
                             if sock not in self._connections:
                                 continue
+                            if key.data == "gfd" and self._gfd_connecting:
+                                self._finish_gfd_connect()
+                                continue
                             connection = self._connections[sock]
                             if mask & selectors.EVENT_READ:
                                 messages = connection.receive()
@@ -184,13 +254,18 @@ class LocalFaultDetector:
                                     self._drop(sock)
                                     continue
                                 for message in messages:
-                                    self._message(sock, message)
+                                    if not isinstance(message, dict):
+                                        raise ValueError("Expected a JSON object")
+                                    if key.data == "gfd":
+                                        self._handle_gfd(message)
+                                    else:
+                                        self._message(sock, message)
                                     if sock not in self._connections:
                                         break
                             if sock in self._connections and mask & selectors.EVENT_WRITE:
                                 connection.flush()
                                 if not connection.has_pending_output:
-                                    self._selector.modify(sock, selectors.EVENT_READ, "server")
+                                    self._selector.modify(sock, selectors.EVENT_READ, key.data)
                         except BlockingIOError:
                             pass
                         except (OSError, ValueError) as exc:
@@ -214,6 +289,8 @@ def main() -> None:
     )
     parser.add_argument("--timeout", type=positive_number, default=2.0, help="ACK/registration timeout in seconds")
     args = parser.parse_args()
+    if args.replica_id is not None and args.replica_id != REPLICA_ASSIGNMENTS[args.id]:
+        parser.error(f"{args.id} must monitor {REPLICA_ASSIGNMENTS[args.id]}")
     detector = LocalFaultDetector(
         lfd_id=cast(str, args.id), replica_id=cast(str | None, args.replica_id),
         frequency=cast(float, args.frequency), timeout=cast(float, args.timeout),
