@@ -62,6 +62,8 @@ PROCESS_CONFIG = {**SERVERS, **LFDS, **INFRASTRUCTURE}
 # Get all the server addresses from PROCESS_CONFIG and return as new dict
 def get_server_addresses(num: int | None = None) -> dict[str, tuple[str, int]]:
     """Return a mapping of server replica IDs to their (host, port) tuples up to `num`."""
+    if num is not None and not 1 <= num <= len(SERVERS):
+        raise ValueError(f"num_replicas must be between 1 and {len(SERVERS)}")
     # Convert SERVERS.items() into a list and slice the first `num` elements
     server_items = list(SERVERS.items())[:num] if num is not None else SERVERS.items()
 
