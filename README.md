@@ -23,24 +23,21 @@ uv sync
 
 ## Configuration (`.env`)
 
-Configure default hosts and ports for nodes using environment variables. Create a .env file in the project root:  
+Copy the shared template to create your local configuration:
 
-```python
-# Server Replicas
-S1_HOST="127.0.0.1"
-S1_PORT=8080
-
-S2_HOST="127.0.0.1"
-S2_PORT=8082
-
-S3_HOST="127.0.0.1"
-S3_PORT=8083
-
-# Local Fault Detectors
-LFD1_HOST="127.0.0.1"
-LFD1_PORT=8081
-...
+```bash
+cp .env.example .env
 ```
+
+`.env` is ignored by Git; `.env.example` lists all supported host/port settings.
+The template runs everything on one Mac. For multiple Macs, replace loopback
+addresses with the corresponding machines' reachable LAN IPs, keeping each
+server and its LFD on the same machine. Use consistent addresses across machines.
+Existing shell environment variables take precedence over `.env` values.
+
+Heartbeat frequency and timeout remain CLI options (`--heartbeat_freq` and
+`--timeout`); use the same frequency for all three LFDs. GFD and RM addresses
+are reserved for their future implementations.
 
 ## Milestone #1 Execution Guide
 Milestone #1 validates single-server communication and Local Fault Detector (LFD1) heartbeating.
