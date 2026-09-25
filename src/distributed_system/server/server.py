@@ -17,11 +17,12 @@ import socket
 from typing import cast
 
 from distributed_system.common import BufferedJsonConnection, log
-from distributed_system.config import get_address
+from distributed_system.config import REPLICA_LFDS, get_address
 
 class Server:
-    def __init__(self, replica_id: str = "S1", port_override: int | None = None):
+    def __init__(self, replica_id: str, port_override: int | None = None):
         self.replica_id: str = replica_id
+        self.lfd_id = REPLICA_LFDS[replica_id]
         self.state: int = 0
         self._connections: dict[socket.socket, BufferedJsonConnection] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
@@ -35,18 +36,18 @@ class Server:
         if port_override:
             self.port: int = port_override
 
-        # Outbound connection to LFD1; None while we have no LFD.
+        # Outbound connection to the assigned LFD; None while we have no LFD.
         self._lfd: socket.socket | None = None
         self._lfd_warned: bool = False
 
     def try_connect_to_lfd(self) -> None:
-        """Attempt one registration with LFD1; never blocks the serve loop.
+        """Attempt registration with the assigned LFD (up to one second).
 
         On failure the socket stays None and the serve loop retries on its
         next tick. On success the socket joins the selector so heartbeats
         are handled alongside client traffic.
         """
-        lfd_host, lfd_port = get_address("LFD1")
+        lfd_host, lfd_port = get_address(self.lfd_id)
         try:
             # Short timeout bounds the TCP handshake if the LFD host is unreachable.
             s = socket.create_connection((lfd_host, lfd_port), timeout=1.0)
@@ -60,7 +61,7 @@ class Server:
         self._lfd_warned = False
         self._register(s, "lfd")
         self._send_json(s, {"type": "registration", "replica_id": self.replica_id})
-        log(f"{self.replica_id} registered with LFD1", kind="registration")
+        log(f"{self.replica_id} registered with {self.lfd_id}", kind="registration")
 
 
     def handle_lfd(self, sock: socket.socket, msg: dict[str, object]) -> None:
@@ -68,9 +69,9 @@ class Server:
             return
         
         count = msg.get("count")
-        log(f"{self.replica_id} got heartbeat [{count}] from LFD1", kind="heartbeat")
+        log(f"{self.replica_id} got heartbeat [{count}] from {self.lfd_id}", kind="heartbeat")
         self._send_json(sock, {"type": "heartbeat_ack", "replica_id": self.replica_id, "count": count})
-        log(f"{self.replica_id} sent ack [{count}] back to LFD1", kind="heartbeat")
+        log(f"{self.replica_id} sent ack [{count}] back to {self.lfd_id}", kind="heartbeat")
 
 
     def handle_client(self, sock: socket.socket, msg: dict[str, object]) -> None:
@@ -115,7 +116,7 @@ class Server:
     def _read_messages(self, sock: socket.socket, kind: str) -> None:
         messages = self._connections[sock].receive()
         if messages is None:
-            self._close_sock(sock, "lost connection to LFD1" if kind == "lfd" else "client disconnected")
+            self._close_sock(sock, f"lost connection to {self.lfd_id}" if kind == "lfd" else "client disconnected")
             return
         for msg in messages:
             if kind == "lfd":
@@ -177,7 +178,7 @@ class Server:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    _ = parser.add_argument("--id", default="S1", help="Replica ID")
+    _ = parser.add_argument("--id", choices=list(REPLICA_LFDS), required=True, help="Replica ID")
     _ = parser.add_argument("--port", type=int, default=None, help="Override port")
 
     args = parser.parse_args()

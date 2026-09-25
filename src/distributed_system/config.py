@@ -56,6 +56,8 @@ INFRASTRUCTURE: dict[str, dict[str, str | int]] = {
     },
 }
 
+REPLICA_LFDS = {"S1": "LFD1", "S2": "LFD2", "S3": "LFD3"}
+
 # Unified single lookup dictionary
 PROCESS_CONFIG = {**SERVERS, **LFDS, **INFRASTRUCTURE}
 
