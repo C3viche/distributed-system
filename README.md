@@ -71,13 +71,13 @@ uv run server --id S1
 
 ```bash
 # Client C1
-uv run client --id C1
+uv run client --id C1 --num_replicas 1
 
 # Client C2
-uv run client --id C2
+uv run client --id C2 --num_replicas 1
 
 # Client C3
-uv run client --id C3
+uv run client --id C3 --num_replicas 1
 ```
 
 ## Wire Protocol & Logging Format

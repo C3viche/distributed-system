@@ -1,9 +1,9 @@
 """Client entry point for Milestone 1.
 
 Usage:
-    uv run client --id C1
-    uv run client --id C2 --interval 0.5
-    uv run client --id C3 --count 5
+    uv run client --id C1 --num_replicas 1
+    uv run client --id C2 --num_replicas 1 --interval 0.5
+    uv run client --id C3 --num_replicas 1 --count 5
 
 Address resolution precedence for replicas:
     -> S1_HOST / S1_PORT environment variables (also loaded from .env)
@@ -14,6 +14,7 @@ import argparse
 from typing import cast
 
 from distributed_system.client.client import Client
+from distributed_system.config import SERVERS
 
 
 def _positive_float(value: str) -> float:
@@ -42,6 +43,7 @@ def _parse_args() -> argparse.Namespace:
         "--num_replicas",
         dest="num_replicas",
         type=_positive_int,
+        choices=range(1, len(SERVERS) + 1),
         required=True,
         help="Specify the number of replicas the client will broadcast to"
     )
