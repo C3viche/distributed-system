@@ -1,8 +1,7 @@
 """Global Fault Detector for Milestone 2 18-749.
 
-Runs on the sacred (client) laptop. LFDs connect here to register, receive
-GFD heartbeats, and report replica add/delete. Clients and servers do not
-talk to the GFD in M2.
+Runs on the sacred (client) laptop. LFDs report replica health; registered
+clients receive the current membership and every subsequent change.
 
 Run from the repository root:
     uv run gfd
@@ -42,13 +41,14 @@ def replica_id_for_lfd(lfd_id: str) -> str:
     raise ValueError(f"No replica mapping for LFD id: {lfd_id}")
 
 
-class LFDSession:
-    """One accepted LFD socket and the replica it currently reports."""
+class PeerSession:
+    """One connection, identified by its first registration message."""
 
     def __init__(self, sock: socket.socket) -> None:
         self.sock: socket.socket = sock
         self.conn: BufferedJsonConnection = BufferedJsonConnection(sock)
         self.lfd_id: str | None = None
+        self.client_id: str | None = None
         self.replica_id: str | None = None
         self._counts: itertools.count[int] = itertools.count(1)
         self.awaiting_ack: bool = False
@@ -58,7 +58,7 @@ class LFDSession:
 
 
 class GlobalFaultDetector:
-    """Membership service: heartbeat LFDs and print group membership."""
+    """Heartbeat LFDs and publish replica membership to clients."""
 
     def __init__(
         self,
@@ -72,7 +72,7 @@ class GlobalFaultDetector:
         self.host, self.port = resolve_address("GFD", host_override, port_override)
         self.membership: list[str] = []
         self.member_count: int = 0
-        self._sessions: dict[socket.socket, LFDSession] = {}
+        self._sessions: dict[socket.socket, PeerSession] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
 
     def membership_text(self) -> str:
@@ -83,7 +83,25 @@ class GlobalFaultDetector:
         return f"GFD: {n} {word}: {', '.join(self.membership)}"
 
     def _print_membership(self) -> None:
+        # A membership transition is one publish point for the console and clients.
         log(self.membership_text(), kind="membership")
+        self._publish_membership()
+
+    def _publish_membership(self, recipient: PeerSession | None = None) -> None:
+        """Send a full snapshot so late clients and updates use the same format."""
+        message: dict[str, object] = {
+            "type": "membership", "members": list(self.membership),
+            "member_count": self.member_count,
+        }
+        clients = ([recipient] if recipient is not None else
+                   [s for s in self._sessions.values() if s.client_id is not None])
+        for session in clients:
+            try:
+                self._send_json(session, message)
+                log(f"GFD sends membership to {session.client_id}: {self.membership_text()}",
+                    kind="membership")
+            except (OSError, ValueError, KeyError) as exc:
+                self._close_session(session.sock, f"{session.client_id} membership send failed: {exc}")
 
     def _add_replica(self, replica_id: str) -> bool:
         if replica_id in self.membership:
@@ -99,7 +117,7 @@ class GlobalFaultDetector:
         self.member_count = len(self.membership)
         return True
 
-    def _send_json(self, session: LFDSession, message: dict[str, object]) -> None:
+    def _send_json(self, session: PeerSession, message: dict[str, object]) -> None:
         session.conn.queue(message)
         key = self.sel.get_key(session.sock)
         self.sel.modify(session.sock, selectors.EVENT_READ | selectors.EVENT_WRITE, key.data)
@@ -126,8 +144,24 @@ class GlobalFaultDetector:
                 continue
             self._close_session(sock, f"{lfd_id} replaced by a new connection")
 
-    def _handle_register(self, session: LFDSession, msg: dict[str, object]) -> None:
+    def _handle_register_client(self, session: PeerSession, msg: dict[str, object]) -> None:
+        client_id = msg.get("client_id")
+        if session.lfd_id is not None or session.client_id is not None:
+            raise ValueError("Peer already registered")
+        if not isinstance(client_id, str) or not client_id:
+            raise ValueError("Invalid client ID")
+        for sock, existing in list(self._sessions.items()):
+            if sock is not session.sock and existing.client_id == client_id:
+                self._close_session(sock, f"{client_id} replaced by a new connection")
+        session.client_id = client_id
+        log(f"{client_id} registered with GFD", kind="registration")
+        # Late joiners need the current state even if no further replica changes occur.
+        self._publish_membership(session)
+
+    def _handle_register(self, session: PeerSession, msg: dict[str, object]) -> None:
         lfd_id = msg.get("lfd_id")
+        if session.client_id is not None:
+            raise ValueError("Client cannot register as an LFD")
         if not isinstance(lfd_id, str) or not lfd_id:
             log("Invalid register_lfd (missing lfd_id)", kind="failure")
             return
@@ -140,7 +174,7 @@ class GlobalFaultDetector:
         session.next_due = time.monotonic()
         log(f"{lfd_id} registered with GFD", kind="registration")
 
-    def _owned_replica(self, session: LFDSession, msg: dict[str, object]) -> str:
+    def _owned_replica(self, session: PeerSession, msg: dict[str, object]) -> str:
         if session.lfd_id is None:
             raise ValueError("LFD must register before reporting membership")
         replica_id = replica_id_for_lfd(session.lfd_id)
@@ -149,21 +183,21 @@ class GlobalFaultDetector:
             raise ValueError("Membership message does not match the registered LFD")
         return replica_id
 
-    def _handle_add(self, session: LFDSession, msg: dict[str, object]) -> None:
+    def _handle_add(self, session: PeerSession, msg: dict[str, object]) -> None:
         replica_id = self._owned_replica(session, msg)
         session.replica_id = replica_id
         if self._add_replica(replica_id):
             log(f"{session.lfd_id}: add replica {replica_id}", kind="membership")
             self._print_membership()
 
-    def _handle_delete(self, session: LFDSession, msg: dict[str, object]) -> None:
+    def _handle_delete(self, session: PeerSession, msg: dict[str, object]) -> None:
         replica_id = self._owned_replica(session, msg)
         session.replica_id = None
         if self._delete_replica(replica_id):
             log(f"{session.lfd_id}: delete replica {replica_id}", kind="membership")
             self._print_membership()
 
-    def _handle_ack(self, session: LFDSession, msg: dict[str, object]) -> None:
+    def _handle_ack(self, session: PeerSession, msg: dict[str, object]) -> None:
         if session.lfd_id is None or not session.awaiting_ack:
             return
         if (msg.get("from") != session.lfd_id or msg.get("to") != "GFD"
@@ -179,11 +213,15 @@ class GlobalFaultDetector:
             kind="heartbeat",
         )
 
-    def _handle_message(self, session: LFDSession, msg: dict[str, object]) -> None:
+    def _handle_message(self, session: PeerSession, msg: dict[str, object]) -> None:
         if not isinstance(msg, dict):
             raise ValueError("Expected a JSON object")
         kind = msg.get("type")
-        if kind == "register_lfd":
+        if kind == "register_client":
+            self._handle_register_client(session, msg)
+        elif session.client_id is not None:
+            raise ValueError("Unexpected message from client")
+        elif kind == "register_lfd":
             self._handle_register(session, msg)
         elif kind == "add_replica":
             self._handle_add(session, msg)
@@ -194,7 +232,7 @@ class GlobalFaultDetector:
         else:
             log(f"GFD ignored unexpected message type: {kind}", kind="info")
 
-    def _send_heartbeat(self, session: LFDSession, now: float) -> None:
+    def _send_heartbeat(self, session: PeerSession, now: float) -> None:
         if session.lfd_id is None:
             return
         count = next(session._counts)
@@ -240,7 +278,7 @@ class GlobalFaultDetector:
             return
         messages = session.conn.receive()
         if messages is None:
-            label = session.lfd_id or "LFD"
+            label = session.lfd_id or session.client_id or "Peer"
             self._close_session(sock, f"{label} disconnected")
             return
         for msg in messages:
@@ -256,10 +294,10 @@ class GlobalFaultDetector:
 
     def _accept(self, listener: socket.socket) -> None:
         conn, addr = cast(tuple[socket.socket, tuple[str, int]], listener.accept())
-        session = LFDSession(conn)
+        session = PeerSession(conn)
         self._sessions[conn] = session
         self.sel.register(conn, selectors.EVENT_READ, "lfd")
-        log(f"LFD connection from {addr[0]}:{addr[1]}", kind="info")
+        log(f"Connection from {addr[0]}:{addr[1]}", kind="info")
 
     def serve(self) -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
