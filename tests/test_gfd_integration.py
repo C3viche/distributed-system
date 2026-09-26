@@ -46,8 +46,10 @@ class IntegrationTests(unittest.TestCase):
     def launch(self, label, component, *args):
         stream = tempfile.TemporaryFile(mode='w+')
         self.logs[label] = stream
+        module = ('distributed_system.client' if component == 'client'
+                  else f'distributed_system.{component}.{component}')
         process = subprocess.Popen(
-            [sys.executable, '-u', '-m', f'distributed_system.{component}.{component}', *args],
+            [sys.executable, '-u', '-m', module, *args],
             cwd=ROOT, env=self.env, stdout=stream, stderr=subprocess.STDOUT)
         self.processes.append(process)
         return process
@@ -178,6 +180,69 @@ class IntegrationTests(unittest.TestCase):
         self.assertNotIn('add replica', self.output('GFD'))
         self.launch('LFD2', 'lfd', '--id', 'LFD2', '--freq', '10', '--timeout', '.5')
         self.wait_for('GFD', 'GFD receives heartbeat from LFD2', 2)
+
+    def test_gfd_broadcasts_membership_to_clients(self):
+        self.gfd()
+        self.wait_for('GFD', 'listening')
+        clients = []
+        try:
+            for client_id in ('C1', 'C2'):
+                sock = socket.create_connection(('127.0.0.1', self.ports['GFD']), timeout=2)
+                stream = sock.makefile('rb')
+                clients.append((sock, stream))
+                sock.sendall((json.dumps(dict(type='register_client', client_id=client_id)) + '\n').encode())
+                self.assertEqual(json.loads(stream.readline()),
+                                 dict(type='membership', members=[], member_count=0))
+
+            self.launch('LFD1', 'lfd', '--id', 'LFD1', '--freq', '10', '--timeout', '.5')
+            self.launch('S1', 'server', '--id', 'S1')
+            for _, stream in clients:
+                self.assertEqual(json.loads(stream.readline()),
+                                 dict(type='membership', members=['S1'], member_count=1))
+
+            self.processes[-1].terminate()
+            self.processes[-1].wait(timeout=3)
+            for _, stream in clients:
+                self.assertEqual(json.loads(stream.readline()),
+                                 dict(type='membership', members=[], member_count=0))
+            self.wait_for('GFD', 'GFD sends membership to C1: GFD: 0 members', 2)
+            self.wait_for('GFD', 'GFD sends membership to C2: GFD: 0 members', 2)
+        finally:
+            for sock, stream in clients:
+                stream.close()
+                sock.close()
+
+    def test_client_accepts_membership_before_server_starts(self):
+        self.gfd()
+        self.wait_for('GFD', 'listening')
+        client = self.launch('C1', 'client', '--id', 'C1', '--interval', '.1', '--count', '1')
+        self.wait_for('C1', 'receives GFD membership: 0 members')
+        self.launch('LFD1', 'lfd', '--id', 'LFD1', '--freq', '10', '--timeout', '.5')
+        self.launch('S1', 'server', '--id', 'S1')
+        self.wait_for('C1', 'receives GFD membership: 1 member: S1')
+        self.wait_for('C1', 'Received <C1, S1, 1, reply')
+        client.wait(timeout=5)
+        self.assertEqual(client.returncode, 0)
+
+    def test_client_stops_sending_to_removed_member(self):
+        self.gfd()
+        self.wait_for('GFD', 'listening')
+        for n in (1, 2):
+            self.launch(f'LFD{n}', 'lfd', '--id', f'LFD{n}', '--freq', '10', '--timeout', '.5')
+            self.launch(f'S{n}', 'server', '--id', f'S{n}')
+        self.wait_for('GFD', 'GFD: 2 members: S1, S2')
+        client = self.launch('C1', 'client', '--id', 'C1', '--interval', '.1')
+        self.wait_for('C1', 'Received <C1,')
+        server = self.processes[2]
+        server.terminate()
+        server.wait(timeout=3)
+        marker = 'receives GFD membership: 1 member: S2'
+        self.wait_for('C1', marker)
+        before = self.output('C1').count('Sent <C1, S2')
+        self.wait_for('C1', 'Sent <C1, S2', before + 2)
+        after_update = self.output('C1').split(marker, 1)[1]
+        self.assertNotIn('Sent <C1, S1', after_update)
+        self.assertIsNone(client.poll())
 
 if __name__ == '__main__':
     unittest.main()
