@@ -47,6 +47,7 @@ class PeerSession:
     def __init__(self, sock: socket.socket) -> None:
         self.sock: socket.socket = sock
         self.conn: BufferedJsonConnection = BufferedJsonConnection(sock)
+        # Exactly one identity is set: an LFD owns a replica, a client observes it.
         self.lfd_id: str | None = None
         self.client_id: str | None = None
         self.replica_id: str | None = None
@@ -95,6 +96,7 @@ class GlobalFaultDetector:
         }
         clients = ([recipient] if recipient is not None else
                    [s for s in self._sessions.values() if s.client_id is not None])
+        # Queue on each nonblocking connection; one slow client cannot hold up LFD heartbeats.
         for session in clients:
             try:
                 self._send_json(session, message)
@@ -132,6 +134,7 @@ class GlobalFaultDetector:
         log(why, kind="failure")
         if session is None or session.replica_id is None:
             return
+        # An LFD disconnect invalidates its last reported healthy replica.
         replica_id = session.replica_id
         lfd_id = session.lfd_id or "LFD?"
         if self._delete_replica(replica_id):
@@ -150,6 +153,7 @@ class GlobalFaultDetector:
             raise ValueError("Peer already registered")
         if not isinstance(client_id, str) or not client_id:
             raise ValueError("Invalid client ID")
+        # Replacing a stale client socket avoids publishing the same update twice.
         for sock, existing in list(self._sessions.items()):
             if sock is not session.sock and existing.client_id == client_id:
                 self._close_session(sock, f"{client_id} replaced by a new connection")
@@ -186,6 +190,7 @@ class GlobalFaultDetector:
     def _handle_add(self, session: PeerSession, msg: dict[str, object]) -> None:
         replica_id = self._owned_replica(session, msg)
         session.replica_id = replica_id
+        # Repeated add reports do not produce duplicate client notifications.
         if self._add_replica(replica_id):
             log(f"{session.lfd_id}: add replica {replica_id}", kind="membership")
             self._print_membership()
@@ -246,6 +251,7 @@ class GlobalFaultDetector:
     def _tick_heartbeats(self) -> None:
         now = time.monotonic()
         for sock, session in list(self._sessions.items()):
+            # Clients are subscribers; only registered LFDs are heartbeat targets.
             if session.lfd_id is None:
                 continue
             if session.awaiting_ack:
