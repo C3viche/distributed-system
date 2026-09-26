@@ -71,11 +71,17 @@ class Client:
                     pass
 
     def _connect_gfd(self) -> bool:
-        """Register for snapshots before choosing any replica sockets."""
+        """Open the membership channel and ask GFD for a fresh snapshot.
+
+        This is used at startup and after a lost GFD connection. The short
+        connection timeout keeps an unavailable GFD from blocking forever.
+        """
         sock: socket.socket | None = None
         try:
             sock = socket.create_connection(get_address("GFD"), timeout=2.0)
             send_json(sock, {"type": "register_client", "client_id": self.client_id})
+            # Future snapshots arrive asynchronously, so subsequent reads use
+            # the same nonblocking JSON-line buffer as the other components.
             self._gfd = BufferedJsonConnection(sock)
             self._received_membership = False
             log(f"{self.client_id} registered with GFD", kind="registration")
@@ -88,13 +94,20 @@ class Client:
             return False
 
     def _read_gfd(self) -> None:
-        """Consume complete JSON lines; a partial network read must not block requests."""
+        """Accept complete membership snapshots from GFD.
+
+        The buffer retains partial lines for the next read. Validate the full
+        snapshot before replacing our view so a malformed update cannot leave
+        the client with a partly changed member list.
+        """
         assert self._gfd is not None
         try:
             messages = self._gfd.receive()
             if messages is None:
                 raise ConnectionError("GFD disconnected")
             for payload in messages:
+                # The JSON decoder can return a non-object despite its type
+                # hint, so check the wire data before reading its fields.
                 raw_message: object = payload
                 if not isinstance(raw_message, dict):
                     raise ValueError("Invalid GFD membership")  # noqa: TRY004 - close bad peer
@@ -109,7 +122,8 @@ class Client:
                     or len(members) != len(set(cast(list[str], members)))
                     or type(count) is not int or count != len(members)):
                     raise ValueError("Invalid GFD membership")
-                # Full snapshots replace the prior view, including removals.
+                # This only updates the desired member list. Replica sockets
+                # are reconciled at the next request boundary.
                 self.membership = cast(list[str], members)
                 self._received_membership = True
                 label = "member" if count == 1 else "members"
@@ -117,13 +131,18 @@ class Client:
                 log(f"{self.client_id} receives GFD membership: {count} {label}{member_list}",
                     kind="membership")
         except (OSError, ValueError, ConnectionError) as exc:
+            # Keep the last valid snapshot while the request loop reconnects.
             log(f"{self.client_id} lost GFD membership channel: {exc}", kind="failure")
             self._gfd.sock.close()
             self._gfd = None
             self._gfd_retry_at = time.monotonic() + 1.0
 
     def _wait_for_gfd(self, timeout: float) -> None:
-        """Poll once for a membership message without blocking on a partial line."""
+        """Wait for one GFD read opportunity, or for the timeout to expire.
+
+        This also acts as a timed sleep when GFD is disconnected. One read can
+        contain a partial line, a full snapshot, or several snapshots.
+        """
         if self._gfd is None:
             time.sleep(timeout)
             return
@@ -133,6 +152,7 @@ class Client:
                 self._read_gfd()
 
     def _wait_for_initial_membership(self) -> bool:
+        """Wait for the first full snapshot before opening replica sockets."""
         deadline = time.monotonic() + 3.0
         while self._gfd is not None and not self._received_membership:
             remaining = deadline - time.monotonic()
@@ -142,13 +162,23 @@ class Client:
         return self._received_membership
 
     def _wait_between_requests(self) -> None:
+        """Honor the request interval while still receiving GFD updates.
+
+        A snapshot may arrive before the interval ends, so keep waiting for
+        the remaining time after processing it.
+        """
         deadline = time.monotonic() + self.interval
         while (remaining := deadline - time.monotonic()) > 0:
             self._wait_for_gfd(remaining)
 
     def _sync_replicas(self, socks: dict[str, socket.socket]) -> None:
-        """Apply the latest snapshot at a request boundary."""
-        # Never remove a socket while the reply selector is using it.
+        """Make request sockets match the latest GFD membership.
+
+        Called between requests so the current reply selector never observes
+        a socket being closed underneath it. Config supplies the addresses;
+        GFD supplies which replica IDs should be active.
+        """
+        # Close removed members first, so the next broadcast excludes them.
         for replica_id in list(socks):
             if replica_id not in self.membership:
                 socks.pop(replica_id).close()
@@ -162,6 +192,7 @@ class Client:
                 socks[replica_id].settimeout(None)
                 log(f"{self.client_id} connected to {replica_id} at {host}:{port}", kind="registration")
             except OSError as exc:
+                # Leave it absent and try again at the next request boundary.
                 log(f"{self.client_id} could not connect to {replica_id}: {exc}", kind="failure")
 
     def _loop(self, socks: dict[str, socket.socket]) -> None:
