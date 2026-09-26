@@ -19,6 +19,7 @@ from typing import cast
 from distributed_system.common import BufferedJsonConnection, log
 from distributed_system.config import REPLICA_LFDS, get_address
 
+
 class Server:
     def __init__(self, replica_id: str, port_override: int | None = None):
         self.replica_id: str = replica_id

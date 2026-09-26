@@ -16,7 +16,6 @@ from typing import cast
 from distributed_system.common import BufferedJsonConnection, heartbeat, log
 from distributed_system.config import REPLICA_LFDS, get_address
 
-
 REPLICA_ASSIGNMENTS = {lfd: replica for replica, lfd in REPLICA_LFDS.items()}
 
 
@@ -255,7 +254,7 @@ class LocalFaultDetector:
                                     continue
                                 for message in messages:
                                     if not isinstance(message, dict):
-                                        raise ValueError("Expected a JSON object")
+                                        raise ValueError("Expected a JSON object")  # noqa: TRY004 - peer validation
                                     if key.data == "gfd":
                                         self._handle_gfd(message)
                                     else:

@@ -4,7 +4,6 @@ Run: python -m unittest discover -s tests -p test_gfd_integration.py -v
 """
 import json
 import os
-from pathlib import Path
 import signal
 import socket
 import subprocess
@@ -12,10 +11,19 @@ import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
+from typing import TextIO
 
 ROOT = Path(__file__).resolve().parents[1]
 
 class IntegrationTests(unittest.TestCase):
+    def __init__(self, methodName: str = 'runTest') -> None:
+        super().__init__(methodName)
+        self.env: dict[str, str] = {}
+        self.processes: list[subprocess.Popen[bytes]] = []
+        self.logs: dict[str, TextIO] = {}
+        self.ports: dict[str, int] = {}
+
     def setUp(self):
         self.env = os.environ.copy()
         self.env['PYTHONPATH'] = str(ROOT / 'src')
@@ -44,7 +52,7 @@ class IntegrationTests(unittest.TestCase):
             stream.close()
 
     def launch(self, label, component, *args):
-        stream = tempfile.TemporaryFile(mode='w+')
+        stream = tempfile.TemporaryFile(mode='w+')  # noqa: SIM115 - tearDown closes it
         self.logs[label] = stream
         module = ('distributed_system.client' if component == 'client'
                   else f'distributed_system.{component}.{component}')
@@ -72,8 +80,8 @@ class IntegrationTests(unittest.TestCase):
 
     def request(self, replica):
         with socket.create_connection(('127.0.0.1', self.ports[replica]), timeout=2) as sock:
-            sock.sendall((json.dumps(dict(type='request', client_id='C1', replica_id=replica,
-                                         request_num=1, payload='Hello')) + '\n').encode())
+            sock.sendall((json.dumps({'type': 'request', 'client_id': 'C1', 'replica_id': replica,
+                                      'request_num': 1, 'payload': 'Hello'}) + '\n').encode())
             with sock.makefile('rb') as stream:
                 reply = json.loads(stream.readline())
             self.assertEqual(reply['replica_id'], replica)
@@ -155,12 +163,12 @@ class IntegrationTests(unittest.TestCase):
                 peer.settimeout(3)
                 with peer.makefile('rb') as stream:
                     self.assertEqual(json.loads(stream.readline()),
-                                     dict(type='register_lfd', lfd_id='LFD1'))
+                                     {'type': 'register_lfd', 'lfd_id': 'LFD1'})
                     peer.sendall(b'{"type":"heartbeat","from":"GFD",')
                     self.launch('S1', 'server', '--id', 'S1')
                     self.wait_for('LFD1', 'receives heartbeat from S1', 4)
                     self.assertEqual(json.loads(stream.readline()),
-                                     dict(type='add_replica', lfd_id='LFD1', replica_id='S1'))
+                                     {'type': 'add_replica', 'lfd_id': 'LFD1', 'replica_id': 'S1'})
                     peer.sendall(b'"to":"LFD1","count":7}\n')
                     self.assertEqual(json.loads(stream.readline()),
                                      dict(type='heartbeat_ack', **{'from': 'LFD1', 'to': 'GFD'}, count=7))
@@ -170,8 +178,8 @@ class IntegrationTests(unittest.TestCase):
         self.wait_for('GFD', 'listening')
         for payload in [b'not-json\n', b'[]\n',
                         b'{"type":"add_replica","lfd_id":"LFD1","replica_id":"S1"}\n',
-                        b'{"type":"register_lfd","lfd_id":"LFD1"}\n'
-                        b'{"type":"add_replica","lfd_id":"LFD1","replica_id":"S2"}\n']:
+                        (b'{"type":"register_lfd","lfd_id":"LFD1"}\n'
+                         b'{"type":"add_replica","lfd_id":"LFD1","replica_id":"S2"}\n')]:
             with socket.create_connection(('127.0.0.1', self.ports['GFD']), timeout=2) as sock:
                 sock.sendall(payload)
                 while sock.recv(4096):
@@ -190,21 +198,21 @@ class IntegrationTests(unittest.TestCase):
                 sock = socket.create_connection(('127.0.0.1', self.ports['GFD']), timeout=2)
                 stream = sock.makefile('rb')
                 clients.append((sock, stream))
-                sock.sendall((json.dumps(dict(type='register_client', client_id=client_id)) + '\n').encode())
+                sock.sendall((json.dumps({'type': 'register_client', 'client_id': client_id}) + '\n').encode())
                 self.assertEqual(json.loads(stream.readline()),
-                                 dict(type='membership', members=[], member_count=0))
+                                 {'type': 'membership', 'members': [], 'member_count': 0})
 
             self.launch('LFD1', 'lfd', '--id', 'LFD1', '--freq', '10', '--timeout', '.5')
             self.launch('S1', 'server', '--id', 'S1')
             for _, stream in clients:
                 self.assertEqual(json.loads(stream.readline()),
-                                 dict(type='membership', members=['S1'], member_count=1))
+                                 {'type': 'membership', 'members': ['S1'], 'member_count': 1})
 
             self.processes[-1].terminate()
             self.processes[-1].wait(timeout=3)
             for _, stream in clients:
                 self.assertEqual(json.loads(stream.readline()),
-                                 dict(type='membership', members=[], member_count=0))
+                                 {'type': 'membership', 'members': [], 'member_count': 0})
             self.wait_for('GFD', 'GFD sends membership to C1: GFD: 0 members', 2)
             self.wait_for('GFD', 'GFD sends membership to C2: GFD: 0 members', 2)
         finally:

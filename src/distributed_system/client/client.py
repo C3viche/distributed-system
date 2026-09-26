@@ -36,8 +36,8 @@ class Client:
         self.replicas: dict[str, tuple[str, int]] = get_server_addresses()
         self.membership: list[str] = []
         self._gfd: BufferedJsonConnection | None = None
-        self._received_membership = False
-        self._gfd_retry_at = 0.0
+        self._received_membership: bool = False
+        self._gfd_retry_at: float = 0.0
         self.interval: float = interval
         self.count: int | None = count  # None -> loop until Ctrl-C / server closes
         self.payload_template: str = payload_template
@@ -94,21 +94,28 @@ class Client:
             messages = self._gfd.receive()
             if messages is None:
                 raise ConnectionError("GFD disconnected")
-            for message in messages:
-                members = message.get("members") if isinstance(message, dict) else None
-                count = message.get("member_count") if isinstance(message, dict) else None
-                if (not isinstance(message, dict) or message.get("type") != "membership"
-                    or not isinstance(members, list)
+            for payload in messages:
+                raw_message: object = payload
+                if not isinstance(raw_message, dict):
+                    raise ValueError("Invalid GFD membership")  # noqa: TRY004 - close bad peer
+                message = cast(dict[str, object], raw_message)
+                raw_members = message.get("members")
+                if not isinstance(raw_members, list):
+                    raise ValueError("Invalid GFD membership")  # noqa: TRY004 - close bad peer
+                members = cast(list[object], raw_members)
+                count = message.get("member_count")
+                if (message.get("type") != "membership"
                     or any(not isinstance(member, str) or member not in self.replicas for member in members)
-                    or len(members) != len(set(members))
+                    or len(members) != len(set(cast(list[str], members)))
                     or type(count) is not int or count != len(members)):
                     raise ValueError("Invalid GFD membership")
                 # Full snapshots replace the prior view, including removals.
-                self.membership = members
+                self.membership = cast(list[str], members)
                 self._received_membership = True
-                log(f"{self.client_id} receives GFD membership: {count} "
-                    f"{'member' if count == 1 else 'members'}"
-                    f"{': ' + ', '.join(members) if members else ''}", kind="membership")
+                label = "member" if count == 1 else "members"
+                member_list = f": {', '.join(self.membership)}" if members else ""
+                log(f"{self.client_id} receives GFD membership: {count} {label}{member_list}",
+                    kind="membership")
         except (OSError, ValueError, ConnectionError) as exc:
             log(f"{self.client_id} lost GFD membership channel: {exc}", kind="failure")
             self._gfd.sock.close()
@@ -121,7 +128,7 @@ class Client:
             time.sleep(timeout)
             return
         with selectors.DefaultSelector() as sel:
-            sel.register(self._gfd.sock, selectors.EVENT_READ)
+            _ = sel.register(self._gfd.sock, selectors.EVENT_READ)
             if sel.select(timeout):
                 self._read_gfd()
 
@@ -161,9 +168,9 @@ class Client:
         """Execute the continuous request loop over the active socket connection."""
         sent = 0
         while self.count is None or sent < self.count:
-            if self._gfd is None and time.monotonic() >= self._gfd_retry_at:
-                if self._connect_gfd():
-                    self._wait_for_initial_membership()
+            if (self._gfd is None and time.monotonic() >= self._gfd_retry_at
+                and self._connect_gfd()):
+                _ = self._wait_for_initial_membership()
             self._sync_replicas(socks)
             if not socks:
                 # A zero-member snapshot is valid; wait for GFD instead of exiting.
@@ -213,14 +220,15 @@ class Client:
             _ = sel.register(sock, selectors.EVENT_READ, data=replica_id)
         if self._gfd is not None:
             # Membership must be consumed even while replies are arriving.
-            sel.register(self._gfd.sock, selectors.EVENT_READ, data="GFD")
+            _ = sel.register(self._gfd.sock, selectors.EVENT_READ, data="GFD")
 
         success = False
         deadline = time.time() + TTL
 
         try:
             # Loop while we still have sockets registered AND time remaining on the clock
-            while any(key.data != "GFD" for key in sel.get_map().values()) and (timeout := deadline - time.time() > 0):
+            while (any(cast(str, key.data) != "GFD" for key in sel.get_map().values())
+                   and (timeout := deadline - time.time() > 0)):
                 for key, _ in sel.select(timeout=timeout):
                     sock = cast(socket.socket, key.fileobj)
                     replica_id = cast(str, key.data)
@@ -228,12 +236,12 @@ class Client:
                     if replica_id == "GFD":
                         self._read_gfd()
                         if self._gfd is None:
-                            sel.unregister(sock)
+                            _ = sel.unregister(sock)
                         # Stop waiting for replies from members the GFD just removed.
                         for active_id in list(socks):
                             if active_id not in self.membership:
                                 try:
-                                    sel.unregister(socks[active_id])
+                                    _ = sel.unregister(socks[active_id])
                                 except KeyError:
                                     pass
                         continue

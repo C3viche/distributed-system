@@ -51,7 +51,7 @@ class PeerSession:
         self.lfd_id: str | None = None
         self.client_id: str | None = None
         self.replica_id: str | None = None
-        self._counts: itertools.count[int] = itertools.count(1)
+        self.counts: itertools.count[int] = itertools.count(1)
         self.awaiting_ack: bool = False
         self.next_due: float = 0.0
         self.ack_deadline: float = 0.0
@@ -70,6 +70,8 @@ class GlobalFaultDetector:
     ) -> None:
         self.interval: float = 1.0 / frequency
         self.timeout: float = timeout
+        self.host: str
+        self.port: int
         self.host, self.port = resolve_address("GFD", host_override, port_override)
         self.membership: list[str] = []
         self.member_count: int = 0
@@ -122,7 +124,8 @@ class GlobalFaultDetector:
     def _send_json(self, session: PeerSession, message: dict[str, object]) -> None:
         session.conn.queue(message)
         key = self.sel.get_key(session.sock)
-        self.sel.modify(session.sock, selectors.EVENT_READ | selectors.EVENT_WRITE, key.data)
+        _ = self.sel.modify(session.sock, selectors.EVENT_READ | selectors.EVENT_WRITE,
+                            cast(str, key.data))
 
     def _close_session(self, sock: socket.socket, why: str) -> None:
         session = self._sessions.pop(sock, None)
@@ -169,7 +172,7 @@ class GlobalFaultDetector:
         if not isinstance(lfd_id, str) or not lfd_id:
             log("Invalid register_lfd (missing lfd_id)", kind="failure")
             return
-        replica_id_for_lfd(lfd_id)  # Reject unconfigured LFD identities.
+        _ = replica_id_for_lfd(lfd_id)  # Reject unconfigured LFD identities.
         if session.lfd_id is not None and session.lfd_id != lfd_id:
             raise ValueError("Cannot change the identity of a registered LFD")
         self._drop_existing(lfd_id, session.sock)
@@ -219,8 +222,10 @@ class GlobalFaultDetector:
         )
 
     def _handle_message(self, session: PeerSession, msg: dict[str, object]) -> None:
-        if not isinstance(msg, dict):
-            raise ValueError("Expected a JSON object")
+        raw_message: object = msg
+        if not isinstance(raw_message, dict):
+            raise ValueError("Expected a JSON object")  # noqa: TRY004 - peer validation closes this socket
+        msg = cast(dict[str, object], raw_message)
         kind = msg.get("type")
         if kind == "register_client":
             self._handle_register_client(session, msg)
@@ -240,7 +245,7 @@ class GlobalFaultDetector:
     def _send_heartbeat(self, session: PeerSession, now: float) -> None:
         if session.lfd_id is None:
             return
-        count = next(session._counts)
+        count = next(session.counts)
         session.last_count = count
         session.awaiting_ack = True
         session.ack_deadline = now + self.timeout
@@ -296,13 +301,13 @@ class GlobalFaultDetector:
             return
         session.conn.flush()
         if not session.conn.has_pending_output:
-            self.sel.modify(sock, selectors.EVENT_READ, "lfd")
+            _ = self.sel.modify(sock, selectors.EVENT_READ, "lfd")
 
     def _accept(self, listener: socket.socket) -> None:
         conn, addr = cast(tuple[socket.socket, tuple[str, int]], listener.accept())
         session = PeerSession(conn)
         self._sessions[conn] = session
-        self.sel.register(conn, selectors.EVENT_READ, "lfd")
+        _ = self.sel.register(conn, selectors.EVENT_READ, "lfd")
         log(f"Connection from {addr[0]}:{addr[1]}", kind="info")
 
     def serve(self) -> None:
