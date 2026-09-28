@@ -25,6 +25,7 @@ from distributed_system.common import BufferedJsonConnection, log
 from distributed_system.config import REPLICA_LFDS, get_address
 
 
+
 def lfd_id_for(replica_id: str) -> str:
     """Return the LFD that heartbeats this replica: S1→LFD1, S2→LFD2, S3→LFD3."""
     try:
@@ -40,7 +41,7 @@ class Server:
         self.state: int = 0
         self._connections: dict[socket.socket, BufferedJsonConnection] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
-        
+
         # Load host/port configuration. The listen socket still binds all interfaces.
         host, port = get_address(self.replica_id)
 
@@ -81,7 +82,7 @@ class Server:
     def handle_lfd(self, sock: socket.socket, msg: dict[str, object]) -> None:
         if msg.get("type") != "heartbeat":
             return
-        
+
         count = msg.get("count")
         log(f"{self.replica_id} got heartbeat [{count}] from {self.lfd_id}", kind="heartbeat")
         self._send_json(sock, {"type": "heartbeat_ack", "replica_id": self.replica_id, "count": count})
@@ -91,16 +92,16 @@ class Server:
     def handle_client(self, sock: socket.socket, msg: dict[str, object]) -> None:
         if msg.get("type") != "request":
             return
-    
+
         client = msg.get("client_id")
         req = msg.get("request_num")
         payload = msg.get("payload", "")
-    
+
         log(f"Received <{client}, {self.replica_id}, {req}, {payload}>", kind="receive")
         log(f"my_state = {self.state} before processing", kind="state")
         self.state += 1
         log(f"my_state = {self.state} after processing", kind="state")
-    
+
         reply = {
             "type": "reply",
             "client_id": client,
@@ -146,8 +147,8 @@ class Server:
         if sock is self._lfd:
             self._lfd = None  # serve loop will try to re-register
         log(why, kind="failure")
-    
-    
+
+
     def serve(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         # lets us restart right after a ctrl-c instead of "address already in use"
@@ -155,10 +156,10 @@ class Server:
         listener.bind(("0.0.0.0", self.port))
         listener.listen()
         log(f"{self.replica_id} up, waiting for clients on {self.host}:{self.port}", kind="info")
-    
+
         # tag each socket so the loop knows what it's looking at
         _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
-    
+
         while True:
             if self._lfd is None:
                 self.try_connect_to_lfd()
@@ -168,7 +169,7 @@ class Server:
                 # Safely narrow key.fileobj to socket.socket
                 if not isinstance(key.fileobj, socket.socket):
                     continue
-                
+
                 sock: socket.socket = key.fileobj
                 data = cast(str, key.data)
 
@@ -176,8 +177,8 @@ class Server:
                     conn, client_addr = cast(tuple[socket.socket, tuple[str, int]], listener.accept())
 
                     self._register(conn, "client")
-                    log(f"new client connection from {client_addr[0]}:{client_addr[1]}", kind="info")                
-                
+                    log(f"new client connection from {client_addr[0]}:{client_addr[1]}", kind="info")
+
                 else:
                     try:
                         if events & selectors.EVENT_READ:

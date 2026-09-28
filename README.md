@@ -101,6 +101,12 @@ The LFD keeps answering GFD heartbeats while its server is absent. If GFD is
 unavailable, server monitoring continues; the LFD retries once per second
 and reports current healthy membership after reconnecting.
 
+Clients register with GFD before sending requests. GFD immediately sends the
+current replica IDs and member count, then sends a new full snapshot whenever
+membership changes. Both sides log each delivery. Clients use those IDs to
+open or close replica connections; `--num_replicas` is a legacy option and does
+not limit GFD membership.
+
 The GFD channel uses these JSON-line messages (server heartbeats retain the M1 format):
 
 ```json
@@ -109,6 +115,8 @@ The GFD channel uses these JSON-line messages (server heartbeats retain the M1 f
 {"type":"heartbeat_ack","from":"LFD1","to":"GFD","count":1}
 {"type":"add_replica","lfd_id":"LFD1","replica_id":"S1"}
 {"type":"delete_replica","lfd_id":"LFD1","replica_id":"S1"}
+{"type":"register_client","client_id":"C1"}
+{"type":"membership","members":["S1","S2"],"member_count":2}
 ```
 
 ## Wire Protocol & Logging Format
