@@ -1,14 +1,19 @@
-"""S1 server process for Milestone 1 18-749.
+"""Server replica for Milestone 2 18-749 (S1, S2, or S3).
 
-The server starts serving clients immediately. Registration with the LFD
-is non-blocking: if the LFD is not up yet the select loop wakes once a
-second and retries, and it re-registers if the LFD connection drops.
-Client requests and LFD heartbeats are handled in the same select loop.
-No threads, timers, or randomness, it is deterministic per the guidelines
+The server starts serving clients immediately. Registration with its paired
+LFD (S1→LFD1, S2→LFD2, S3→LFD3) uses connection attempts bounded by
+a one-second timeout. The loop retries when disconnected and re-registers
+if the LFD connection drops. Client requests and LFD heartbeats are handled in the
+same select loop. No threads, timers, or randomness.
+
+The listen socket binds 0.0.0.0 so other machines can connect. The port, and
+the host printed at startup, come from config.
 
 
 To Run:
     uv run server --id S1           # host/port from config.py
+    uv run server --id S2
+    uv run server --id S3
 """
 
 import argparse
@@ -19,15 +24,24 @@ from typing import cast
 from distributed_system.common import BufferedJsonConnection, log
 from distributed_system.config import REPLICA_LFDS, get_address
 
+
+def lfd_id_for(replica_id: str) -> str:
+    """Return the LFD that heartbeats this replica: S1→LFD1, S2→LFD2, S3→LFD3."""
+    try:
+        return REPLICA_LFDS[replica_id]
+    except KeyError as exc:
+        raise ValueError(f"No LFD mapping for replica id: {replica_id}") from exc
+
+
 class Server:
     def __init__(self, replica_id: str, port_override: int | None = None):
         self.replica_id: str = replica_id
-        self.lfd_id = REPLICA_LFDS[replica_id]
+        self.lfd_id: str = lfd_id_for(replica_id)
         self.state: int = 0
         self._connections: dict[socket.socket, BufferedJsonConnection] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
         
-        # Load host/port configuration
+        # Load host/port configuration. The listen socket still binds all interfaces.
         host, port = get_address(self.replica_id)
 
         self.host: str = host
@@ -138,7 +152,7 @@ class Server:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         # lets us restart right after a ctrl-c instead of "address already in use"
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((self.host, self.port))
+        listener.bind(("0.0.0.0", self.port))
         listener.listen()
         log(f"{self.replica_id} up, waiting for clients on {self.host}:{self.port}", kind="info")
     
