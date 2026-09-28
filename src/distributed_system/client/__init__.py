@@ -14,7 +14,6 @@ import argparse
 from typing import cast
 
 from distributed_system.client.client import Client
-from distributed_system.config import SERVERS
 
 
 def _positive_float(value: str) -> float:
@@ -43,7 +42,6 @@ def _parse_args() -> argparse.Namespace:
         "--num_replicas",
         dest="num_replicas",
         type=_positive_int,
-        choices=range(1, len(SERVERS) + 1),
         required=True,
         help="Specify the number of replicas the client will broadcast to"
     )
