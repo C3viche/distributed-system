@@ -151,7 +151,7 @@ class Server:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         # lets us restart right after a ctrl-c instead of "address already in use"
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((self.host, self.port))
+        listener.bind(("0.0.0.0", self.port))
         listener.listen()
         log(f"{self.replica_id} up, waiting for clients on {self.host}:{self.port}", kind="info")
     
