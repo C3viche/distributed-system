@@ -1,9 +1,9 @@
 """Server replica for Milestone 2 18-749 (S1, S2, or S3).
 
 The server starts serving clients immediately. Registration with its paired
-LFD (S1→LFD1, S2→LFD2, S3→LFD3) is non-blocking: if the LFD is not up yet
-the select loop wakes once a second and retries, and it re-registers if the
-LFD connection drops. Client requests and LFD heartbeats are handled in the
+LFD (S1→LFD1, S2→LFD2, S3→LFD3) uses connection attempts bounded by
+a one-second timeout. The loop retries when disconnected and re-registers
+if the LFD connection drops. Client requests and LFD heartbeats are handled in the
 same select loop. No threads, timers, or randomness.
 
 The listen socket binds 0.0.0.0 so other machines can connect. The port, and
@@ -22,18 +22,19 @@ import socket
 from typing import cast
 
 from distributed_system.common import BufferedJsonConnection, log
-from distributed_system.config import get_address
+from distributed_system.config import REPLICA_LFDS, get_address
 
 
 def lfd_id_for(replica_id: str) -> str:
     """Return the LFD that heartbeats this replica: S1→LFD1, S2→LFD2, S3→LFD3."""
-    if replica_id.startswith("S") and replica_id[1:].isdigit():
-        return f"LFD{replica_id[1:]}"
-    raise ValueError(f"No LFD mapping for replica id: {replica_id}")
+    try:
+        return REPLICA_LFDS[replica_id]
+    except KeyError as exc:
+        raise ValueError(f"No LFD mapping for replica id: {replica_id}") from exc
 
 
 class Server:
-    def __init__(self, replica_id: str = "S1", port_override: int | None = None):
+    def __init__(self, replica_id: str, port_override: int | None = None):
         self.replica_id: str = replica_id
         self.lfd_id: str = lfd_id_for(replica_id)
         self.state: int = 0
@@ -49,12 +50,12 @@ class Server:
         if port_override:
             self.port: int = port_override
 
-        # Outbound connection to this replica's LFD; None while we have no LFD.
+        # Outbound connection to the assigned LFD; None while we have no LFD.
         self._lfd: socket.socket | None = None
         self._lfd_warned: bool = False
 
     def try_connect_to_lfd(self) -> None:
-        """Attempt one registration with this replica's LFD; never blocks the serve loop.
+        """Attempt registration with the assigned LFD (up to one second).
 
         On failure the socket stays None and the serve loop retries on its
         next tick. On success the socket joins the selector so heartbeats
@@ -191,7 +192,7 @@ class Server:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    _ = parser.add_argument("--id", default="S1", help="Replica ID")
+    _ = parser.add_argument("--id", choices=list(REPLICA_LFDS), required=True, help="Replica ID")
     _ = parser.add_argument("--port", type=int, default=None, help="Override port")
 
     args = parser.parse_args()
