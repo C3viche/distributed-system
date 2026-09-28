@@ -28,9 +28,10 @@ class ReplicaConnections:
         self._connections: dict[socket.socket, BufferedJsonConnection] = {}
         self._last_completed = 0
 
-    def connect_all(self) -> None:
+    def connect_all(self, members: list[str] | None = None) -> None:
         """Connect to available replicas, retaining main's bounded connect timeout."""
-        for replica_id, (host, port) in self.replicas.items():
+        selected = self.replicas if members is None else {name: self.replicas[name] for name in members}
+        for replica_id, (host, port) in selected.items():
             if replica_id in self.dead or replica_id in self.alive:
                 continue
             try:
@@ -43,6 +44,15 @@ class ReplicaConnections:
             self._connections[sock] = BufferedJsonConnection(sock)
             self._selector.register(sock, selectors.EVENT_READ, replica_id)
             log(f"{self.client_id} connected to {replica_id} at {host}:{port}", kind="registration")
+
+    def sync_membership(self, members: list[str]) -> None:
+        """Use GFD membership to close removed peers and connect missing members."""
+        for replica_id in list(self.alive):
+            if replica_id not in members:
+                self.mark_dead(replica_id)
+        # GFD can re-admit a restarted replica; dead is not a permanent blacklist.
+        self.dead.difference_update(members)
+        self.connect_all(members)
 
     def mark_dead(self, replica_id: str) -> None:
         """Remove a failed peer from both future broadcasts and readiness checks."""
