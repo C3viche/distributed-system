@@ -1,154 +1,164 @@
-# 18-749 Distributed System
+# Distributed Fault-Tolerant Application (18-749)
+A fault-tolerant, deterministic distributed client-server application built in Python for *CMU 18-749: Building Reliable Distributed Systems*.
 
-Fault-tolerant client/server app for CMU 18-749. Python, plain TCP sockets,
-one JSON object per line. No threads anywhere; every process is a single
-`selectors` loop so the servers stay deterministic.
+This project implements a complete distributed fault-tolerance infrastructure featuring heartbeating, membership updates, active/passive replication, state logging, checkpointing, and automatic failure recovery.
 
-Current milestone: **M2, active replication.** Three replicas, three LFDs, one
-GFD, three clients. Clients send every request to all live replicas, keep the
-first reply, and discard the rest. Kill a replica and the LFD notices, the GFD
-updates membership, and the clients keep going.
+## System Architecture
+The overall system models an asynchronous distributed application split into nodes that communicate over newline-delimited JSON TCP sockets:
+- **Server Replicas (`S1`, `S2`, `S3`)**: Stateful, deterministic server nodes. Each server maintains internal state (`my_state`) and handles incoming client requests and heartbeat checks.
+- **Local Fault Detector (`LFD1`, `LFD2`, `LFD3`)**: Resides on the same physical/virtual host as its assigned server replica. Sends periodic heartbeats to monitor replica health and reports crashes.
+- **Global Fault Detector (`GFD`)**: Aggregates local health notifications from all LFDs, maintains central system group membership, and broadcasts membership updates.
+- **Replication Manager (`RM`)**: Orchestrates high-level system fault tolerance, tracks healthy members, and automates replica recovery/re-launch.
+- **Clients (`C1`, `C2`, `C3`)**: Independent client processes issuing requests with unique `<client_id, replica_id, request_num>` tuples.
 
-## What runs where
+### Which laptop runs what
 
-| Laptop | Runs | Command |
-|---|---|---|
-| Replica 1 | LFD1, S1 | `./run_all.sh replica 1` |
-| Replica 2 | LFD2, S2 | `./run_all.sh replica 2` |
-| Replica 3 | LFD3, S3 | `./run_all.sh replica 3` |
-| Client laptop | GFD, C1, C2, C3 | `./run_all.sh gfd` then `./run_all.sh clients` |
+| Laptop | Processes |
+|---|---|
+| Replica 1 | LFD1, S1 |
+| Replica 2 | LFD2, S2 |
+| Replica 3 | LFD3, S3 |
+| Client laptop | GFD, C1, C2, C3 |
 
-Each LFD has to be on the same machine as the server it heartbeats. The GFD
-and the clients share a machine because the guide says so and because none of
-them are replicated anyway.
+Each LFD has to be on the same machine as the server it heartbeats. The GFD and the clients go on the fourth machine, as the project guide suggests.
 
-## Setup
+## Prerequisites & Installation
+- Python: >= 3.13
+- Package & Task Runner: uv
 
-Python 3.13 and [uv](https://docs.astral.sh/uv/). Then:
+Install dependencies and set up the local virtual environment:
 
 ```bash
 uv sync
+```
+
+## Configuration (`.env`)
+
+Copy the shared template to create your local configuration:
+
+```bash
 cp .env.example .env
 ```
 
-`.env` holds the host and port of every process and is gitignored, so each
-laptop keeps its own copy. The template runs everything on `127.0.0.1`, which
-is all you need to develop on one machine.
+`.env` is ignored by Git; `.env.example` lists all supported host/port settings.
+The template runs everything on one Mac. For multiple Macs, replace loopback
+addresses with the corresponding machines' reachable LAN IPs, keeping each
+server and its LFD on the same machine. Use consistent addresses across machines.
+Existing shell environment variables take precedence over `.env` values.
 
-### Before a multi-laptop run
+Heartbeat frequency and timeout remain CLI options (`--heartbeat_freq` and
+`--timeout`); use the same frequency for all three LFDs. GFD uses `GFD_HOST` and `GFD_PORT`; RM remains reserved for a future milestone.
 
-1. **Everyone on the same Wi-Fi.** Turn VPNs off; they route traffic away from
-   the local network. Test on the network you'll demo on, since some CMU
-   subnets block laptop-to-laptop traffic.
-2. **Find your IP.** On a Mac:
+### Setting up `.env` for a multi-laptop run
+
+1. Make sure everyone is on the same Wi-Fi network and has their VPN turned off. Since the IPs are handed out by the network, they will be different on campus Wi-Fi than at home, so this has to be redone on the day of the demo.
+2. Find your laptop's IP address. On a Mac:
    ```bash
    ipconfig getifaddr en0
    ```
-   If that prints nothing, try `en1`, or look in System Settings → Wi-Fi →
-   Details. This address changes every time you join a different network, so
-   check it again on demo day.
-3. **Fill in `.env` with the four real addresses.** The replica-1 laptop's IP
-   goes in `S1_HOST` and `LFD1_HOST`, and so on. The client laptop's IP goes in
-   `GFD_HOST`. Leave the ports alone. **All four `.env` files should be
-   identical.** Paste the finished one in Slack so nobody types it by hand.
-4. **Firewall.** The first time Python listens on a port, macOS asks whether to
-   allow incoming connections. Click Allow. If a client can't reach a server,
-   this prompt is the usual reason.
+   If that prints nothing, try `en1`, or check System Settings → Wi-Fi → Details.
+3. Put the four addresses into `.env`. The replica 1 laptop's IP goes in `S1_HOST` and `LFD1_HOST`, replica 2's in `S2_HOST` and `LFD2_HOST`, and so on. The client laptop's IP goes in `GFD_HOST`. The ports can stay as they are. Every laptop should end up with the same `.env`, so it is easiest to have one person fill it in and share it.
+4. The first time a process listens on a port, macOS will ask whether to allow incoming connections. Allow it. If a client cannot reach a server, this prompt is usually the reason.
 
-## Running it
+## Milestone #2 Execution Guide
+Milestone #2 runs three active replicas with an LFD each, a GFD that tracks membership, and three clients that send every request to all replicas and discard duplicate replies.
 
-`run_all.sh` opens each process in its own Terminal window, in the order the
-rubric wants. It just runs the `uv run` commands listed below; use those
-directly if you'd rather.
+The launch order is GFD, then the three LFDs, then S1, S2, and S3 one at a time, then the clients.
 
-Launch order matters. GFD first, then the LFDs, then the servers one at a
-time, then the clients.
+### Using `run_all.sh`
+
+`run_all.sh` opens each process in its own Terminal window and runs the `uv run` commands listed below. Each laptop runs the command for its role:
 
 ```bash
-# client laptop
+# Client laptop, first
 ./run_all.sh gfd
 
-# each replica laptop, one after another
+# Replica laptops, one at a time (2 and 3 on the other laptops)
 ./run_all.sh replica 1
-./run_all.sh replica 2
-./run_all.sh replica 3
 
-# client laptop, once all three replicas show up in the GFD window
+# Client laptop, once the GFD window shows all three replicas
 ./run_all.sh clients
 ```
 
-Everything on one machine:
+To run everything on one machine for testing:
 
 ```bash
 ./run_all.sh local
 ```
 
-Other things it can do:
+Other options:
 
 ```bash
 ./run_all.sh kill server 1     # crash S1, same as Ctrl-C in its window
-./run_all.sh kill all          # stop everything it started
-./run_all.sh local --headless  # no windows; output goes to logs/*.log
+./run_all.sh kill all          # stop everything the script started
+./run_all.sh local --headless  # no windows, output goes to logs/*.log
 HEARTBEAT_FREQ=2 INTERVAL=0.5 ./run_all.sh local   # faster heartbeats and requests
 ```
 
-It refuses to start if a port is already taken, which usually means a process
-from an earlier run is still alive. `kill all` clears that. If the port is held
-by something else (OrbStack and some dev servers sit on 8080), either quit that
-app or change the port in `.env` on every laptop. `kill` only ever touches
-processes started from this repo.
+The script will not start if one of the ports is already in use, which usually means a process from an earlier run is still going. `kill all` takes care of that. If the port belongs to some other program (OrbStack uses 8080, for example), either quit it or change the port in `.env` on every laptop. `kill` only stops processes that were started from this repository.
 
-### The commands it runs
+### Running the commands by hand
+
+Run each command in a separate terminal tab/window:
 
 ```bash
 uv run gfd --heartbeat_freq 1 --timeout 2
 uv run lfd --id LFD1 --heartbeat_freq 1 --timeout 2
+uv run lfd --id LFD2 --heartbeat_freq 1 --timeout 2
+uv run lfd --id LFD3 --heartbeat_freq 1 --timeout 2
 uv run server --id S1
+uv run server --id S2
+uv run server --id S3
 uv run client --id C1 --interval 1
+uv run client --id C2 --interval 1
+uv run client --id C3 --interval 1
 ```
 
-`--heartbeat_freq` is in Hz. Use the same value on the GFD and all three LFDs.
-`--timeout` is how many seconds without an ack before the LFD declares the
-server dead. `--interval` is seconds between client requests.
+`--heartbeat_freq` is in heartbeats per second (Hz); use the same value for the GFD and all three LFDs. `--timeout` is how many seconds the LFD waits for an ACK before declaring the server dead. `--interval` is the number of seconds between client requests.
 
-## Demo walkthrough
+### What happens at each step
 
-What to point at in each window, in the order Priya's rubric goes.
+1. The GFD starts and prints `GFD: 0 members`.
+2. Each LFD registers with the GFD. The GFD and LFD windows start showing numbered heartbeats in both directions.
+3. S1 starts and registers with LFD1. After the first successful heartbeat, LFD1 prints `LFD1: add replica S1` and the GFD prints `GFD: 1 member: S1`. The same happens for S2 and S3, ending with `GFD: 3 members: S1, S2, S3`.
+4. Each client registers with the GFD, receives the member list, and opens a connection to every replica. It then loops continuously, printing a `Sent` line for each replica followed by `Received` for the replies. `request_num` is incremented after the first reply arrives, not after all three.
+5. Each server window shows `Received`, `my_state` before, `my_state` after, and `Sending` for every request. `my_state` counts requests, so the three servers track each other, though they can differ briefly when requests from different clients arrive in a different order.
+6. Press Ctrl-C in the S1 window. LFD1 prints `S1 has died` and `LFD1: delete replica S1`. The GFD prints `GFD: 2 members: S2, S3` and sends the new list to the clients, which print that they removed S1 and continue with two `Sent` lines per request.
+7. After some time, press Ctrl-C in the S2 window. The same sequence happens again, ending with `GFD: 1 member: S3`.
 
-1. GFD starts and prints `GFD: 0 members`.
-2. Each LFD prints that it registered with the GFD. GFD and LFD windows start
-   showing numbered heartbeats in both directions.
-3. S1 starts, registers with LFD1, and LFD1 prints `LFD1: add replica S1`.
-   GFD prints `GFD: 1 member: S1`. Same for S2 and S3, ending at
-   `GFD: 3 members: S1, S2, S3`.
-4. Each client registers with the GFD, gets the member list, and opens a
-   socket to every replica. It then loops forever: three `Sent` lines, one per
-   replica, then `Received` for the replies. `request_num` goes up after the
-   first reply, not after all three.
-5. Every server window shows `Received`, `my_state` before, `my_state` after,
-   and `Sending` for every request. `my_state` counts requests, so the three
-   servers track each other; they can differ briefly when requests from
-   different clients arrive in a different order.
-6. Ctrl-C S1. Within one heartbeat interval LFD1 prints `S1 has died` and
-   `LFD1: delete replica S1`. GFD prints `GFD: 2 members: S2, S3` and pushes
-   the new list to the clients. Clients print that they removed S1 and carry
-   on with two `Sent` lines per request. No pause.
-7. Wait a bit, then Ctrl-C S2. Same thing again, ending at `GFD: 1 member: S3`.
+Recovery of a dead replica, checkpointing, and the RM are not part of this milestone.
 
-Not part of M2: bringing a dead replica back, checkpointing, the RM.
+### LFD and GFD behavior
 
-## Messages on the wire
+Each LFD registers with GFD before reporting a replica. The first successful
+server heartbeat adds the replica; timeout or disconnection removes it.
+The LFD keeps answering GFD heartbeats while its server is absent. If GFD is
+unavailable, server monitoring continues; the LFD retries once per second
+and reports current healthy membership after reconnecting.
 
-Newline-delimited JSON over TCP. Every client/server message carries
-`client_id`, `replica_id`, and `request_num` so requests and replies can be
-matched up.
+Clients register with GFD before sending requests. GFD immediately sends the
+current replica IDs and member count, then sends a new full snapshot whenever
+membership changes. Both sides log each delivery. Clients use those IDs to
+open or close replica connections; `--num_replicas` is a legacy option and does
+not limit GFD membership.
+
+Run the local integration tests with:
+
+```bash
+uv run python -m unittest discover -s tests -p 'test_gfd_integration.py' -v
+```
+
+## Wire Protocol & Logging Format
+
+### Message Framing
+All network communication uses newline-delimited JSON payloads over TCP (\n framing)
 
 ```json
-{"type": "request", "client_id": "C1", "replica_id": "S1", "request_num": 1, "payload": "hello from C1 #1"}
-{"type": "reply",   "client_id": "C1", "replica_id": "S1", "request_num": 1, "state": 1}
+{"type": "request", "client_id": "C1", "replica_id": "S1", "request_num": 1, "payload": "Hello"}
+{"type": "reply", "client_id": "C1", "replica_id": "S1", "request_num": 1, "state": 1}
 ```
 
-Server ↔ LFD (unchanged from M1):
+Server heartbeats keep the M1 format:
 
 ```json
 {"type": "registration", "replica_id": "S1"}
@@ -156,62 +166,41 @@ Server ↔ LFD (unchanged from M1):
 {"type": "heartbeat_ack", "replica_id": "S1", "count": 1}
 ```
 
-LFD ↔ GFD and client ↔ GFD (new in M2):
+The GFD channel uses these JSON-line messages:
 
 ```json
-{"type": "register_lfd", "lfd_id": "LFD1"}
-{"type": "heartbeat", "from": "GFD", "to": "LFD1", "count": 1}
-{"type": "heartbeat_ack", "from": "LFD1", "to": "GFD", "count": 1}
-{"type": "add_replica", "lfd_id": "LFD1", "replica_id": "S1"}
-{"type": "delete_replica", "lfd_id": "LFD1", "replica_id": "S1"}
-{"type": "register_client", "client_id": "C1"}
-{"type": "membership", "members": ["S1", "S2"], "member_count": 2}
+{"type":"register_lfd","lfd_id":"LFD1"}
+{"type":"heartbeat","from":"GFD","to":"LFD1","count":1}
+{"type":"heartbeat_ack","from":"LFD1","to":"GFD","count":1}
+{"type":"add_replica","lfd_id":"LFD1","replica_id":"S1"}
+{"type":"delete_replica","lfd_id":"LFD1","replica_id":"S1"}
+{"type":"register_client","client_id":"C1"}
+{"type":"membership","members":["S1","S2"],"member_count":2}
 ```
 
-## Console colors
+### Protocol Tuple Specification
+Per project requirements, every client-server exchange is logged and tracked via:
 
-Every line starts with a `[C1]`-style tag in that process's own color, so you
-can tell windows apart at a glance. A server and its LFD share a color (S1 and
-LFD1 are both orange), the three clients each get their own, GFD is white.
+$$
+\langle \text{client\_id}, \text{replica\_id}, \text{request\_num}, \text{payload/direction} \rangle
+$$
 
-Timestamps are UTC. The rest of the line is colored by message kind:
+### Color-Coded Log Visuals
+Every line begins with a tag such as `[C1]` in that process's own color. A server and its LFD share a color (S1 and LFD1 are both orange), each client has its own color, and the GFD is white.
 
-- yellow: requests and replies (bold for sends)
-- magenta: heartbeats
-- green: `my_state` updates
-- blue: registrations
-- cyan: membership changes
-- red: failures and dropped connections
+Console outputs are timestamped in UTC and the rest of the line is color-coded by message type:
+- Yellow: Client/Server requests & replies (send/receive)
+- Magenta: Heartbeat checks and acknowledgments
+- Green: State processing updates (my_state)
+- Blue: Registration events (`S1` $\rightarrow$ `LFD1`)
+- Cyan: Membership changes
+- Red: Process failures & socket tear-downs
 
-## Tests
-
-```bash
-uv run python -m unittest discover -s tests -p 'test_gfd_integration.py' -v
-```
-
-Spins up a real GFD, LFDs, servers, and clients on random localhost ports and
-checks their output. Takes about five seconds.
-
-## Layout
-
-```
-src/distributed_system/
-  common.py        JSON framing, buffered connections, colored log()
-  config.py        reads .env, maps S1→LFD1 etc.
-  server/server.py
-  lfd/lfd.py
-  gfd/gfd.py
-  client/client.py
-run_all.sh
-tests/
-```
-
-## Milestones
-
-1. One server, one LFD, three clients. Done.
-2. Active replication with the GFD. This one.
-3. Passive replication with checkpointing.
-4. RM plus manual recovery.
-5. Automatic recovery under repeated faults.
+## Project Milestones Roadmap
+- Milestone #1: Single stateful server replica (`S1`), 3 clients, and `LFD1` heartbeat monitoring.
+- Milestone #2 (Current): Active replication across 3 replicas (`S1`, `S2`, `S3`), `GFD` membership tracking, and client-side duplicate suppression.
+- Milestone #3: Warm passive replication with primary-to-backup state checkpointing.
+- Milestone #4: Integrated Fault-Tolerance infrastructure (`RM` + `GFD` + `LFD`s) with manual crash recovery.
+- Milestone #5: Full fault-tolerance standard featuring multi-fault handling and automated `RM` recovery.
 
 *AI was used as assistance in the making of this document*
