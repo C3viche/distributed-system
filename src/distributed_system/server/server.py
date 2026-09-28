@@ -1,9 +1,9 @@
 """Server replica for Milestone 2 18-749 (S1, S2, or S3).
 
 The server starts serving clients immediately. Registration with its paired
-LFD (S1→LFD1, S2→LFD2, S3→LFD3) is non-blocking: if the LFD is not up yet
-the select loop wakes once a second and retries, and it re-registers if the
-LFD connection drops. Client requests and LFD heartbeats are handled in the
+LFD (S1→LFD1, S2→LFD2, S3→LFD3) uses connection attempts bounded by
+a one-second timeout. The loop retries when disconnected and re-registers
+if the LFD connection drops. Client requests and LFD heartbeats are handled in the
 same select loop. No threads, timers, or randomness.
 
 The listen socket binds 0.0.0.0 so other machines can connect. The port, and
@@ -28,9 +28,10 @@ from distributed_system.config import REPLICA_LFDS, get_address
 
 def lfd_id_for(replica_id: str) -> str:
     """Return the LFD that heartbeats this replica: S1→LFD1, S2→LFD2, S3→LFD3."""
-    if replica_id.startswith("S") and replica_id[1:].isdigit():
-        return f"LFD{replica_id[1:]}"
-    raise ValueError(f"No LFD mapping for replica id: {replica_id}")
+    try:
+        return REPLICA_LFDS[replica_id]
+    except KeyError as exc:
+        raise ValueError(f"No LFD mapping for replica id: {replica_id}") from exc
 
 
 class Server:
@@ -55,7 +56,7 @@ class Server:
         self._lfd_warned: bool = False
 
     def try_connect_to_lfd(self) -> None:
-        """Attempt one registration with this replica's LFD; never blocks the serve loop.
+        """Attempt registration with the assigned LFD (up to one second).
 
         On failure the socket stays None and the serve loop retries on its
         next tick. On success the socket joins the selector so heartbeats

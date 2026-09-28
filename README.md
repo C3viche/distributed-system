@@ -119,12 +119,6 @@ The GFD channel uses these JSON-line messages (server heartbeats retain the M1 f
 {"type":"membership","members":["S1","S2"],"member_count":2}
 ```
 
-Run the local integration tests with:
-
-```bash
-uv run python -m unittest discover -s tests -p 'test_gfd_integration.py' -v
-```
-
 ## Wire Protocol & Logging Format
 
 ### Message Framing
