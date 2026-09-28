@@ -54,7 +54,6 @@ class Server:
 
         # Outbound connection to the assigned LFD; None while we have no LFD.
         self._lfd: socket.socket | None = None
-        self._lfd_warned: bool = False
 
     def try_connect_to_lfd(self) -> None:
         """Attempt registration with the assigned LFD (up to one second).
@@ -64,17 +63,15 @@ class Server:
         are handled alongside client traffic.
         """
         lfd_host, lfd_port = get_address(self.lfd_id)
+        log(f"{self.replica_id} trying to connect to {self.lfd_id} at {lfd_host}:{lfd_port}", kind="info")
         try:
             # Short timeout bounds the TCP handshake if the LFD host is unreachable.
             s = socket.create_connection((lfd_host, lfd_port), timeout=1.0)
-        except OSError:
-            if not self._lfd_warned:
-                log(f"{self.replica_id}: no LFD at {lfd_host}:{lfd_port} yet, retrying every second", kind="info")
-                self._lfd_warned = True
+        except OSError as exc:
+            log(f"{self.replica_id} could not reach {self.lfd_id} ({exc}); retrying in 1s", kind="failure")
             return
 
         self._lfd = s
-        self._lfd_warned = False
         self._register(s, "lfd")
         self._send_json(s, {"type": "registration", "replica_id": self.replica_id})
         log(f"{self.replica_id} registered with {self.lfd_id}", kind="registration")

@@ -94,6 +94,7 @@ class LocalFaultDetector:
         self._selector = selectors.DefaultSelector()
         self._connections: dict[socket.socket, ServerSession | GFDSession] = {}
         self._server: ServerSession | None = None
+        self._absent_notice_at: float | None = None
         self._gfd = GFDSession(get_address("GFD"))
 
     def _membership_changed(self, added: bool) -> None:
@@ -245,7 +246,13 @@ class LocalFaultDetector:
                 log("Server registration timed out", kind="failure")
                 self._drop(sock)
         if self._server is None:
+            # Keep saying so once per heartbeat interval, so the console shows
+            # the LFD is still waiting for its replica after a crash.
+            if self._absent_notice_at is None or now >= self._absent_notice_at:
+                log(f"{self.lfd_id} heartbeat to {self.replica_id}: no connection, waiting for {self.replica_id} to register", kind="failure")
+                self._absent_notice_at = now + self.interval
             return
+        self._absent_notice_at = None
         if self._server.ack_deadline is not None and now >= self._server.ack_deadline:
             self._drop(self._server.sock)
         elif (
@@ -265,6 +272,8 @@ class LocalFaultDetector:
         deadlines = [session.next_deadline() for session in self._connections.values()
                      if isinstance(session, ServerSession)]
         deadlines.append(self._gfd.next_deadline())
+        if self._server is None:
+            deadlines.append(self._absent_notice_at)
         pending = [deadline for deadline in deadlines if deadline is not None]
         return max(0.0, min(pending) - time.monotonic()) if pending else None
 
