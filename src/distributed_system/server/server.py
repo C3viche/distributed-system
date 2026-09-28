@@ -186,7 +186,7 @@ class Server:
                     conn, client_addr = cast(tuple[socket.socket, tuple[str, int]], listener.accept())
 
                     self._register(conn, "client")
-                    log(f"new client connection from {client_addr[0]}:{client_addr[1]}", kind="info")
+                    log(f"new client connection from {client_addr[0]}:{client_addr[1]}", kind="registration")
 
                 else:
                     try:
