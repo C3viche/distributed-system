@@ -53,13 +53,31 @@ launch() {
         (cd "$ROOT" && eval "$cmd") > "$LOGDIR/$name.log" 2>&1 &
         echo "started $name (pid $!) -> logs/$name.log"
     else
-        osascript > /dev/null <<EOF
+        # If Terminal is still relaunching after a `kill all`, the first attempt
+        # can fail with "Connection is invalid"; wait a moment and try once more.
+        local attempt
+        for attempt in 1 2; do
+            if osascript > /dev/null 2>&1 <<EOF
 tell application "Terminal"
-    set t to do script "cd '$ROOT' && $cmd"
+    activate
+    -- The printf sets the window title to the process name before the command runs.
+    set t to do script "cd '$ROOT' && printf '\\\\033]0;$name\\\\007' && $cmd"
+    -- Hide the other title parts Terminal would add (working directory, shell, size).
     set custom title of t to "$name"
+    set title displays custom title of t to true
+    set title displays device name of t to false
+    set title displays file name of t to false
+    set title displays shell path of t to false
+    set title displays window size of t to false
 end tell
 EOF
-        echo "opened window: $name"
+            then
+                echo "opened window: $name"
+                return
+            fi
+            sleep 1
+        done
+        echo "could not open a Terminal window for $name"
     fi
 }
 
