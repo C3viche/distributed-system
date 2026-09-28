@@ -18,7 +18,7 @@ import socket
 import time
 from typing import cast
 
-from distributed_system.common import BufferedJsonConnection, heartbeat, log
+from distributed_system.common import BufferedJsonConnection, heartbeat, log, set_process_id
 from distributed_system.config import REPLICA_LFDS, resolve_address
 
 
@@ -361,6 +361,7 @@ def main() -> None:
     _ = parser.add_argument("--host", default=None, help="override GFD_HOST")
     _ = parser.add_argument("--port", type=int, default=None, help="override GFD_PORT")
     args = parser.parse_args()
+    set_process_id("GFD")
 
     detector = GlobalFaultDetector(
         frequency=cast(float, args.frequency),

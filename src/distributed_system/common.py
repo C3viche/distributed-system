@@ -4,6 +4,7 @@ Public API can be called:
     send_json(sock, message)
     recv_json(sock)
     heartbeat(from_id, to_id, count, ack=False)
+    set_process_id("C1")
     log(message, kind="info")
 
 Wire format is one JSON object per line:
@@ -29,6 +30,28 @@ all_colors = {
     "failure": "red",
     "info": "white",
 }
+
+# Each process gets its own color for the [id] tag at the start of every line,
+# so you can tell windows apart at a glance. A server and its LFD share a color
+# (S1 and LFD1 are both orange), clients each get their own, GFD is white.
+# 256-color codes, picked to not collide with the kind colors above.
+process_colors = {
+    "S1": 208, "LFD1": 208,   # orange
+    "S2": 141, "LFD2": 141,   # purple
+    "S3": 43,  "LFD3": 43,    # teal
+    "C1": 213,                # pink
+    "C2": 118,                # lime
+    "C3": 75,                 # sky blue
+    "GFD": 255,               # white
+}
+
+_process_id: str | None = None
+
+
+def set_process_id(process_id: str) -> None:
+    """Call once at startup so every log line is tagged and colored for this process."""
+    global _process_id
+    _process_id = process_id
 
 
 def heartbeat(
@@ -142,4 +165,10 @@ def log(message: str, kind: str = "info") -> None:
 
     style = attr("bold") if kind in {"send", "membership"} else ""
 
-    print(f"{style}{fg(color)}[{timestamp}] {message}{attr('reset')}", flush=True)
+    # Process tag in the process's own color, then the message in its kind color.
+    tag = ""
+    if _process_id is not None:
+        tag_color = process_colors.get(_process_id, 255)
+        tag = f"{attr('bold')}{fg(tag_color)}[{_process_id}]{attr('reset')} "
+
+    print(f"{fg(color)}[{timestamp}]{attr('reset')} {tag}{style}{fg(color)}{message}{attr('reset')}", flush=True)
