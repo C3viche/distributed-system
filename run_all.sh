@@ -9,6 +9,7 @@
 #   ./run_all.sh lfd 2              just LFD2
 #   ./run_all.sh server 2           just S2
 #   ./run_all.sh kill server 1      crash S1 (same effect as Ctrl-C in its window)
+#   ./run_all.sh kill lfd 1         crash LFD1; also works for client 1 and gfd
 #   ./run_all.sh kill all           stop every process this script can find
 #
 # Add --headless to write each process's output to logs/<name>.log instead of
@@ -176,6 +177,16 @@ case "$1" in
             server) [ $# -eq 3 ] || usage; kill_port "S$3" "$(port_of S$3)" ;;
             lfd)    [ $# -eq 3 ] || usage; kill_port "LFD$3" "$(port_of LFD$3)" ;;
             gfd)    kill_port GFD "$(port_of GFD)" ;;
+            client) [ $# -eq 3 ] || usage
+                    # Clients don't listen on a port, so match the command line instead.
+                    pattern="$ROOT/.venv/bin/client --id C$3( |\$)"
+                    if pkill -INT -f "$pattern"; then
+                        sleep 0.5
+                        pkill -9 -f "$pattern" 2>/dev/null
+                        echo "killed C$3"
+                    else
+                        echo "C$3: not running"
+                    fi ;;
             *)      usage ;;
         esac
         ;;
