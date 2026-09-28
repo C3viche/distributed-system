@@ -40,6 +40,7 @@ class Server:
         self.lfd_id: str = lfd_id_for(replica_id)
         self.state: int = 0
         self._connections: dict[socket.socket, BufferedJsonConnection] = {}
+        self._client_ids: dict[socket.socket, str] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
 
         # Load host/port configuration. The listen socket still binds all interfaces.
@@ -94,6 +95,8 @@ class Server:
             return
 
         client = msg.get("client_id")
+        if isinstance(client, str) and client:
+            self._client_ids[sock] = client
         req = msg.get("request_num")
         payload = msg.get("payload", "")
 
@@ -131,7 +134,8 @@ class Server:
     def _read_messages(self, sock: socket.socket, kind: str) -> None:
         messages = self._connections[sock].receive()
         if messages is None:
-            self._close_sock(sock, f"lost connection to {self.lfd_id}" if kind == "lfd" else "client disconnected")
+            why = f"lost connection to {self.lfd_id}" if kind == "lfd" else "client disconnected"
+            self._close_sock(sock, why)
             return
         for msg in messages:
             if kind == "lfd":
@@ -143,9 +147,14 @@ class Server:
         # have to unregister or select() keeps waking up on the dead socket
         _ = self.sel.unregister(sock)
         self._connections.pop(sock, None)
+        client_id = self._client_ids.pop(sock, None)
         sock.close()
         if sock is self._lfd:
             self._lfd = None  # serve loop will try to re-register
+        elif client_id and "client disconnected" in why:
+            why = f"{client_id} disconnected"
+        elif client_id and why.startswith("Connection lost"):
+            why = f"{client_id} disconnected ({why})"
         log(why, kind="failure")
 
 
