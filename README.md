@@ -143,9 +143,19 @@ open or close replica connections; `--num_replicas` is a legacy option and does
 not limit GFD membership.
 
 Run the local integration tests with:
-
 ```bash
 uv run python -m unittest discover -s tests -p 'test_gfd_integration.py' -v
+```
+
+The GFD channel uses these JSON-line messages (server heartbeats retain the M1 format):
+```json
+{"type":"register_lfd","lfd_id":"LFD1"}
+{"type":"heartbeat","from":"GFD","to":"LFD1","count":1}
+{"type":"heartbeat_ack","from":"LFD1","to":"GFD","count":1}
+{"type":"add_replica","lfd_id":"LFD1","replica_id":"S1"}
+{"type":"delete_replica","lfd_id":"LFD1","replica_id":"S1"}
+{"type":"register_client","client_id":"C1"}
+{"type":"membership","members":["S1","S2"],"member_count":2}
 ```
 
 ## Wire Protocol & Logging Format
