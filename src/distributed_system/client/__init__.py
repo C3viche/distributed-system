@@ -1,13 +1,11 @@
-"""Client entry point for Milestone 1.
+"""Client entry point for Milestone 2.
 
 Usage:
     uv run client --id C1 --num_replicas 1
     uv run client --id C2 --num_replicas 1 --interval 0.5
     uv run client --id C3 --num_replicas 1 --count 5
 
-Address resolution precedence for replicas:
-    -> S1_HOST / S1_PORT environment variables (also loaded from .env)
-    -> config.py defaults (127.0.0.1:8080)
+The GFD supplies live replica IDs; config.py resolves their host/port values.
 """
 
 import argparse
@@ -42,8 +40,8 @@ def _parse_args() -> argparse.Namespace:
         "--num_replicas",
         dest="num_replicas",
         type=_positive_int,
-        required=True,
-        help="Specify the number of replicas the client will broadcast to"
+        default=None,
+        help="Legacy option; GFD membership determines the active replicas",
     )
     _ = parser.add_argument(
         "--interval",

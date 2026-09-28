@@ -8,7 +8,7 @@ later replies for that request_num are discarded.
 No coordination between C1/C2/C3. Each holds its own request_num.
 """
 
-from distributed_system.common import log
+from distributed_system.common import BufferedJsonConnection, log
 from distributed_system.config import get_server_addresses
 from distributed_system.server.replica_conns import ReplicaConnections
 
@@ -19,15 +19,19 @@ class Client:
     def __init__(
         self,
         client_id: str,
-        num_replicas: int | None,
+        num_replicas: int | None = None,
         interval: float = 1.0,
         count: int | None = None,
         payload_template: str = "hello from {client_id} #{request_num}",
     ) -> None:
         """Initialize the client configuration and state."""
         self.client_id: str = client_id
-        self.num_replicas: int | None = num_replicas
-        self.replicas: dict[str, tuple[str, int]] = get_server_addresses(num_replicas)
+        # num_replicas is retained for callers using the old CLI; GFD is authoritative.
+        self.replicas: dict[str, tuple[str, int]] = get_server_addresses()
+        self.membership: list[str] = []
+        self._gfd: BufferedJsonConnection | None = None
+        self._received_membership: bool = False
+        self._gfd_retry_at: float = 0.0
         self.interval: float = interval
         self.count: int | None = count  # None -> loop until Ctrl-C / server closes
         self.payload_template: str = payload_template

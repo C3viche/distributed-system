@@ -1,9 +1,9 @@
 """Server replica for Milestone 2 18-749 (S1, S2, or S3).
 
 The server starts serving clients immediately. Registration with its paired
-LFD (S1→LFD1, S2→LFD2, S3→LFD3) is non-blocking: if the LFD is not up yet
-the select loop wakes once a second and retries, and it re-registers if the
-LFD connection drops. Client requests and LFD heartbeats are handled in the
+LFD (S1→LFD1, S2→LFD2, S3→LFD3) uses connection attempts bounded by
+a one-second timeout. The loop retries when disconnected and re-registers
+if the LFD connection drops. Client requests and LFD heartbeats are handled in the
 same select loop. No threads, timers, or randomness.
 
 The listen socket binds 0.0.0.0 so other machines can connect. The port, and
@@ -22,24 +22,26 @@ import socket
 from typing import cast
 
 from distributed_system.common import BufferedJsonConnection, log
-from distributed_system.config import get_address
+from distributed_system.config import REPLICA_LFDS, get_address
+
 
 
 def lfd_id_for(replica_id: str) -> str:
     """Return the LFD that heartbeats this replica: S1→LFD1, S2→LFD2, S3→LFD3."""
-    if replica_id.startswith("S") and replica_id[1:].isdigit():
-        return f"LFD{replica_id[1:]}"
-    raise ValueError(f"No LFD mapping for replica id: {replica_id}")
+    try:
+        return REPLICA_LFDS[replica_id]
+    except KeyError as exc:
+        raise ValueError(f"No LFD mapping for replica id: {replica_id}") from exc
 
 
 class Server:
-    def __init__(self, replica_id: str = "S1", port_override: int | None = None):
+    def __init__(self, replica_id: str, port_override: int | None = None):
         self.replica_id: str = replica_id
         self.lfd_id: str = lfd_id_for(replica_id)
         self.state: int = 0
         self._connections: dict[socket.socket, BufferedJsonConnection] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
-        
+
         # Load host/port configuration. The listen socket still binds all interfaces.
         host, port = get_address(self.replica_id)
 
@@ -49,12 +51,12 @@ class Server:
         if port_override:
             self.port: int = port_override
 
-        # Outbound connection to this replica's LFD; None while we have no LFD.
+        # Outbound connection to the assigned LFD; None while we have no LFD.
         self._lfd: socket.socket | None = None
         self._lfd_warned: bool = False
 
     def try_connect_to_lfd(self) -> None:
-        """Attempt one registration with this replica's LFD; never blocks the serve loop.
+        """Attempt registration with the assigned LFD (up to one second).
 
         On failure the socket stays None and the serve loop retries on its
         next tick. On success the socket joins the selector so heartbeats
@@ -80,7 +82,7 @@ class Server:
     def handle_lfd(self, sock: socket.socket, msg: dict[str, object]) -> None:
         if msg.get("type") != "heartbeat":
             return
-        
+
         count = msg.get("count")
         log(f"{self.replica_id} got heartbeat [{count}] from {self.lfd_id}", kind="heartbeat")
         self._send_json(sock, {"type": "heartbeat_ack", "replica_id": self.replica_id, "count": count})
@@ -90,16 +92,16 @@ class Server:
     def handle_client(self, sock: socket.socket, msg: dict[str, object]) -> None:
         if msg.get("type") != "request":
             return
-    
+
         client = msg.get("client_id")
         req = msg.get("request_num")
         payload = msg.get("payload", "")
-    
+
         log(f"Received <{client}, {self.replica_id}, {req}, {payload}>", kind="receive")
         log(f"my_state = {self.state} before processing", kind="state")
         self.state += 1
         log(f"my_state = {self.state} after processing", kind="state")
-    
+
         reply = {
             "type": "reply",
             "client_id": client,
@@ -145,8 +147,8 @@ class Server:
         if sock is self._lfd:
             self._lfd = None  # serve loop will try to re-register
         log(why, kind="failure")
-    
-    
+
+
     def serve(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         # lets us restart right after a ctrl-c instead of "address already in use"
@@ -154,10 +156,10 @@ class Server:
         listener.bind(("0.0.0.0", self.port))
         listener.listen()
         log(f"{self.replica_id} up, waiting for clients on {self.host}:{self.port}", kind="info")
-    
+
         # tag each socket so the loop knows what it's looking at
         _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
-    
+
         while True:
             if self._lfd is None:
                 self.try_connect_to_lfd()
@@ -167,7 +169,7 @@ class Server:
                 # Safely narrow key.fileobj to socket.socket
                 if not isinstance(key.fileobj, socket.socket):
                     continue
-                
+
                 sock: socket.socket = key.fileobj
                 data = cast(str, key.data)
 
@@ -175,8 +177,8 @@ class Server:
                     conn, client_addr = cast(tuple[socket.socket, tuple[str, int]], listener.accept())
 
                     self._register(conn, "client")
-                    log(f"new client connection from {client_addr[0]}:{client_addr[1]}", kind="info")                
-                
+                    log(f"new client connection from {client_addr[0]}:{client_addr[1]}", kind="info")
+
                 else:
                     try:
                         if events & selectors.EVENT_READ:
@@ -191,7 +193,7 @@ class Server:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    _ = parser.add_argument("--id", default="S1", help="Replica ID")
+    _ = parser.add_argument("--id", choices=list(REPLICA_LFDS), required=True, help="Replica ID")
     _ = parser.add_argument("--port", type=int, default=None, help="Override port")
 
     args = parser.parse_args()
