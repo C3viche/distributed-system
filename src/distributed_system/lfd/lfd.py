@@ -110,17 +110,21 @@ class LocalFaultDetector:
 
     def _connect_gfd(self, now: float) -> None:
         """Start a nonblocking connection; completion is handled on write readiness."""
+        host, port = self._gfd.address
+        log(f"{self.lfd_id} trying to connect to GFD at {host}:{port}", kind="info")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setblocking(False)
         try:
             result = sock.connect_ex(self._gfd.address)
-        except OSError:
+        except OSError as exc:
             sock.close()
             self._gfd.retry_at = now + 1.0
+            log(f"{self.lfd_id} could not reach GFD ({exc}); retrying in 1s", kind="failure")
             return
         if result not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
             sock.close()
             self._gfd.retry_at = now + 1.0
+            log(f"{self.lfd_id} could not reach GFD ({errno.errorcode.get(result, result)}); retrying in 1s", kind="failure")
             return
         self._gfd.sock = sock
         self._gfd.connecting = True
@@ -174,8 +178,13 @@ class LocalFaultDetector:
         self._connections.pop(sock)
         sock.close()
         if sock is self._gfd.sock:
+            was_connecting = self._gfd.connecting
             self._gfd.disconnected(time.monotonic())
-            log(f"{self.lfd_id} lost GFD connection; retrying", kind="failure")
+            if was_connecting:
+                # The attempt never completed (refused, timed out, host down).
+                log(f"{self.lfd_id} could not reach GFD; retrying in 1s", kind="failure")
+            else:
+                log(f"{self.lfd_id} lost GFD connection; retrying in 1s", kind="failure")
             return
         if self._server is not None and sock is self._server.sock:
             log(f"{self.replica_id} has died", kind="failure")
