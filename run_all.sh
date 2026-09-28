@@ -26,16 +26,19 @@ INTERVAL="${INTERVAL:-1}"
 HEADLESS=0
 LOGDIR="$ROOT/logs"
 
-# Port a process listens on: the value from .env, else the config.py default.
-# Only `kill` needs this.
+# Port a process listens on. Same lookup order as config.py: an exported
+# shell variable wins, then .env, then the built-in default.
 port_of() {
-    local name="$1" value default
+    local name="$1" var="${1}_PORT" value default
     case "$name" in
         GFD) default=9001 ;;
         S1) default=8080 ;; S2) default=8082 ;; S3) default=8083 ;;
         LFD1) default=8081 ;; LFD2) default=8084 ;; LFD3) default=8085 ;;
     esac
-    value=$(grep -E "^${name}_PORT=" "$ROOT/.env" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"' | tr -d "'")
+    value="${!var:-}"
+    if [ -z "$value" ]; then
+        value=$(grep -E "^${var}=" "$ROOT/.env" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"' | tr -d "'")
+    fi
     echo "${value:-$default}"
 }
 
@@ -65,15 +68,24 @@ start_lfd()    { launch "LFD$1" "uv run lfd --id LFD$1 --heartbeat_freq $HEARTBE
 start_server() { launch "S$1"   "uv run server --id S$1"; }
 start_client() { launch "C$1"   "uv run client --id C$1 --interval $INTERVAL"; }
 
-# Crash one process by killing whatever is listening on its port.
+# Crash one of our processes by finding what is listening on its port.
+# Only kills something launched from this repo's .venv; anything else on the
+# port (OrbStack likes 8080, for example) is left alone and reported.
 kill_port() {
-    local name="$1" port="$2" pids pid
+    local name="$1" port="$2" pids pid cmd
     pids=$(lsof -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null)
     if [ -z "$pids" ]; then
         echo "$name: nothing listening on port $port"
         return
     fi
     for pid in $pids; do
+        cmd=$(ps -o command= -p "$pid" 2>/dev/null)
+        case "$cmd" in
+            *"$ROOT/.venv/bin/"*) ;;
+            *) echo "$name: port $port is held by something that isn't ours, leaving it alone:"
+               echo "    pid $pid: $cmd"
+               continue ;;
+        esac
         kill -INT "$pid" 2>/dev/null
         sleep 0.5
         kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null

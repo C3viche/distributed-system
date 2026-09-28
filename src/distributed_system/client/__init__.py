@@ -12,6 +12,7 @@ import argparse
 from typing import cast
 
 from distributed_system.client.client import Client
+from distributed_system.common import set_process_id
 
 
 def _positive_float(value: str) -> float:
@@ -62,6 +63,7 @@ def main() -> None:
     args = _parse_args()
 
     client_id = cast(str, args.client_id)
+    set_process_id(client_id)
     num_replicas = cast(int | None, args.num_replicas)
 
     interval = cast(float, args.interval)

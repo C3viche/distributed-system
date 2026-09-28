@@ -16,7 +16,7 @@ import selectors
 import socket
 from typing import cast
 
-from distributed_system.common import BufferedJsonConnection, log
+from distributed_system.common import BufferedJsonConnection, log, set_process_id
 from distributed_system.config import REPLICA_LFDS, get_address
 
 
@@ -184,6 +184,7 @@ def main() -> None:
 
     args = parser.parse_args()
     replica_id = cast(str, args.id)
+    set_process_id(replica_id)
     port_override = cast(int | None, args.port)
 
     server = Server(replica_id=replica_id, port_override=port_override)

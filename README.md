@@ -93,7 +93,10 @@ HEARTBEAT_FREQ=2 INTERVAL=0.5 ./run_all.sh local   # faster heartbeats and reque
 ```
 
 It refuses to start if a port is already taken, which usually means a process
-from an earlier run is still alive. `kill all` clears that.
+from an earlier run is still alive. `kill all` clears that. If the port is held
+by something else (OrbStack and some dev servers sit on 8080), either quit that
+app or change the port in `.env` on every laptop. `kill` only ever touches
+processes started from this repo.
 
 ### The commands it runs
 
@@ -167,7 +170,11 @@ LFD ↔ GFD and client ↔ GFD (new in M2):
 
 ## Console colors
 
-Timestamps are UTC. Colors by message kind:
+Every line starts with a `[C1]`-style tag in that process's own color, so you
+can tell windows apart at a glance. A server and its LFD share a color (S1 and
+LFD1 are both orange), the three clients each get their own, GFD is white.
+
+Timestamps are UTC. The rest of the line is colored by message kind:
 
 - yellow: requests and replies (bold for sends)
 - magenta: heartbeats

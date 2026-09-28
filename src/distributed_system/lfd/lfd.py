@@ -13,7 +13,7 @@ import socket
 import time
 from typing import cast
 
-from distributed_system.common import BufferedJsonConnection, heartbeat, log
+from distributed_system.common import BufferedJsonConnection, heartbeat, log, set_process_id
 from distributed_system.config import REPLICA_LFDS, get_address
 
 REPLICA_ASSIGNMENTS = {lfd: replica for replica, lfd in REPLICA_LFDS.items()}
@@ -290,6 +290,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.replica_id is not None and args.replica_id != REPLICA_ASSIGNMENTS[args.id]:
         parser.error(f"{args.id} must monitor {REPLICA_ASSIGNMENTS[args.id]}")
+    set_process_id(cast(str, args.id))
     detector = LocalFaultDetector(
         lfd_id=cast(str, args.id), replica_id=cast(str | None, args.replica_id),
         frequency=cast(float, args.frequency), timeout=cast(float, args.timeout),
