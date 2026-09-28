@@ -11,17 +11,6 @@ The overall system models an asynchronous distributed application split into nod
 - **Replication Manager (`RM`)**: Orchestrates high-level system fault tolerance, tracks healthy members, and automates replica recovery/re-launch.
 - **Clients (`C1`, `C2`, `C3`)**: Independent client processes issuing requests with unique `<client_id, replica_id, request_num>` tuples.
 
-### Which laptop runs what
-
-| Laptop | Processes |
-|---|---|
-| Replica 1 | LFD1, S1 |
-| Replica 2 | LFD2, S2 |
-| Replica 3 | LFD3, S3 |
-| Client laptop | GFD, C1, C2, C3 |
-
-Each LFD has to be on the same machine as the server it heartbeats. The GFD and the clients go on the fourth machine, as the project guide suggests.
-
 ## Prerequisites & Installation
 - Python: >= 3.13
 - Package & Task Runner: uv
@@ -62,6 +51,17 @@ Heartbeat frequency and timeout remain CLI options (`--heartbeat_freq` and
 
 ## Milestone #2 Execution Guide
 Milestone #2 runs three active replicas with an LFD each, a GFD that tracks membership, and three clients that send every request to all replicas and discard duplicate replies.
+
+### Laptop division
+
+| Laptop | Processes |
+|---|---|
+| Replica 1 | LFD1, S1 |
+| Replica 2 | LFD2, S2 |
+| Replica 3 | LFD3, S3 |
+| Client laptop | GFD, C1, C2, C3 |
+
+Each LFD has to be on the same machine as the server it heartbeats. The GFD and the clients go on the fourth machine, as the project guide suggests. This layout stays the same for later milestones; the RM joins the client laptop in Milestone 4.
 
 The launch order is GFD, then the three LFDs, then S1, S2, and S3 one at a time, then the clients.
 
