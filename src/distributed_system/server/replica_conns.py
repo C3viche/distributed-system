@@ -1,163 +1,130 @@
-"""Client-side connections to every active server replica.
+"""Persistent, nonblocking client connections to the configured replicas.
 
-One ReplicaConnections instance lives inside a client process. It connects
-to S1, S2, and S3, sends each request to every replica that is still alive,
-and collects the replies that arrive before a timeout. The first matching
-reply is delivered. Later replies for the same request_num are logged and
-discarded.
-
-A replica is marked dead on connect failure, send failure, or a closed
-socket, and is never waited on again. A timeout only ends the wait for this
-request; it does not by itself mark a replica dead.
+The first matching reply completes a request. Partial messages survive across
+requests, and late replies are logged as duplicates while other peers progress.
 """
 
-import select
+import selectors
 import socket
 import time
+from typing import cast
 
-from distributed_system.common import BufferedJsonConnection, log, send_json
+from distributed_system.common import BufferedJsonConnection, log
 from distributed_system.config import get_server_addresses
 
 
 class ReplicaConnections:
-    """Sockets from one client to every server replica."""
+    """Own replica sockets and their buffers for the client's lifetime."""
 
-    def __init__(
-        self,
-        client_id: str,
-        replicas: dict[str, tuple[str, int]] | None = None,
-        timeout: float = 1.0,
-    ) -> None:
-        self.client_id: str = client_id
-        self.replicas: dict[str, tuple[str, int]] = (
-            replicas if replicas is not None else get_server_addresses()
-        )
-        self.timeout: float = timeout
+    def __init__(self, client_id: str,
+                 replicas: dict[str, tuple[str, int]] | None = None,
+                 timeout: float = 1.0) -> None:
+        self.client_id = client_id
+        self.replicas = replicas if replicas is not None else get_server_addresses()
+        self.timeout = timeout
         self.alive: dict[str, socket.socket] = {}
         self.dead: set[str] = set()
+        self._selector = selectors.DefaultSelector()
+        self._connections: dict[socket.socket, BufferedJsonConnection] = {}
+        self._last_completed = 0
 
-    def connect_all(self) -> None:
-        """Open one TCP connection per replica. A failed connect marks that replica dead."""
-        for replica_id, (host, port) in self.replicas.items():
-            if replica_id in self.dead:
+    def connect_all(self, members: list[str] | None = None) -> None:
+        """Connect to available replicas, retaining main's bounded connect timeout."""
+        selected = self.replicas if members is None else {name: self.replicas[name] for name in members}
+        for replica_id, (host, port) in selected.items():
+            if replica_id in self.dead or replica_id in self.alive:
                 continue
             try:
                 sock = socket.create_connection((host, port), timeout=self.timeout)
-                sock.settimeout(None)
             except OSError as exc:
-                log(
-                    f"{self.client_id} could not connect to {replica_id} at {host}:{port}: {exc}",
-                    kind="failure",
-                )
-                self.mark_dead(replica_id)
+                log(f"{self.client_id} could not connect to {replica_id}: {exc}", kind="failure")
+                self.dead.add(replica_id)
                 continue
             self.alive[replica_id] = sock
-            log(
-                f"{self.client_id} connected to {replica_id} at {host}:{port}",
-                kind="registration",
-            )
+            self._connections[sock] = BufferedJsonConnection(sock)
+            self._selector.register(sock, selectors.EVENT_READ, replica_id)
+            log(f"{self.client_id} connected to {replica_id} at {host}:{port}", kind="registration")
+
+    def sync_membership(self, members: list[str]) -> None:
+        """Use GFD membership to close removed peers and connect missing members."""
+        for replica_id in list(self.alive):
+            if replica_id not in members:
+                self.mark_dead(replica_id)
+        # GFD can re-admit a restarted replica; dead is not a permanent blacklist.
+        self.dead.difference_update(members)
+        self.connect_all(members)
 
     def mark_dead(self, replica_id: str) -> None:
-        """Close the replica socket and never wait on it again."""
+        """Remove a failed peer from both future broadcasts and readiness checks."""
         self.dead.add(replica_id)
         sock = self.alive.pop(replica_id, None)
         if sock is not None:
-            try:
-                sock.close()
-            except OSError:
-                pass
+            self._selector.unregister(sock)
+            self._connections.pop(sock)
+            sock.close()
+            log(f"{self.client_id} disconnected from {replica_id}", kind="failure")
 
     def send_and_collect(self, request_num: int, payload: str) -> dict[str, object] | None:
-        """Send one request to every alive replica and return the first matching reply.
+        """Queue the request for every peer and return the first matching reply."""
+        for replica_id, sock in self.alive.items():
+            self._connections[sock].queue({
+                "type": "request", "client_id": self.client_id,
+                "replica_id": replica_id, "request_num": request_num, "payload": payload,
+            })
+            self._selector.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, replica_id)
+            log(f"Sent <{self.client_id}, {replica_id}, {request_num}, {payload}>", kind="send")
+        return self._receive_until(time.monotonic() + self.timeout, request_num)
 
-        Every arrival is printed. Replies after the first for this request_num
-        are printed as discarded duplicates. Returns None when no alive replica
-        answers before the timeout.
-        """
-        pending: dict[socket.socket, str] = {}
-        buffers: dict[str, BufferedJsonConnection] = {}
+    def receive_pending(self, duration: float) -> None:
+        """Service delayed replies and queued writes during the request interval."""
+        self._receive_until(time.monotonic() + duration, None)
 
-        for replica_id, sock in list(self.alive.items()):
-            request = {
-                "type": "request",
-                "client_id": self.client_id,
-                "replica_id": replica_id,
-                "request_num": request_num,
-                "payload": payload,
-            }
-            log(
-                f"Sent <{self.client_id}, {replica_id}, {request_num}, {payload}>",
-                kind="send",
-            )
-            try:
-                sock.settimeout(self.timeout)
-                send_json(sock, request)
-            except OSError as exc:
-                log(f"{self.client_id} send to {replica_id} failed: {exc}", kind="failure")
-                self.mark_dead(replica_id)
-                continue
-            buffers[replica_id] = BufferedJsonConnection(sock)
-            pending[sock] = replica_id
-
-        delivered: dict[str, object] | None = None
-        deadline = time.monotonic() + self.timeout
-        while pending:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            readable, _, errored = select.select(list(pending), [], list(pending), remaining)
-            for sock in errored:
-                replica_id = pending.pop(sock, None)
-                if replica_id is not None:
-                    self.mark_dead(replica_id)
-            for sock in readable:
-                replica_id = pending.get(sock)
-                if replica_id is None:
+    def _receive_until(self, deadline: float, request_num: int | None) -> dict[str, object] | None:
+        delivered = None
+        while self.alive and (remaining := deadline - time.monotonic()) > 0:
+            for key, events in self._selector.select(remaining):
+                sock = cast(socket.socket, key.fileobj)
+                replica_id = cast(str, key.data)
+                # A closed socket can still have another event in this batch.
+                if sock not in self._connections:
                     continue
+                connection = self._connections[sock]
                 try:
-                    messages = buffers[replica_id].receive()
+                    if events & selectors.EVENT_WRITE:
+                        connection.flush()
+                        if not connection.has_pending_output:
+                            self._selector.modify(sock, selectors.EVENT_READ, replica_id)
+                    if not events & selectors.EVENT_READ:
+                        continue
+                    messages = connection.receive()
+                    if messages is None:
+                        self.mark_dead(replica_id)
+                        continue
+                    for reply in messages:
+                        if not isinstance(reply, dict):
+                            continue
+                        number = reply.get("request_num")
+                        if (reply.get("type") != "reply"
+                            or reply.get("client_id") != self.client_id
+                            or reply.get("replica_id") != replica_id
+                            or type(number) is not int):
+                            continue
+                        if 1 <= number <= self._last_completed:
+                            log(f"request_num {number}: Discarded duplicate reply from {replica_id}", kind="info")
+                        elif number == request_num and delivered is None:
+                            log(f"Received <{self.client_id}, {replica_id}, {number}, reply, state={reply.get('state')}>", kind="receive")
+                            self._last_completed = number
+                            delivered = reply
                 except BlockingIOError:
                     continue
                 except (OSError, ValueError):
-                    pending.pop(sock, None)
                     self.mark_dead(replica_id)
-                    continue
-                if messages is None:
-                    pending.pop(sock, None)
-                    self.mark_dead(replica_id)
-                    continue
-                if not messages:
-                    continue
-                pending.pop(sock, None)
-                for reply in messages:
-                    if not self._reply_matches(reply, replica_id, request_num):
-                        continue
-                    log(
-                        f"Received <{self.client_id}, {replica_id}, {request_num}, reply>",
-                        kind="receive",
-                    )
-                    if delivered is None:
-                        delivered = reply
-                    else:
-                        log(
-                            f"request_num {request_num}: Discarded duplicate reply from {replica_id}.",
-                            kind="info",
-                        )
-        return delivered
-
-    def _reply_matches(
-        self,
-        reply: dict[str, object],
-        expected_replica_id: str,
-        request_num: int,
-    ) -> bool:
-        return (
-            reply.get("type") == "reply"
-            and reply.get("client_id") == self.client_id
-            and reply.get("replica_id") == expected_replica_id
-            and reply.get("request_num") == request_num
-        )
+            if delivered is not None:
+                return delivered
+        return None
 
     def close(self) -> None:
+        """Release all sockets and the selector when the client exits."""
         for replica_id in list(self.alive):
             self.mark_dead(replica_id)
+        self._selector.close()

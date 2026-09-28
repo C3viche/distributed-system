@@ -1,9 +1,9 @@
 """Client entry point for Milestone 2.
 
 Usage:
-    uv run client --id C1
-    uv run client --id C2 --interval 0.5
-    uv run client --id C3 --count 5
+    uv run client --id C1 --num_replicas 1
+    uv run client --id C2 --num_replicas 1 --interval 0.5
+    uv run client --id C3 --num_replicas 1 --count 5
 
 The GFD supplies live replica IDs; config.py resolves their host/port values.
 """

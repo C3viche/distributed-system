@@ -83,6 +83,14 @@ The launch order is GFD, then the three LFDs, then S1, S2, and S3 one at a time,
 To run everything on one machine for testing:
 
 ```bash
+# Client C1
+uv run client --id C1 --num_replicas 1
+
+# Client C2
+uv run client --id C2 --num_replicas 1
+
+# Client C3
+uv run client --id C3 --num_replicas 1
 ./run_all.sh local
 ```
 
