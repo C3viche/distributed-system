@@ -166,6 +166,52 @@ The GFD channel uses these JSON-line messages (server heartbeats retain the M1 f
 {"type":"membership","members":["S1","S2"],"member_count":2}
 ```
 
+## Milestone #3 client routing
+
+Start GFD, LFDs, and all three servers as above. Launch these clients one at a
+time, each in its own terminal:
+
+```bash
+uv run client --id C1 --replication-mode passive
+uv run client --id C2 --replication-mode passive
+uv run client --id C3 --replication-mode passive
+```
+
+Each client maintains one TCP connection per GFD member (three when S1, S2,
+and S3 are members), but sends requests only to its assigned primary, initially
+S1. Requests run automatically at `--interval 1` until Ctrl-C. Use
+`--replication-mode active` for broadcasts to every connected replica; active
+remains the default. `--count N` exits after N issued requests, including requests
+that receive no reply.
+
+Verify that each client logs three connections, then `Sent` and `Received`
+tuples naming S1 and increasing `request_num` values. S1 logs matching
+`Received` and `Sending` tuples. Crash S2 or S3: clients should log the
+connection/membership change and continue exchanging requests with S1 without
+manual intervention. Missing replica connections retry asynchronously with
+bounded connection deadlines and a one-second retry backoff.
+
+A request timeout is logged and the next request uses a fresh number. Requests
+are not automatically replayed because the current server does not deduplicate
+operations. Late replies are discarded. If the primary is unavailable, clients
+keep running, process membership updates, and wait for it to reconnect or for a
+new primary assignment; they do not promote backups themselves.
+
+The client accepts an optional `primary_id` in a GFD membership snapshot:
+
+```json
+{"type":"membership","members":["S1","S2","S3"],"member_count":3,"primary_id":"S2"}
+```
+
+Assignments take effect for the next request. An omitted `primary_id` preserves
+the previous assignment; `null` clears it. An explicit non-null assignment must
+name a configured member in the same snapshot. Invalid snapshots are rejected
+without changing the last valid membership or assignment.
+
+This implements client routing for passive replication. Server checkpointing,
+safe primary promotion, and GFD publication of `primary_id` are separate work;
+the current GFD omits this field, so passive clients initially use S1.
+
 ## Wire Protocol & Logging Format
 
 ### Message Framing
