@@ -1,21 +1,13 @@
-"""Client for Milestone 2 active replication with GFD membership.
-
-Runs as an independent process (C1, C2, or C3). Each client opens one
-long-lived TCP connection per replica and sends the same tagged request to
-every live replica before the next request. The first reply is delivered;
-later replies for that request_num are discarded.
-
-No coordination between C1/C2/C3. Each holds its own request_num.
-"""
+"""Independent active/passive clients using GFD membership and primary assignments."""
 
 import selectors
 import socket
 import time
 from typing import cast
 
+from distributed_system.client.replica_conns import ReplicaConnections
 from distributed_system.common import BufferedJsonConnection, log, send_json
 from distributed_system.config import get_address, get_server_addresses
-from distributed_system.server.replica_conns import ReplicaConnections
 
 
 class Client:
@@ -28,8 +20,13 @@ class Client:
         interval: float = 1.0,
         count: int | None = None,
         payload_template: str = "hello from {client_id} #{request_num}",
+        replication_mode: str = "active",
     ) -> None:
         """Initialize the client configuration and state."""
+        if replication_mode not in {"active", "passive"}:
+            raise ValueError("replication_mode must be active or passive")
+        self.replication_mode = replication_mode
+        self.primary_id: str | None = "S1"
         self.client_id: str = client_id
         # num_replicas is retained for callers using the old CLI; GFD is authoritative.
         self.replicas: dict[str, tuple[str, int]] = get_server_addresses()
@@ -38,14 +35,16 @@ class Client:
         self._received_membership: bool = False
         self._gfd_retry_at: float = 0.0
         self.interval: float = interval
-        self.count: int | None = count  # None -> loop until Ctrl-C / server closes
+        self.count: int | None = count  # None -> loop until Ctrl-C
         self.payload_template: str = payload_template
         self.request_num: int = 1
         self.conns: ReplicaConnections = ReplicaConnections(client_id, replicas=self.replicas)
 
     def run(self) -> None:
         """Wait for GFD membership before connecting to any replicas."""
-        log(f"{self.client_id} starting", kind="info")
+        log(f"{self.client_id} starting in {self.replication_mode} mode"
+            + (f", primary={self.primary_id}" if self.replication_mode == "passive" else ""),
+            kind="info")
         try:
             self._loop()
         except KeyboardInterrupt:
@@ -106,6 +105,14 @@ class Client:
                     or len(members) != len(set(cast(list[str], members)))
                     or type(count) is not int or count != len(members)):
                     raise ValueError("Invalid GFD membership")
+                primary = message.get("primary_id", self.primary_id)
+                if "primary_id" in message and primary is not None and (
+                    not isinstance(primary, str) or primary not in members
+                ):
+                    raise ValueError("Invalid GFD primary assignment")
+                if primary != self.primary_id:
+                    log(f"{self.client_id} assigned primary: {primary}", kind="membership")
+                self.primary_id = cast(str | None, primary)
                 # This only updates the desired member list. Replica sockets
                 # are reconciled at the next request boundary.
                 self.membership = cast(list[str], members)
@@ -143,7 +150,7 @@ class Client:
         while (remaining := deadline - time.monotonic()) > 0:
             # Small bounded slices retain ReplicaConnections' ownership of its selector.
             duration = min(remaining, 0.05)
-            if self.conns.alive:
+            if self.conns.alive or self._received_membership:
                 self.conns.receive_pending(duration)
                 self._wait_for_gfd(0)
             else:
@@ -158,17 +165,18 @@ class Client:
             self._wait_for_gfd(0)
             if self._received_membership:
                 self.conns.sync_membership(self.membership)
-            if not self.conns.alive:
+            if not self._has_request_target():
                 self._wait_between_requests()
                 continue
-            if not self._send_and_await_reply():
-                if not self.conns.alive:
-                    self._wait_between_requests()
-                    continue
-                return
+            self._send_and_await_reply()
             sent += 1
             if self.count is None or sent < self.count:
                 self._wait_between_requests()
+
+    def _has_request_target(self) -> bool:
+        if self.replication_mode == "active":
+            return bool(self.conns.alive)
+        return self.primary_id is not None and self.primary_id in self.conns.alive
 
     def _send_and_await_reply(self) -> bool:
         """Send one request through ReplicaConnections. True when a reply is delivered."""
@@ -176,8 +184,10 @@ class Client:
             client_id=self.client_id,
             request_num=self.request_num,
         )
-        reply = self.conns.send_and_collect(self.request_num, payload)
-        if reply is None:
-            return False
+        if self.replication_mode == "active":
+            reply = self.conns.send_active(self.request_num, payload)
+        else:
+            assert self.primary_id is not None
+            reply = self.conns.send_passive(self.request_num, payload, self.primary_id)
         self.request_num += 1
-        return True
+        return reply is not None
