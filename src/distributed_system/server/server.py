@@ -25,7 +25,6 @@ from distributed_system.common import BufferedJsonConnection, log, set_process_i
 from distributed_system.config import REPLICA_LFDS, get_address
 
 
-
 def lfd_id_for(replica_id: str) -> str:
     """Return the LFD that heartbeats this replica: S1→LFD1, S2→LFD2, S3→LFD3."""
     try:
@@ -115,18 +114,18 @@ class Server:
 
     def _register(self, sock: socket.socket, kind: str) -> None:
         self._connections[sock] = BufferedJsonConnection(sock)
-        self.sel.register(sock, selectors.EVENT_READ, kind)
+        _ = self.sel.register(sock, selectors.EVENT_READ, kind)
 
     def _send_json(self, sock: socket.socket, message: dict[str, object]) -> None:
         self._connections[sock].queue(message)
         key = self.sel.get_key(sock)
-        self.sel.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, key.data)
+        _ = self.sel.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, cast(str, key.data))
 
     def _write_pending(self, sock: socket.socket, kind: str) -> None:
         connection = self._connections[sock]
         connection.flush()
         if not connection.has_pending_output:
-            self.sel.modify(sock, selectors.EVENT_READ, kind)
+            _ = self.sel.modify(sock, selectors.EVENT_READ, kind)
 
     def _read_messages(self, sock: socket.socket, kind: str) -> None:
         messages = self._connections[sock].receive()
@@ -134,7 +133,10 @@ class Server:
             why = f"lost connection to {self.lfd_id}" if kind == "lfd" else "client disconnected"
             self._close_sock(sock, why)
             return
-        for msg in messages:
+        for raw_message in messages:
+            if not isinstance(raw_message, dict):
+                raise ValueError("Expected a JSON object")  # noqa: TRY004 - close malformed peer
+            msg = cast(dict[str, object], raw_message)
             if kind == "lfd":
                 self.handle_lfd(sock, msg)
             else:
@@ -143,7 +145,7 @@ class Server:
     def _close_sock(self, sock: socket.socket, why: str):
         # have to unregister or select() keeps waking up on the dead socket
         _ = self.sel.unregister(sock)
-        self._connections.pop(sock, None)
+        _ = self._connections.pop(sock, None)
         client_id = self._client_ids.pop(sock, None)
         sock.close()
         if sock is self._lfd:
@@ -193,7 +195,7 @@ class Server:
                             self._write_pending(sock, data)
                     except BlockingIOError:
                         pass  # Try again when the selector reports readiness.
-                    except OSError as exc:
+                    except (OSError, ValueError) as exc:
                         self._close_sock(sock, f"Connection lost: {exc}")
 
 

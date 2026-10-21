@@ -118,22 +118,22 @@ class BufferedJsonConnection:
     """
 
     def __init__(self, sock: socket.socket):
-        self.sock = sock
+        self.sock: socket.socket = sock
         self.sock.setblocking(False)
-        self._incoming = bytearray()
-        self._outgoing = bytearray()
+        self._incoming: bytearray = bytearray()
+        self._outgoing: bytearray = bytearray()
 
-    def receive(self) -> list[dict[str, object]] | None:
+    def receive(self) -> list[object] | None:
         """Return complete messages, [] for a partial line, or None on EOF."""
         chunk = self.sock.recv(4096)
         if not chunk:
             return None
         self._incoming.extend(chunk)
-        messages = []
+        messages: list[object] = []
         while b"\n" in self._incoming:
             line, _, remainder = self._incoming.partition(b"\n")
             self._incoming[:] = remainder
-            messages.append(cast(dict[str, object], json.loads(line.decode("utf-8"))))
+            messages.append(cast(object, json.loads(line.decode("utf-8"))))
         return messages
 
     def queue(self, message: Mapping[str, object]) -> None:

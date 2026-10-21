@@ -16,17 +16,17 @@ class ReplicaConnections:
     def __init__(self, client_id: str,
                  replicas: dict[str, tuple[str, int]] | None = None,
                  timeout: float = 1.0) -> None:
-        self.client_id = client_id
-        self.replicas = replicas if replicas is not None else get_server_addresses()
-        self.timeout = timeout
+        self.client_id: str = client_id
+        self.replicas: dict[str, tuple[str, int]] = replicas if replicas is not None else get_server_addresses()
+        self.timeout: float = timeout
         self.alive: dict[str, socket.socket] = {}
         self.dead: set[str] = set()
-        self._selector = selectors.DefaultSelector()
+        self._selector: selectors.DefaultSelector = selectors.DefaultSelector()
         self._connections: dict[socket.socket, BufferedJsonConnection] = {}
         self._connecting: dict[str, tuple[socket.socket, float]] = {}
         self._retry_at: dict[str, float] = {}
-        self._last_finished = 0
-        self._last_completed = 0
+        self._last_finished: int = 0
+        self._last_completed: int = 0
 
     def connect_all(self, members: list[str] | None = None) -> None:
         """Start connections without waiting for unavailable replicas."""
@@ -42,7 +42,7 @@ class ReplicaConnections:
                 result = sock.connect_ex(address)
                 if result not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
                     raise OSError(result, errno.errorcode.get(result, "connect failed"))
-                self._selector.register(sock, selectors.EVENT_WRITE, replica_id)
+                _ = self._selector.register(sock, selectors.EVENT_WRITE, replica_id)
                 self._connecting[replica_id] = (sock, time.monotonic() + self.timeout)
                 if result == 0:
                     self._finish_connect(replica_id, sock)
@@ -58,12 +58,12 @@ class ReplicaConnections:
         error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
         if error:
             raise OSError(error, errno.errorcode.get(error, "connect failed"))
-        self._connecting.pop(replica_id)
+        _ = self._connecting.pop(replica_id)
         self.alive[replica_id] = sock
         self.dead.discard(replica_id)
-        self._retry_at.pop(replica_id, None)
+        _ = self._retry_at.pop(replica_id, None)
         self._connections[sock] = BufferedJsonConnection(sock)
-        self._selector.modify(sock, selectors.EVENT_READ, replica_id)
+        _ = self._selector.modify(sock, selectors.EVENT_READ, replica_id)
         host, port = self.replicas[replica_id]
         log(f"{self.client_id} connected to {replica_id} at {host}:{port}", kind="registration")
 
@@ -89,8 +89,8 @@ class ReplicaConnections:
         if sock is None and pending is not None:
             sock = pending[0]
         if sock is not None:
-            self._selector.unregister(sock)
-            self._connections.pop(sock, None)
+            _ = self._selector.unregister(sock)
+            _ = self._connections.pop(sock, None)
             sock.close()
             log(f"{self.client_id} disconnected from {replica_id}", kind="failure")
 
@@ -118,7 +118,7 @@ class ReplicaConnections:
                 "type": "request", "client_id": self.client_id,
                 "replica_id": replica_id, "request_num": request_num, "payload": payload,
             })
-            self._selector.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, replica_id)
+            _ = self._selector.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, replica_id)
             log(f"Sent <{self.client_id}, {replica_id}, {request_num}, {payload}>", kind="send")
         reply = self._receive_until(time.monotonic() + self.timeout, request_num, set(targets))
         self._last_finished = request_num
@@ -138,7 +138,7 @@ class ReplicaConnections:
         if not self.alive and not self._connecting:
             time.sleep(max(0, duration))
             return
-        self._receive_until(time.monotonic() + duration, None)
+        _ = self._receive_until(time.monotonic() + duration, None)
 
     def _receive_until(self, deadline: float, request_num: int | None,
                        targets: set[str] | None = None) -> dict[str, object] | None:
@@ -166,16 +166,17 @@ class ReplicaConnections:
                     if events & selectors.EVENT_WRITE:
                         connection.flush()
                         if not connection.has_pending_output:
-                            self._selector.modify(sock, selectors.EVENT_READ, replica_id)
+                            _ = self._selector.modify(sock, selectors.EVENT_READ, replica_id)
                     if not events & selectors.EVENT_READ:
                         continue
                     messages = connection.receive()
                     if messages is None:
                         self.mark_dead(replica_id)
                         continue
-                    for reply in messages:
-                        if not isinstance(reply, dict):
+                    for raw_reply in messages:
+                        if not isinstance(raw_reply, dict):
                             continue
+                        reply = cast(dict[str, object], raw_reply)
                         number = reply.get("request_num")
                         if (reply.get("type") != "reply"
                             or reply.get("client_id") != self.client_id
