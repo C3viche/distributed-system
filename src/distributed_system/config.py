@@ -1,11 +1,14 @@
 """Host and port lookup for processes.
 
 Public API:
+    PRIMARY_ID: configured primary replica (default S1)
+    CHECKPOINT_FREQ: checkpoints per second (default 1 Hz)
     get_address(process_id) -> (host, port)
     resolve_address(process_id, host_override, port_override) -> (host, port)
 """
 
 # Network Settings
+import math
 import os
 from typing import cast
 
@@ -29,6 +32,18 @@ SERVERS: dict[str, dict[str, str | int]] = {
         "port": int(os.getenv("S3_PORT", "8083")),
     },
 }
+
+# Server/client CLI options can use these validated values as their defaults.
+PRIMARY_ID = os.getenv("PRIMARY_ID", "S1")
+if PRIMARY_ID not in SERVERS:
+    raise ValueError(f"PRIMARY_ID must be one of {', '.join(SERVERS)}; got {PRIMARY_ID!r}")
+
+try:
+    CHECKPOINT_FREQ = float(os.getenv("CHECKPOINT_FREQ", "1"))
+except ValueError as exc:
+    raise ValueError("CHECKPOINT_FREQ must be a finite, positive number in Hz") from exc
+if not math.isfinite(CHECKPOINT_FREQ) or CHECKPOINT_FREQ <= 0:
+    raise ValueError("CHECKPOINT_FREQ must be a finite, positive number in Hz")
 
 LFDS: dict[str, dict[str, str | int]] = {
     "LFD1": {

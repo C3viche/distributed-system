@@ -27,6 +27,7 @@ all_colors = {
     "state": "green",
     "registration": "blue",
     "membership": "cyan",
+    "checkpoint": "light_cyan",
     "failure": "red",
     "info": "white",
 }
