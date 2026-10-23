@@ -72,7 +72,7 @@ class Server:
         self._client_ids: dict[socket.socket, str] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
 
-        # 1. type of server
+        # here we define the type of server (role)
         if replication_mode == "active":
             self.role: str = "active"  # M2: every replica handles every request
         elif replica_id == primary_id:
@@ -80,14 +80,14 @@ class Server:
         else:
             self.role = "backup"  # M3: ignores requests, receives checkpoints
 
-        # 2. checkpoint timer, only the primary uses it
+        # this section controls the checkpoint timer, only the primary uses it
         self.checkpoint_count: int = 1
         self._checkpoint_interval: float = (
             1.0 / checkpoint_freq
         )  # seconds between checkpoints
         self._next_checkpoint: float = 0.0  # set when serve() starts
 
-        # 3. other replicas: primary moves ids from _pending_backups to _backups (sock -> id)
+        # other replicas: primary moves ids from _pending_backups to _backups (sock -> id)
         self._pending_backups: list[str] = []
         self._backups: dict[socket.socket, str] = {}
         self._next_backup_retry: float = 0.0  # don't redial more than once a second

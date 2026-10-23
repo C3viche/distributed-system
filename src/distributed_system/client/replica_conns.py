@@ -39,7 +39,7 @@ class ReplicaConnections:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setblocking(False)
             try:
-                result = sock.connect_ex(address)
+                result = sock.connect_ex(address) # is like connect(address), but returns an error code
                 if result not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
                     raise OSError(result, errno.errorcode.get(result, "connect failed"))
                 _ = self._selector.register(sock, selectors.EVENT_WRITE, replica_id)
@@ -55,6 +55,9 @@ class ReplicaConnections:
         self.receive_pending(0)
 
     def _finish_connect(self, replica_id: str, sock: socket.socket) -> None:
+        """Removes successfully connected replicas from dead set and assigns sockets to alive replicas. 
+        Basically handles necessary state changes (connecting -> alive, etc.) to officially complete a 
+        connection"""
         error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
         if error:
             raise OSError(error, errno.errorcode.get(error, "connect failed"))
@@ -68,6 +71,8 @@ class ReplicaConnections:
         log(f"{self.client_id} connected to {replica_id} at {host}:{port}", kind="registration")
 
     def _expire_connections(self) -> None:
+        """Handle the case where the connection to server replicas times out, marking them
+        as officially 'dead' without removing them from list"""
         for replica_id, (_, deadline) in list(self._connecting.items()):
             if time.monotonic() >= deadline:
                 log(f"{self.client_id} connection to {replica_id} timed out", kind="failure")
@@ -110,6 +115,7 @@ class ReplicaConnections:
 
     def _send_to(self, targets: list[str], request_num: int,
                  payload: str) -> dict[str, object] | None:
+        """Sends payload to a directed target n number of times and returns a reply if received"""
         if not targets:
             return None
         for replica_id in targets:
@@ -142,6 +148,8 @@ class ReplicaConnections:
 
     def _receive_until(self, deadline: float, request_num: int | None,
                        targets: set[str] | None = None) -> dict[str, object] | None:
+        """Service connections until we get valid reply, reach deadline or lose all eligible targets. 
+        Will return first valid reply matching current request and allowed target or None if none arrives"""
         delivered = None
         first_poll = True
         while self.alive or self._connecting:
@@ -173,7 +181,7 @@ class ReplicaConnections:
                     if messages is None:
                         self.mark_dead(replica_id)
                         continue
-                    for raw_reply in messages:
+                    for raw_reply in messages: # skip replies that aren't what we expect and format message
                         if not isinstance(raw_reply, dict):
                             continue
                         reply = cast(dict[str, object], raw_reply)

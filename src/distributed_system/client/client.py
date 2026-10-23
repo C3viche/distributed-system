@@ -200,6 +200,7 @@ class Client:
                 self._wait_between_requests()
 
     def _has_request_target(self) -> bool:
+        """A boolean check to se if the connection is alive and there is a valid primary id available"""
         if self.replication_mode == "active":
             return bool(self.conns.alive)
         return self.primary_id is not None and self.primary_id in self.conns.alive
