@@ -1,6 +1,7 @@
 """Host and port lookup for processes.
 
 Public API:
+    REPLICATION_MODE: active or passive (default active)
     PRIMARY_ID: configured primary replica (default S1)
     CHECKPOINT_FREQ: checkpoints per second (default 1 Hz)
     get_address(process_id) -> (host, port)
@@ -34,6 +35,10 @@ SERVERS: dict[str, dict[str, str | int]] = {
 }
 
 # Server/client CLI options can use these validated values as their defaults.
+REPLICATION_MODE = os.getenv("REPLICATION_MODE", "active")
+if REPLICATION_MODE not in {"active", "passive"}:
+    raise ValueError(f"REPLICATION_MODE must be active or passive; got {REPLICATION_MODE!r}")
+
 PRIMARY_ID = os.getenv("PRIMARY_ID", "S1")
 if PRIMARY_ID not in SERVERS:
     raise ValueError(f"PRIMARY_ID must be one of {', '.join(SERVERS)}; got {PRIMARY_ID!r}")

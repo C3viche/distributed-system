@@ -16,6 +16,7 @@ from distributed_system.client import _parse_args
 from distributed_system.client.client import Client
 from distributed_system.client.replica_conns import ReplicaConnections
 from distributed_system.common import BufferedJsonConnection, send_json
+from distributed_system.config import PRIMARY_ID, REPLICATION_MODE
 
 
 class Replica:
@@ -194,7 +195,7 @@ class ClientTests(unittest.TestCase):
 
     def test_primary_assignment_omission_and_clear(self) -> None:
         self.snapshot(["S1", "S2", "S3"])
-        self.assertEqual(self.client.primary_id, "S1")
+        self.assertEqual(self.client.primary_id, PRIMARY_ID)
         self.snapshot(["S1", "S2"], primary_id="S2")
         self.assertEqual(self.client.primary_id, "S2")
         self.snapshot(["S2"])
@@ -211,6 +212,7 @@ class ClientTests(unittest.TestCase):
         self.assertIsNone(self.client._gfd)
 
     def test_missing_primary_does_not_fall_back(self) -> None:
+        self.client.primary_id = "S1"
         with patch.object(self.client.conns, "alive", {"S2": object()}):
             self.assertFalse(self.client._has_request_target())
             self.snapshot(["S2"], primary_id="S2")
@@ -225,7 +227,7 @@ class ClientTests(unittest.TestCase):
 
     def test_cli_defaults_and_passive_flag(self) -> None:
         with patch("sys.argv", ["client", "--id", "C1"]):
-            self.assertEqual(_parse_args().replication_mode, "active")
+            self.assertEqual(_parse_args().replication_mode, REPLICATION_MODE)
         with patch("sys.argv", ["client", "--id", "C1", "--replication-mode", "passive"]):
             self.assertEqual(_parse_args().replication_mode, "passive")
 

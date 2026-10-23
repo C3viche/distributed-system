@@ -1,10 +1,10 @@
 """Server replica for 18-749 (S1, S2, or S3).
 
-M2 (--replication_mode active): every replica handles every request.
-M3 (--replication_mode passive, the default): only the primary (PRIMARY_ID or
---primary) handles requests. The primary opens a connection to each backup and
-sends a checkpoint of my_state every 1/checkpoint_freq seconds. Backups ignore
-client requests and just take the checkpointed state.
+Active mode: every replica handles every request.
+Passive mode: the configured primary opens a connection to each backup and
+sends a checkpoint of my_state every 1/checkpoint_freq seconds. Backup request
+suppression and checkpoint application are still unfinished. Mode defaults to
+REPLICATION_MODE (active if unset); --replication-mode overrides it.
 
 Registration with the paired LFD (S1→LFD1, S2→LFD2, S3→LFD3) uses connection
 attempts bounded by a one-second timeout and is retried from the serve loop.
@@ -16,12 +16,13 @@ the host printed at startup, come from config.
 
 
 To Run:
-    uv run server --id S1                               # passive, S1 is primary (PRIMARY_ID)
-    uv run server --id S2 --checkpoint_freq 2           # backup, freq only matters on the primary
-    uv run server --id S1 --replication_mode active     # M2 behaviour
+    uv run server --id S1                         # shared config defaults
+    uv run server --id S2 --checkpoint-freq 2     # frequency only matters on the primary
+    uv run server --id S1 --replication-mode active
 """
 
 import argparse
+import math
 import selectors
 import socket
 import time
@@ -32,6 +33,7 @@ from distributed_system.config import (
     CHECKPOINT_FREQ,
     PRIMARY_ID,
     REPLICA_LFDS,
+    REPLICATION_MODE,
     get_address,
     get_server_addresses,
 )
@@ -50,15 +52,19 @@ class Server:
         self,
         replica_id: str,
         port_override: int | None = None,
-        replication_mode: str = "passive",
+        replication_mode: str = REPLICATION_MODE,
         primary_id: str = PRIMARY_ID,
         checkpoint_freq: float = CHECKPOINT_FREQ,
     ):
         if replication_mode not in {"active", "passive"}:
             raise ValueError("replication_mode must be active or passive")
-        if checkpoint_freq <= 0:
-            raise ValueError("checkpoint_freq must be positive")
+        if not math.isfinite(checkpoint_freq) or checkpoint_freq <= 0:
+            raise ValueError("checkpoint_freq must be finite and positive")
+        if primary_id not in REPLICA_LFDS:
+            raise ValueError("primary_id must name a configured replica")
 
+        self.replication_mode: str = replication_mode
+        self.primary_id: str = primary_id
         self.replica_id: str = replica_id
         self.lfd_id: str = lfd_id_for(replica_id)
         self.state: int = 0
@@ -305,7 +311,9 @@ class Server:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("0.0.0.0", self.port))
         listener.listen()
-        log(f"{self.replica_id} ({self.role}) up, waiting for clients on {self.host}:{self.port}", kind="info")
+        log(f"{self.replica_id} starting in {self.replication_mode} mode"
+            + (f", primary={self.primary_id}" if self.replication_mode == "passive" else "")
+            + f", role={self.role}; waiting for clients on {self.host}:{self.port}", kind="info")
 
         # tag each socket so the loop knows what it's looking at
         _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
@@ -350,23 +358,27 @@ class Server:
 
 def positive_float(text: str) -> float:
     value = float(text)
-    if value <= 0:
-        raise argparse.ArgumentTypeError("must be positive")
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
     return value
 
 
-def main() -> None:
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     _ = parser.add_argument("--id", choices=list(REPLICA_LFDS), required=True, help="Replica ID")
     _ = parser.add_argument("--port", type=int, default=None, help="Override port")
-    _ = parser.add_argument("--replication_mode", choices=["active", "passive"], default="passive",
-                            help="active = M2, everyone serves. passive = M3, only the primary serves")
+    _ = parser.add_argument("--replication-mode", choices=["active", "passive"], default=REPLICATION_MODE,
+                            help=f"Replication mode (default {REPLICATION_MODE}); passive server support is incomplete")
     _ = parser.add_argument("--primary", choices=list(REPLICA_LFDS), default=PRIMARY_ID,
                             help=f"who the primary is in passive mode (default PRIMARY_ID={PRIMARY_ID})")
-    _ = parser.add_argument("--checkpoint_freq", type=positive_float, default=CHECKPOINT_FREQ,
+    _ = parser.add_argument("--checkpoint-freq", type=positive_float, default=CHECKPOINT_FREQ,
                             help=f"checkpoints per second, primary only (default {CHECKPOINT_FREQ})")
 
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
     replica_id = cast(str, args.id)
     set_process_id(replica_id)
     port_override = cast(int | None, args.port)

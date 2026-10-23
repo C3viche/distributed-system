@@ -7,7 +7,12 @@ from typing import cast
 
 from distributed_system.client.replica_conns import ReplicaConnections
 from distributed_system.common import BufferedJsonConnection, log, send_json
-from distributed_system.config import get_address, get_server_addresses
+from distributed_system.config import (
+    PRIMARY_ID,
+    REPLICATION_MODE,
+    get_address,
+    get_server_addresses,
+)
 
 
 class Client:
@@ -20,13 +25,13 @@ class Client:
         interval: float = 1.0,
         count: int | None = None,
         payload_template: str = "hello from {client_id} #{request_num}",
-        replication_mode: str = "active",
+        replication_mode: str = REPLICATION_MODE,
     ) -> None:
         """Initialize the client configuration and state."""
         if replication_mode not in {"active", "passive"}:
             raise ValueError("replication_mode must be active or passive")
         self.replication_mode: str = replication_mode
-        self.primary_id: str | None = "S1"
+        self.primary_id: str | None = PRIMARY_ID
         self.client_id: str = client_id
         # num_replicas is retained for callers using the old CLI; GFD is authoritative.
         self.replicas: dict[str, tuple[str, int]] = get_server_addresses()

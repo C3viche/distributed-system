@@ -13,6 +13,7 @@ from typing import cast
 
 from distributed_system.client.client import Client
 from distributed_system.common import set_process_id
+from distributed_system.config import REPLICATION_MODE
 
 
 def _positive_float(value: str) -> float:
@@ -59,8 +60,8 @@ def _parse_args() -> argparse.Namespace:
     _ = parser.add_argument(
         "--replication-mode",
         choices=("active", "passive"),
-        default="active",
-        help="Broadcast to all replicas or send only to the assigned primary (default: active).",
+        default=REPLICATION_MODE,
+        help=f"Broadcast to all replicas or send only to the assigned primary (default: {REPLICATION_MODE}).",
     )
     return parser.parse_args()
 
