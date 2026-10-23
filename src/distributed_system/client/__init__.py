@@ -75,6 +75,9 @@ def main() -> None:
     interval = cast(float, args.interval)
     count = cast(int | None, args.count)
 
+    # Parse arguments for client id, num replicas, etc
+    # Most importantly, now we support a "replication mode" which
+    # gets passed along to the client object
     Client(
         client_id = client_id,
         num_replicas = num_replicas,
