@@ -32,7 +32,9 @@ class Replica:
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen()
         self.listener.settimeout(0.05)
-        self.address: tuple[str, int] = cast(tuple[str, int], self.listener.getsockname())
+        self.address: tuple[str, int] = cast(
+            tuple[str, int], self.listener.getsockname()
+        )
         self.thread: threading.Thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
@@ -74,9 +76,16 @@ class Replica:
     def reply(self, number: int) -> None:
         peer = self.peer
         assert peer is not None
-        send_json(peer, {"type": "reply", "client_id": "C1",
-                             "replica_id": self.replica_id,
-                             "request_num": number, "state": number})
+        send_json(
+            peer,
+            {
+                "type": "reply",
+                "client_id": "C1",
+                "replica_id": self.replica_id,
+                "request_num": number,
+                "state": number,
+            },
+        )
 
     def close(self) -> None:
         self.stopped.set()
@@ -95,12 +104,16 @@ class RoutingTests(unittest.TestCase):
         quiet = patch("distributed_system.client.replica_conns.log")
         self.logs: MagicMock | AsyncMock = quiet.start()
         self.addCleanup(quiet.stop)
-        self.replicas: dict[str, Replica] = {name: Replica(name) for name in ("S1", "S2", "S3")}
+        self.replicas: dict[str, Replica] = {
+            name: Replica(name) for name in ("S1", "S2", "S3")
+        }
         for replica in self.replicas.values():
             self.addCleanup(replica.close)
-        self.conns: ReplicaConnections = ReplicaConnections("C1", {
-            name: replica.address for name, replica in self.replicas.items()
-        }, timeout=0.2)
+        self.conns: ReplicaConnections = ReplicaConnections(
+            "C1",
+            {name: replica.address for name, replica in self.replicas.items()},
+            timeout=0.2,
+        )
         self.addCleanup(self.conns.close)
         self.conns.connect_all()
         deadline = time.monotonic() + 1
@@ -118,19 +131,38 @@ class RoutingTests(unittest.TestCase):
         assert reply is not None
         self.assertEqual(reply["request_num"], 1)
         self.conns.receive_pending(0.05)
-        self.assertEqual([len(replica.requests) for replica in self.replicas.values()], [1, 1, 1])
-        self.assertTrue(any("Discarded duplicate" in call.args[0]
-                            for call in self.logs.call_args_list))
+        self.assertEqual(
+            [len(replica.requests) for replica in self.replicas.values()], [1, 1, 1]
+        )
+        self.assertTrue(
+            any(
+                "Discarded duplicate" in call.args[0]
+                for call in self.logs.call_args_list
+            )
+        )
         self.assertIsNotNone(self.conns.send_and_collect(2, "legacy"))
 
     def test_passive_backup_failure_and_reassignment(self) -> None:
-        self.assertEqual(self.require_reply(self.conns.send_passive(1, "hello", "S1"))["replica_id"], "S1")
+        self.assertEqual(
+            self.require_reply(self.conns.send_passive(1, "hello", "S1"))["replica_id"],
+            "S1",
+        )
         self.assertEqual(len(self.conns.alive), 3)
-        self.assertEqual([len(self.replicas[name].requests) for name in ("S2", "S3")], [0, 0])
+        self.assertEqual(
+            [len(self.replicas[name].requests) for name in ("S2", "S3")], [0, 0]
+        )
         self.replicas["S3"].close()
         self.conns.sync_membership(["S1", "S2"])
-        self.assertEqual(self.require_reply(self.conns.send_passive(2, "fault", "S1"))["replica_id"], "S1")
-        self.assertEqual(self.require_reply(self.conns.send_passive(3, "new primary", "S2"))["replica_id"], "S2")
+        self.assertEqual(
+            self.require_reply(self.conns.send_passive(2, "fault", "S1"))["replica_id"],
+            "S1",
+        )
+        self.assertEqual(
+            self.require_reply(self.conns.send_passive(3, "new primary", "S2"))[
+                "replica_id"
+            ],
+            "S2",
+        )
         self.assertEqual(len(self.replicas["S1"].requests), 2)
 
     def test_timeout_late_reply_and_next_request(self) -> None:
@@ -141,8 +173,12 @@ class RoutingTests(unittest.TestCase):
         reply = self.conns.send_passive(2, "next", "S1")
         assert reply is not None
         self.assertEqual(reply["request_num"], 2)
-        self.assertTrue(any("Discarded late reply" in call.args[0]
-                            for call in self.logs.call_args_list))
+        self.assertTrue(
+            any(
+                "Discarded late reply" in call.args[0]
+                for call in self.logs.call_args_list
+            )
+        )
 
     def test_wrong_replica_reply_cannot_complete_passive_request(self) -> None:
         self.replicas["S1"].answer = False
@@ -180,7 +216,9 @@ class ClientTests(unittest.TestCase):
         quiet = patch("distributed_system.client.client.log")
         _ = quiet.start()
         self.addCleanup(quiet.stop)
-        self.client: Client = Client("C1", replication_mode="passive", count=2, interval=0.001)
+        self.client: Client = Client(
+            "C1", replication_mode="passive", count=2, interval=0.001
+        )
         self.addCleanup(self.client.conns.close)
         receiver, publisher = socket.socketpair()
         self.publisher: socket.socket = publisher
@@ -189,8 +227,15 @@ class ClientTests(unittest.TestCase):
         self.addCleanup(self.publisher.close)
 
     def snapshot(self, members: list[str], **extra: object) -> None:
-        send_json(self.publisher, {"type": "membership", "members": members,
-                                  "member_count": len(members), **extra})
+        send_json(
+            self.publisher,
+            {
+                "type": "membership",
+                "members": members,
+                "member_count": len(members),
+                **extra,
+            },
+        )
         self.client._read_gfd()
 
     def test_primary_assignment_omission_and_clear(self) -> None:
@@ -219,8 +264,14 @@ class ClientTests(unittest.TestCase):
             self.assertTrue(self.client._has_request_target())
 
     def test_loop_continues_after_timeout_and_counts_issued_requests(self) -> None:
-        with (patch.object(self.client, "_has_request_target", return_value=True),
-              patch.object(self.client.conns, "send_passive", side_effect=[None, {"request_num": 2}]) as send):
+        with (
+            patch.object(self.client, "_has_request_target", return_value=True),
+            patch.object(
+                self.client.conns,
+                "send_passive",
+                side_effect=[None, {"request_num": 2}],
+            ) as send,
+        ):
             self.client._loop()
         self.assertEqual([call.args[0] for call in send.call_args_list], [1, 2])
         self.assertEqual(self.client.request_num, 3)
@@ -228,7 +279,9 @@ class ClientTests(unittest.TestCase):
     def test_cli_defaults_and_passive_flag(self) -> None:
         with patch("sys.argv", ["client", "--id", "C1"]):
             self.assertEqual(_parse_args().replication_mode, REPLICATION_MODE)
-        with patch("sys.argv", ["client", "--id", "C1", "--replication-mode", "passive"]):
+        with patch(
+            "sys.argv", ["client", "--id", "C1", "--replication-mode", "passive"]
+        ):
             self.assertEqual(_parse_args().replication_mode, "passive")
 
 

@@ -80,9 +80,9 @@ def main() -> None:
     # Most importantly, now we support a "replication mode" which
     # gets passed along to the client object
     Client(
-        client_id = client_id,
-        num_replicas = num_replicas,
-        interval = interval,
-        count = count,
-        replication_mode = cast(str, args.replication_mode),
+        client_id=client_id,
+        num_replicas=num_replicas,
+        interval=interval,
+        count=count,
+        replication_mode=cast(str, args.replication_mode),
     ).run()

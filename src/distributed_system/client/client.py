@@ -43,13 +43,21 @@ class Client:
         self.count: int | None = count  # None -> loop until Ctrl-C
         self.payload_template: str = payload_template
         self.request_num: int = 1
-        self.conns: ReplicaConnections = ReplicaConnections(client_id, replicas=self.replicas)
+        self.conns: ReplicaConnections = ReplicaConnections(
+            client_id, replicas=self.replicas
+        )
 
     def run(self) -> None:
         """Wait for GFD membership before connecting to any replicas."""
-        log(f"{self.client_id} starting in {self.replication_mode} mode"
-            + (f", primary={self.primary_id}" if self.replication_mode == "passive" else ""),
-            kind="info")
+        log(
+            f"{self.client_id} starting in {self.replication_mode} mode"
+            + (
+                f", primary={self.primary_id}"
+                if self.replication_mode == "passive"
+                else ""
+            ),
+            kind="info",
+        )
         try:
             self._loop()
         except KeyboardInterrupt:
@@ -105,18 +113,29 @@ class Client:
                     raise ValueError("Invalid GFD membership")  # noqa: TRY004 - close bad peer
                 members = cast(list[object], raw_members)
                 count = message.get("member_count")
-                if (message.get("type") != "membership"
-                    or any(not isinstance(member, str) or member not in self.replicas for member in members)
+                if (
+                    message.get("type") != "membership"
+                    or any(
+                        not isinstance(member, str) or member not in self.replicas
+                        for member in members
+                    )
                     or len(members) != len(set(cast(list[str], members)))
-                    or type(count) is not int or count != len(members)):
+                    or type(count) is not int
+                    or count != len(members)
+                ):
                     raise ValueError("Invalid GFD membership")
                 primary = message.get("primary_id", self.primary_id)
-                if "primary_id" in message and primary is not None and (
-                    not isinstance(primary, str) or primary not in members
+                if (
+                    "primary_id" in message
+                    and primary is not None
+                    and (not isinstance(primary, str) or primary not in members)
                 ):
                     raise ValueError("Invalid GFD primary assignment")
                 if primary != self.primary_id:
-                    log(f"{self.client_id} assigned primary: {primary}", kind="membership")
+                    log(
+                        f"{self.client_id} assigned primary: {primary}",
+                        kind="membership",
+                    )
                 self.primary_id = cast(str | None, primary)
                 # This only updates the desired member list. Replica sockets
                 # are reconciled at the next request boundary.
@@ -124,8 +143,10 @@ class Client:
                 self._received_membership = True
                 label = "member" if count == 1 else "members"
                 member_list = f": {', '.join(self.membership)}" if members else ""
-                log(f"{self.client_id} receives GFD membership: {count} {label}{member_list}",
-                    kind="membership")
+                log(
+                    f"{self.client_id} receives GFD membership: {count} {label}{member_list}",
+                    kind="membership",
+                )
         except BlockingIOError:
             return
         except (OSError, ValueError) as exc:

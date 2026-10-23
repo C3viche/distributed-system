@@ -74,24 +74,27 @@ class Server:
 
         # 1. type of server
         if replication_mode == "active":
-            self.role: str = "active"    # M2: every replica handles every request
+            self.role: str = "active"  # M2: every replica handles every request
         elif replica_id == primary_id:
-            self.role = "primary"        # M3: handles requests, sends checkpoints
+            self.role = "primary"  # M3: handles requests, sends checkpoints
         else:
-            self.role = "backup"         # M3: ignores requests, receives checkpoints
+            self.role = "backup"  # M3: ignores requests, receives checkpoints
 
         # 2. checkpoint timer, only the primary uses it
         self.checkpoint_count: int = 1
-        self._checkpoint_interval: float = 1.0 / checkpoint_freq   # seconds between checkpoints
-        self._next_checkpoint: float = 0.0                         # set when serve() starts
+        self._checkpoint_interval: float = (
+            1.0 / checkpoint_freq
+        )  # seconds between checkpoints
+        self._next_checkpoint: float = 0.0  # set when serve() starts
 
         # 3. other replicas: primary moves ids from _pending_backups to _backups (sock -> id)
         self._pending_backups: list[str] = []
         self._backups: dict[socket.socket, str] = {}
-        self._next_backup_retry: float = 0.0   # don't redial more than once a second
+        self._next_backup_retry: float = 0.0  # don't redial more than once a second
         if self.role == "primary":
-            self._pending_backups = [rid for rid in get_server_addresses() if rid != replica_id]
-
+            self._pending_backups = [
+                rid for rid in get_server_addresses() if rid != replica_id
+            ]
 
         # Load host/port configuration. The listen socket still binds all interfaces.
         host, port = get_address(self.replica_id)
@@ -113,19 +116,24 @@ class Server:
         are handled alongside client traffic.
         """
         lfd_host, lfd_port = get_address(self.lfd_id)
-        log(f"{self.replica_id} trying to connect to {self.lfd_id} at {lfd_host}:{lfd_port}", kind="info")
+        log(
+            f"{self.replica_id} trying to connect to {self.lfd_id} at {lfd_host}:{lfd_port}",
+            kind="info",
+        )
         try:
             # Short timeout bounds the TCP handshake if the LFD host is unreachable.
             s = socket.create_connection((lfd_host, lfd_port), timeout=1.0)
         except OSError as exc:
-            log(f"{self.replica_id} could not reach {self.lfd_id} ({exc}); retrying in 1s", kind="failure")
+            log(
+                f"{self.replica_id} could not reach {self.lfd_id} ({exc}); retrying in 1s",
+                kind="failure",
+            )
             return
 
         self._lfd = s
         self._register(s, "lfd")
         self._send_json(s, {"type": "registration", "replica_id": self.replica_id})
         log(f"{self.replica_id} registered with {self.lfd_id}", kind="registration")
-
 
     def try_connect_to_backups(self) -> None:
         """Open the checkpoint channel to one backup. One try per second so a slow host
@@ -136,11 +144,17 @@ class Server:
         self._next_backup_retry = now + 1.0
         backup_id = self._pending_backups.pop(0)
         host, port = get_address(backup_id)
-        log(f"{self.replica_id} trying to open checkpoint channel to {backup_id} at {host}:{port}", kind="info")
+        log(
+            f"{self.replica_id} trying to open checkpoint channel to {backup_id} at {host}:{port}",
+            kind="info",
+        )
         try:
             s = socket.create_connection((host, port), timeout=0.5)
         except OSError as exc:
-            log(f"{self.replica_id} could not reach {backup_id} ({exc}); retrying", kind="failure")
+            log(
+                f"{self.replica_id} could not reach {backup_id} ({exc}); retrying",
+                kind="failure",
+            )
             self._pending_backups.append(backup_id)
             return
 
@@ -148,15 +162,21 @@ class Server:
         self._register(s, "backup")
         # first message on the socket tells the backup this isn't a client
         self._send_json(s, {"type": "register_primary", "replica_id": self.replica_id})
-        log(f"{self.replica_id} opened checkpoint channel to {backup_id}", kind="registration")
+        log(
+            f"{self.replica_id} opened checkpoint channel to {backup_id}",
+            kind="registration",
+        )
 
     def send_checkpoint(self) -> None:
         """Push my_state to every connected backup, print it, bump the count."""
         if not self._backups:
             # nobody to send to, does'nt bump the count
-            log(f"{self.replica_id}: no backups connected, checkpoint [{self.checkpoint_count}] skipped", kind="checkpoint")
+            log(
+                f"{self.replica_id}: no backups connected, checkpoint [{self.checkpoint_count}] skipped",
+                kind="checkpoint",
+            )
             return
-        message = {
+        message: dict[str, object] = {
             "type": "checkpoint",
             "replica_id": self.replica_id,
             "my_state": self.state,
@@ -164,9 +184,11 @@ class Server:
         }
         for sock, backup_id in list(self._backups.items()):
             self._send_json(sock, message)
-            log(f"{self.replica_id} sending checkpoint [{self.checkpoint_count}] to {backup_id}: my_state={self.state}", kind="checkpoint")
+            log(
+                f"{self.replica_id} sending checkpoint [{self.checkpoint_count}] to {backup_id}: my_state={self.state}",
+                kind="checkpoint",
+            )
         self.checkpoint_count += 1
-
 
     def _seconds_until_next_wakeup(self) -> float | None:
         # no threads, so the select() timeout is the only clock. 1s while retrying a
@@ -190,16 +212,23 @@ class Server:
         while self._next_checkpoint <= now:
             self._next_checkpoint += self._checkpoint_interval
 
-
     def handle_lfd(self, sock: socket.socket, msg: dict[str, object]) -> None:
         if msg.get("type") != "heartbeat":
             return
 
         count = msg.get("count")
-        log(f"{self.replica_id} got heartbeat [{count}] from {self.lfd_id}", kind="heartbeat")
-        self._send_json(sock, {"type": "heartbeat_ack", "replica_id": self.replica_id, "count": count})
-        log(f"{self.replica_id} sent ack [{count}] back to {self.lfd_id}", kind="heartbeat")
-
+        log(
+            f"{self.replica_id} got heartbeat [{count}] from {self.lfd_id}",
+            kind="heartbeat",
+        )
+        self._send_json(
+            sock,
+            {"type": "heartbeat_ack", "replica_id": self.replica_id, "count": count},
+        )
+        log(
+            f"{self.replica_id} sent ack [{count}] back to {self.lfd_id}",
+            kind="heartbeat",
+        )
 
     def handle_client(self, sock: socket.socket, msg: dict[str, object]) -> None:
         if msg.get("type") != "request":
@@ -228,7 +257,6 @@ class Server:
         log(f"Sending <{client}, {self.replica_id}, {req}, reply>", kind="send")
         self._send_json(sock, reply)
 
-
     def _register(self, sock: socket.socket, kind: str) -> None:
         self._connections[sock] = BufferedJsonConnection(sock)
         _ = self.sel.register(sock, selectors.EVENT_READ, kind)
@@ -240,19 +268,23 @@ class Server:
         # register_primary shows up, this swaps the label to "primary". selectors has no
         # "change label" call, only modify(), so the read/write mask is passed back unchanged.
         key = self.sel.get_key(sock)
-        self.sel.modify(sock, key.events, kind)
+        _ = self.sel.modify(sock, key.events, kind)
 
     def _send_json(self, sock: socket.socket, message: dict[str, object]) -> None:
         self._connections[sock].queue(message)
         key = self.sel.get_key(sock)
-        _ = self.sel.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, cast(str, key.data))
+        _ = self.sel.modify(
+            sock, selectors.EVENT_READ | selectors.EVENT_WRITE, cast(str, key.data)
+        )
 
     def _write_pending(self, sock: socket.socket) -> None:
         connection = self._connections[sock]
         connection.flush()
         if not connection.has_pending_output:
             # look the label up again, a read on this same tick might have relabelled it
-            _ = self.sel.modify(sock, selectors.EVENT_READ, cast(str, self.sel.get_key(sock).data))
+            _ = self.sel.modify(
+                sock, selectors.EVENT_READ, cast(str, self.sel.get_key(sock).data)
+            )
 
     def _read_messages(self, sock: socket.socket, kind: str) -> None:
         messages = self._connections[sock].receive()
@@ -281,7 +313,10 @@ class Server:
             elif msg.get("type") == "register_primary":
                 # backup side: this 'client' is actually the primary, route its messages as checkpoints from now on
                 self._relabel_socket(sock, "primary")
-                log(f"{self.replica_id} (backup): checkpoint channel from {msg.get('replica_id')}", kind="registration")
+                log(
+                    f"{self.replica_id} (backup): checkpoint channel from {msg.get('replica_id')}",
+                    kind="registration",
+                )
             else:
                 self.handle_client(sock, msg)
 
@@ -304,16 +339,22 @@ class Server:
             why = f"{client_id} disconnected ({why})"
         log(why, kind="failure")
 
-
     def serve(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         # lets us restart right after a ctrl-c instead of "address already in use"
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("0.0.0.0", self.port))
         listener.listen()
-        log(f"{self.replica_id} starting in {self.replication_mode} mode"
-            + (f", primary={self.primary_id}" if self.replication_mode == "passive" else "")
-            + f", role={self.role}; waiting for clients on {self.host}:{self.port}", kind="info")
+        log(
+            f"{self.replica_id} starting in {self.replication_mode} mode"
+            + (
+                f", primary={self.primary_id}"
+                if self.replication_mode == "passive"
+                else ""
+            )
+            + f", role={self.role}; waiting for clients on {self.host}:{self.port}",
+            kind="info",
+        )
 
         # tag each socket so the loop knows what it's looking at
         _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
@@ -327,7 +368,9 @@ class Server:
             if self._pending_backups:
                 self.try_connect_to_backups()
 
-            for key, events in self.sel.select(timeout=self._seconds_until_next_wakeup()):
+            for key, events in self.sel.select(
+                timeout=self._seconds_until_next_wakeup()
+            ):
                 # Safely narrow key.fileobj to socket.socket
                 if not isinstance(key.fileobj, socket.socket):
                     continue
@@ -336,10 +379,15 @@ class Server:
                 data = cast(str, key.data)
 
                 if data == "listener":
-                    conn, client_addr = cast(tuple[socket.socket, tuple[str, int]], listener.accept())
+                    conn, client_addr = cast(
+                        tuple[socket.socket, tuple[str, int]], listener.accept()
+                    )
 
                     self._register(conn, "client")
-                    log(f"new client connection from {client_addr[0]}:{client_addr[1]}", kind="registration")
+                    log(
+                        f"new client connection from {client_addr[0]}:{client_addr[1]}",
+                        kind="registration",
+                    )
 
                 else:
                     try:
@@ -365,14 +413,28 @@ def positive_float(text: str) -> float:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    _ = parser.add_argument("--id", choices=list(REPLICA_LFDS), required=True, help="Replica ID")
+    _ = parser.add_argument(
+        "--id", choices=list(REPLICA_LFDS), required=True, help="Replica ID"
+    )
     _ = parser.add_argument("--port", type=int, default=None, help="Override port")
-    _ = parser.add_argument("--replication-mode", choices=["active", "passive"], default=REPLICATION_MODE,
-                            help=f"Replication mode (default {REPLICATION_MODE}); passive server support is incomplete")
-    _ = parser.add_argument("--primary", choices=list(REPLICA_LFDS), default=PRIMARY_ID,
-                            help=f"who the primary is in passive mode (default PRIMARY_ID={PRIMARY_ID})")
-    _ = parser.add_argument("--checkpoint-freq", type=positive_float, default=CHECKPOINT_FREQ,
-                            help=f"checkpoints per second, primary only (default {CHECKPOINT_FREQ})")
+    _ = parser.add_argument(
+        "--replication-mode",
+        choices=["active", "passive"],
+        default=REPLICATION_MODE,
+        help=f"Replication mode (default {REPLICATION_MODE}); passive server support is incomplete",
+    )
+    _ = parser.add_argument(
+        "--primary",
+        choices=list(REPLICA_LFDS),
+        default=PRIMARY_ID,
+        help=f"who the primary is in passive mode (default PRIMARY_ID={PRIMARY_ID})",
+    )
+    _ = parser.add_argument(
+        "--checkpoint-freq",
+        type=positive_float,
+        default=CHECKPOINT_FREQ,
+        help=f"checkpoints per second, primary only (default {CHECKPOINT_FREQ})",
+    )
 
     return parser.parse_args()
 
@@ -394,6 +456,7 @@ def main() -> None:
         server.serve()
     except KeyboardInterrupt:
         log(f"{replica_id} shutting down", kind="failure")
+
 
 if __name__ == "__main__":
     main()

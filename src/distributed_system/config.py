@@ -37,11 +37,15 @@ SERVERS: dict[str, dict[str, str | int]] = {
 # Server/client CLI options can use these validated values as their defaults.
 REPLICATION_MODE = os.getenv("REPLICATION_MODE", "active")
 if REPLICATION_MODE not in {"active", "passive"}:
-    raise ValueError(f"REPLICATION_MODE must be active or passive; got {REPLICATION_MODE!r}")
+    raise ValueError(
+        f"REPLICATION_MODE must be active or passive; got {REPLICATION_MODE!r}"
+    )
 
 PRIMARY_ID = os.getenv("PRIMARY_ID", "S1")
 if PRIMARY_ID not in SERVERS:
-    raise ValueError(f"PRIMARY_ID must be one of {', '.join(SERVERS)}; got {PRIMARY_ID!r}")
+    raise ValueError(
+        f"PRIMARY_ID must be one of {', '.join(SERVERS)}; got {PRIMARY_ID!r}"
+    )
 
 try:
     CHECKPOINT_FREQ = float(os.getenv("CHECKPOINT_FREQ", "1"))
@@ -81,6 +85,7 @@ REPLICA_LFDS = {"S1": "LFD1", "S2": "LFD2", "S3": "LFD3"}
 # Unified single lookup dictionary
 PROCESS_CONFIG = {**SERVERS, **LFDS, **INFRASTRUCTURE}
 
+
 # Get all the server addresses from PROCESS_CONFIG and return as new dict
 def get_server_addresses(num: int | None = None) -> dict[str, tuple[str, int]]:
     """Return a mapping of server replica IDs to their (host, port) tuples up to `num`."""
@@ -92,6 +97,7 @@ def get_server_addresses(num: int | None = None) -> dict[str, tuple[str, int]]:
         for proc_id, cfg in server_items
     }
 
+
 # Helper function to get the address info. Will make dynamic later
 def get_address(process_id: str) -> tuple[str, int]:
     """
@@ -102,6 +108,7 @@ def get_address(process_id: str) -> tuple[str, int]:
 
     config = PROCESS_CONFIG[process_id]
     return str(config["host"]), int(config["port"])
+
 
 # Resolves the address with CLI overrides
 def resolve_address(

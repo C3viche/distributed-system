@@ -5,8 +5,7 @@ import subprocess
 import sys
 import unittest
 
-
-CONSUMER_CHECK = '''
+CONSUMER_CHECK = """
 import os
 import socket
 import sys
@@ -67,20 +66,28 @@ finally:
     client.conns.close()
     for server in servers:
         server.sel.close()
-'''
+"""
 
 
 class ReplicationConfigIntegrationTests(unittest.TestCase):
     def test_shared_defaults_and_cli_overrides(self) -> None:
         for mode in (None, "active", "passive"):
             with self.subTest(mode=mode):
-                env = {key: value for key, value in os.environ.items()
-                       if key not in {"REPLICATION_MODE", "PRIMARY_ID", "CHECKPOINT_FREQ"}}
+                env = {
+                    key: value
+                    for key, value in os.environ.items()
+                    if key not in {"REPLICATION_MODE", "PRIMARY_ID", "CHECKPOINT_FREQ"}
+                }
                 if mode is not None:
-                    env.update(REPLICATION_MODE=mode, PRIMARY_ID="S2", CHECKPOINT_FREQ="2")
+                    env.update(
+                        REPLICATION_MODE=mode, PRIMARY_ID="S2", CHECKPOINT_FREQ="2"
+                    )
                 result = subprocess.run(
-                    [sys.executable, "-c", CONSUMER_CHECK], env=env,
-                    capture_output=True, text=True, check=False,
+                    [sys.executable, "-c", CONSUMER_CHECK],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -89,22 +96,38 @@ class ReplicationConfigIntegrationTests(unittest.TestCase):
             ("client", ["--replication_mode", "passive"]),
             ("server", ["--replication_mode", "passive"]),
             ("server", ["--checkpoint_freq", "2"]),
-            *(("server", ["--checkpoint-freq", value]) for value in ("0", "-1", "nan", "inf")),
+            *(
+                ("server", ["--checkpoint-freq", value])
+                for value in ("0", "-1", "nan", "inf")
+            ),
         ):
             with self.subTest(command=command, arguments=arguments):
-                code = (
-                    "from unittest.mock import patch\n"
-                    "with patch('dotenv.load_dotenv'):\n"
-                    f"    from distributed_system.{command}"
-                    + (".server" if command == "server" else "")
-                    + " import _parse_args\n"
-                    "_parse_args()\n"
+                module = f"distributed_system.{command}" + (
+                    ".server" if command == "server" else ""
                 )
-                env = {key: value for key, value in os.environ.items()
-                       if key not in {"REPLICATION_MODE", "PRIMARY_ID", "CHECKPOINT_FREQ"}}
+                code = f"""from unittest.mock import patch
+with patch('dotenv.load_dotenv'):
+    from {module} import _parse_args
+_parse_args()
+"""
+                env = {
+                    key: value
+                    for key, value in os.environ.items()
+                    if key not in {"REPLICATION_MODE", "PRIMARY_ID", "CHECKPOINT_FREQ"}
+                }
                 result = subprocess.run(
-                    [sys.executable, "-c", code, "--id", "S1" if command == "server" else "C1", *arguments],
-                    env=env, capture_output=True, text=True, check=False,
+                    [
+                        sys.executable,
+                        "-c",
+                        code,
+                        "--id",
+                        "S1" if command == "server" else "C1",
+                        *arguments,
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
                 )
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("error:", result.stderr)

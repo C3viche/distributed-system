@@ -37,13 +37,16 @@ all_colors = {
 # (S1 and LFD1 are both orange), clients each get their own, GFD is white.
 # 256-color codes, picked to not collide with the kind colors above.
 process_colors = {
-    "S1": 208, "LFD1": 208,   # orange
-    "S2": 141, "LFD2": 141,   # purple
-    "S3": 43,  "LFD3": 43,    # teal
-    "C1": 213,                # pink
-    "C2": 118,                # lime
-    "C3": 75,                 # sky blue
-    "GFD": 255,               # white
+    "S1": 208,
+    "LFD1": 208,  # orange
+    "S2": 141,
+    "LFD2": 141,  # purple
+    "S3": 43,
+    "LFD3": 43,  # teal
+    "C1": 213,  # pink
+    "C2": 118,  # lime
+    "C3": 75,  # sky blue
+    "GFD": 255,  # white
 }
 
 _process_id: str | None = None
@@ -153,6 +156,7 @@ class BufferedJsonConnection:
             raise ConnectionError("connection closed while sending")
         del self._outgoing[:sent]
 
+
 def log(message: str, kind: str = "info") -> None:
     """
     Print a timestamped, color-coded console message.
@@ -172,4 +176,7 @@ def log(message: str, kind: str = "info") -> None:
         tag_color = process_colors.get(_process_id, 255)
         tag = f"{attr('bold')}{fg(tag_color)}[{_process_id}]{attr('reset')} "
 
-    print(f"{fg(color)}[{timestamp}]{attr('reset')} {tag}{style}{fg(color)}{message}{attr('reset')}", flush=True)
+    print(
+        f"{fg(color)}[{timestamp}]{attr('reset')} {tag}{style}{fg(color)}{message}{attr('reset')}",
+        flush=True,
+    )
