@@ -18,7 +18,12 @@ import socket
 import time
 from typing import cast
 
-from distributed_system.common import BufferedJsonConnection, heartbeat, log, set_process_id
+from distributed_system.common import (
+    BufferedJsonConnection,
+    heartbeat,
+    log,
+    set_process_id,
+)
 from distributed_system.config import REPLICA_LFDS, resolve_address
 
 
@@ -221,7 +226,7 @@ class GlobalFaultDetector:
             kind="heartbeat",
         )
 
-    def _handle_message(self, session: PeerSession, msg: dict[str, object]) -> None:
+    def _handle_message(self, session: PeerSession, msg: object) -> None:
         raw_message: object = msg
         if not isinstance(raw_message, dict):
             raise ValueError("Expected a JSON object")  # noqa: TRY004 - peer validation closes this socket

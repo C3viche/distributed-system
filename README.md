@@ -166,6 +166,79 @@ The GFD channel uses these JSON-line messages (server heartbeats retain the M1 f
 {"type":"membership","members":["S1","S2"],"member_count":2}
 ```
 
+## Milestone #3 client routing
+
+Set the following shared values in each machine's local `.env`, alongside the
+same reachable server and infrastructure addresses:
+
+```dotenv
+REPLICATION_MODE=passive
+PRIMARY_ID=S1
+CHECKPOINT_FREQ=1
+```
+
+Start GFD and LFDs as above. On each server's machine, run its own command:
+
+```bash
+uv run server --id S1
+uv run server --id S2
+uv run server --id S3
+```
+
+Launch these clients one at a time, each in its own terminal:
+
+```bash
+uv run client --id C1
+uv run client --id C2
+uv run client --id C3
+```
+
+Each client maintains one TCP connection per GFD member (three when S1, S2,
+and S3 are members), but sends requests only to its assigned primary, initially
+`PRIMARY_ID` (S1 by default). Requests run automatically at `--interval 1` until Ctrl-C.
+Both client and server read `REPLICATION_MODE`, defaulting to active when unset.
+Exported environment variables take precedence over `.env`; explicit CLI flags
+take precedence over configuration. Both commands accept `--replication-mode`;
+the server also accepts `--primary` and `--checkpoint-freq` (in Hz).
+The server no longer accepts underscore spellings of these flags. Overrides can
+make processes disagree, so use matching settings across machines. Startup logs
+show the effective mode and passive primary. Config differences are not detected
+across machines, and changes require restarting processes. `run_all.sh` uses
+these same defaults through its existing commands.
+`--count N` exits after N issued requests, including requests
+that receive no reply.
+
+Verify that each client logs three connections, then `Sent` and `Received`
+tuples naming S1 and increasing `request_num` values. S1 logs matching
+`Received` and `Sending` tuples. Crash S2 or S3: clients should log the
+connection/membership change and continue exchanging requests with S1 without
+manual intervention. Missing replica connections retry asynchronously with
+bounded connection deadlines and a one-second retry backoff.
+
+A request timeout is logged and the next request uses a fresh number. Requests
+are not automatically replayed because the current server does not deduplicate
+operations. Late replies are discarded. If the primary is unavailable, clients
+keep running, process membership updates, and wait for it to reconnect or for a
+new primary assignment; they do not promote backups themselves.
+
+The client accepts an optional `primary_id` in a GFD membership snapshot:
+
+```json
+{"type":"membership","members":["S1","S2","S3"],"member_count":3,"primary_id":"S2"}
+```
+
+Assignments take effect for the next request. An omitted `primary_id` preserves
+the previous assignment; `null` clears it. An explicit non-null assignment must
+name a configured member in the same snapshot. Invalid snapshots are rejected
+without changing the last valid membership or assignment.
+
+Passive server support is incomplete: the primary sends and logs checkpoints,
+but backups do not yet apply them or suppress client requests. Automatic primary
+promotion and GFD publication of `primary_id` also remain unfinished. The current
+GFD omits this field, so clients retain their configured initial primary until
+an explicit assignment arrives. This demo validates routing and checkpoint
+sending, not full passive state recovery.
+
 ## Wire Protocol & Logging Format
 
 ### Message Framing
