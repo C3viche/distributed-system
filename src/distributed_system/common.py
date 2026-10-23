@@ -27,6 +27,7 @@ all_colors = {
     "state": "green",
     "registration": "blue",
     "membership": "cyan",
+    "checkpoint": "light_cyan",
     "failure": "red",
     "info": "white",
 }
@@ -36,13 +37,16 @@ all_colors = {
 # (S1 and LFD1 are both orange), clients each get their own, GFD is white.
 # 256-color codes, picked to not collide with the kind colors above.
 process_colors = {
-    "S1": 208, "LFD1": 208,   # orange
-    "S2": 141, "LFD2": 141,   # purple
-    "S3": 43,  "LFD3": 43,    # teal
-    "C1": 213,                # pink
-    "C2": 118,                # lime
-    "C3": 75,                 # sky blue
-    "GFD": 255,               # white
+    "S1": 208,
+    "LFD1": 208,  # orange
+    "S2": 141,
+    "LFD2": 141,  # purple
+    "S3": 43,
+    "LFD3": 43,  # teal
+    "C1": 213,  # pink
+    "C2": 118,  # lime
+    "C3": 75,  # sky blue
+    "GFD": 255,  # white
 }
 
 _process_id: str | None = None
@@ -118,22 +122,22 @@ class BufferedJsonConnection:
     """
 
     def __init__(self, sock: socket.socket):
-        self.sock = sock
+        self.sock: socket.socket = sock
         self.sock.setblocking(False)
-        self._incoming = bytearray()
-        self._outgoing = bytearray()
+        self._incoming: bytearray = bytearray()
+        self._outgoing: bytearray = bytearray()
 
-    def receive(self) -> list[dict[str, object]] | None:
+    def receive(self) -> list[object] | None:
         """Return complete messages, [] for a partial line, or None on EOF."""
         chunk = self.sock.recv(4096)
         if not chunk:
             return None
         self._incoming.extend(chunk)
-        messages = []
+        messages: list[object] = []
         while b"\n" in self._incoming:
             line, _, remainder = self._incoming.partition(b"\n")
             self._incoming[:] = remainder
-            messages.append(cast(dict[str, object], json.loads(line.decode("utf-8"))))
+            messages.append(cast(object, json.loads(line.decode("utf-8"))))
         return messages
 
     def queue(self, message: Mapping[str, object]) -> None:
@@ -151,6 +155,7 @@ class BufferedJsonConnection:
         if sent == 0:
             raise ConnectionError("connection closed while sending")
         del self._outgoing[:sent]
+
 
 def log(message: str, kind: str = "info") -> None:
     """
@@ -171,4 +176,7 @@ def log(message: str, kind: str = "info") -> None:
         tag_color = process_colors.get(_process_id, 255)
         tag = f"{attr('bold')}{fg(tag_color)}[{_process_id}]{attr('reset')} "
 
-    print(f"{fg(color)}[{timestamp}]{attr('reset')} {tag}{style}{fg(color)}{message}{attr('reset')}", flush=True)
+    print(
+        f"{fg(color)}[{timestamp}]{attr('reset')} {tag}{style}{fg(color)}{message}{attr('reset')}",
+        flush=True,
+    )

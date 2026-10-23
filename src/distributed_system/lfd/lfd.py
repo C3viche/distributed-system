@@ -13,7 +13,12 @@ import socket
 import time
 from typing import cast
 
-from distributed_system.common import BufferedJsonConnection, heartbeat, log, set_process_id
+from distributed_system.common import (
+    BufferedJsonConnection,
+    heartbeat,
+    log,
+    set_process_id,
+)
 from distributed_system.config import REPLICA_LFDS, get_address
 
 REPLICA_ASSIGNMENTS = {lfd: replica for replica, lfd in REPLICA_LFDS.items()}
@@ -33,13 +38,13 @@ class ServerSession:
     """One incoming server connection, from registration through heartbeats."""
 
     def __init__(self, sock: socket.socket, registration_deadline: float) -> None:
-        self.sock = sock
-        self.connection = BufferedJsonConnection(sock)
+        self.sock: socket.socket = sock
+        self.connection: BufferedJsonConnection = BufferedJsonConnection(sock)
         self.registration_deadline: float | None = registration_deadline
         self.next_heartbeat: float | None = None
         self.ack_deadline: float | None = None
         self.awaiting_count: int | None = None
-        self.healthy = False
+        self.healthy: bool = False
 
     def next_deadline(self) -> float | None:
         """Return the next registration, ACK, or heartbeat deadline."""
@@ -52,12 +57,12 @@ class GFDSession:
     """Outbound GFD connection state, retained between reconnect attempts."""
 
     def __init__(self, address: tuple[str, int]) -> None:
-        self.address = address
+        self.address: tuple[str, int] = address
         self.sock: socket.socket | None = None
         self.connection: BufferedJsonConnection | None = None
-        self.connecting = False
+        self.connecting: bool = False
         self.connect_deadline: float | None = None
-        self.retry_at = 0.0
+        self.retry_at: float = 0.0
 
     def disconnected(self, now: float) -> None:
         """Discard connection state and schedule the next attempt."""
@@ -82,20 +87,22 @@ class LocalFaultDetector:
         frequency: float = 1.0,
         timeout: float = 2.0,
     ) -> None:
-        self.lfd_id = lfd_id
-        self.replica_id = REPLICA_ASSIGNMENTS[lfd_id] if replica_id is None else replica_id
+        self.lfd_id: str = lfd_id
+        self.replica_id: str = REPLICA_ASSIGNMENTS[lfd_id] if replica_id is None else replica_id
         if self.replica_id != REPLICA_ASSIGNMENTS[lfd_id]:
             raise ValueError(f"{lfd_id} must monitor {REPLICA_ASSIGNMENTS[lfd_id]}")
-        self.interval = 1.0 / frequency
-        self.timeout = timeout
+        self.interval: float = 1.0 / frequency
+        self.timeout: float = timeout
+        self.host: str
+        self.port: int
         self.host, self.port = get_address(lfd_id)
         # Counts belong to the LFD lifetime and must survive server reconnects.
-        self._counts = itertools.count(1)
-        self._selector = selectors.DefaultSelector()
+        self._counts: itertools.count[int] = itertools.count(1)
+        self._selector: selectors.DefaultSelector = selectors.DefaultSelector()
         self._connections: dict[socket.socket, ServerSession | GFDSession] = {}
         self._server: ServerSession | None = None
         self._absent_notice_at: float | None = None
-        self._gfd = GFDSession(get_address("GFD"))
+        self._gfd: GFDSession = GFDSession(get_address("GFD"))
 
     def _membership_changed(self, added: bool) -> None:
         """Queue a membership transition if the GFD connection is ready."""
@@ -132,7 +139,7 @@ class LocalFaultDetector:
         self._gfd.connect_deadline = now + self.timeout
         self._gfd.connection = BufferedJsonConnection(sock)
         self._connections[sock] = self._gfd
-        self._selector.register(sock, selectors.EVENT_WRITE, "gfd")
+        _ = self._selector.register(sock, selectors.EVENT_WRITE, "gfd")
 
     def _finish_gfd_connect(self) -> None:
         """Register with GFD and reannounce the currently healthy replica."""
@@ -161,22 +168,22 @@ class LocalFaultDetector:
 
     def _accept(self, listener: socket.socket) -> None:
         """Track an incoming server until it registers or times out."""
-        sock, _ = listener.accept()
+        sock = listener.accept()[0]
         self._connections[sock] = ServerSession(sock, time.monotonic() + self.timeout)
-        self._selector.register(sock, selectors.EVENT_READ, "server")
+        _ = self._selector.register(sock, selectors.EVENT_READ, "server")
 
     def _queue(self, sock: socket.socket, message: dict[str, object]) -> None:
         """Buffer a message and request write readiness from the shared selector."""
         connection = self._connections[sock].connection
         assert connection is not None
         connection.queue(message)
-        self._selector.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE,
-                              self._selector.get_key(sock).data)
+        _ = self._selector.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE,
+                              cast(str, self._selector.get_key(sock).data))
 
     def _drop(self, sock: socket.socket) -> None:
         """Close one connection and coordinate retry or membership removal."""
-        self._selector.unregister(sock)
-        self._connections.pop(sock)
+        _ = self._selector.unregister(sock)
+        _ = self._connections.pop(sock)
         sock.close()
         if sock is self._gfd.sock:
             was_connecting = self._gfd.connecting
@@ -284,7 +291,7 @@ class LocalFaultDetector:
             listener.bind((self.host, self.port))
             listener.listen()
             listener.setblocking(False)
-            self._selector.register(listener, selectors.EVENT_READ, "listener")
+            _ = self._selector.register(listener, selectors.EVENT_READ, "listener")
             log(f"{self.lfd_id} listening on {self.host}:{self.port}", kind="info")
             try:
                 while True:
@@ -294,13 +301,14 @@ class LocalFaultDetector:
                     self._tick(time.monotonic())
                     for key, mask in events:
                         sock = cast(socket.socket, key.fileobj)
+                        kind = cast(str, key.data)
                         try:
-                            if key.data == "listener":
+                            if kind == "listener":
                                 self._accept(listener)
                                 continue
                             if sock not in self._connections:
                                 continue
-                            if key.data == "gfd" and self._gfd.connecting:
+                            if kind == "gfd" and self._gfd.connecting:
                                 self._finish_gfd_connect()
                                 continue
                             connection = self._connections[sock].connection
@@ -310,10 +318,11 @@ class LocalFaultDetector:
                                 if messages is None:
                                     self._drop(sock)
                                     continue
-                                for message in messages:
-                                    if not isinstance(message, dict):
+                                for raw_message in messages:
+                                    if not isinstance(raw_message, dict):
                                         raise ValueError("Expected a JSON object")  # noqa: TRY004 - peer validation
-                                    if key.data == "gfd":
+                                    message = cast(dict[str, object], raw_message)
+                                    if kind == "gfd":
                                         self._handle_gfd(message)
                                     else:
                                         self._message(sock, message)
@@ -322,7 +331,7 @@ class LocalFaultDetector:
                             if sock in self._connections and mask & selectors.EVENT_WRITE:
                                 connection.flush()
                                 if not connection.has_pending_output:
-                                    self._selector.modify(sock, selectors.EVENT_READ, key.data)
+                                    _ = self._selector.modify(sock, selectors.EVENT_READ, kind)
                         except BlockingIOError:
                             pass
                         except (OSError, ValueError) as exc:
@@ -338,16 +347,18 @@ class LocalFaultDetector:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--id", choices=list(REPLICA_ASSIGNMENTS), required=True)
-    parser.add_argument("--replica-id", choices=list(REPLICA_LFDS), default=None, help="assigned replica (default: matching S1/S2/S3)")
-    parser.add_argument(
+    _ = parser.add_argument("--id", choices=list(REPLICA_ASSIGNMENTS), required=True)
+    _ = parser.add_argument("--replica-id", choices=list(REPLICA_LFDS), default=None, help="assigned replica (default: matching S1/S2/S3)")
+    _ = parser.add_argument(
         "--freq", "--heartbeat_freq", dest="frequency", type=positive_number,
         default=1.0, help="heartbeats per second (Hz)",
     )
-    parser.add_argument("--timeout", type=positive_number, default=2.0, help="ACK/registration timeout in seconds")
+    _ = parser.add_argument("--timeout", type=positive_number, default=2.0, help="ACK/registration timeout in seconds")
     args = parser.parse_args()
-    if args.replica_id is not None and args.replica_id != REPLICA_ASSIGNMENTS[args.id]:
-        parser.error(f"{args.id} must monitor {REPLICA_ASSIGNMENTS[args.id]}")
+    lfd_id = cast(str, args.id)
+    replica_id = cast(str | None, args.replica_id)
+    if replica_id is not None and replica_id != REPLICA_ASSIGNMENTS[lfd_id]:
+        parser.error(f"{lfd_id} must monitor {REPLICA_ASSIGNMENTS[lfd_id]}")
     set_process_id(cast(str, args.id))
     detector = LocalFaultDetector(
         lfd_id=cast(str, args.id), replica_id=cast(str | None, args.replica_id),
