@@ -2,9 +2,10 @@
 
 Active mode: every replica handles every request.
 Passive mode: the configured primary opens a connection to each backup and
-sends a checkpoint of my_state every 1/checkpoint_freq seconds. Backup request
-suppression and checkpoint application are still unfinished. Mode defaults to
-REPLICATION_MODE (active if unset); --replication-mode overrides it.
+sends a checkpoint of my_state every 1/checkpoint_freq seconds. A backup
+copies my_state and checkpoint_count from each checkpoint and does not answer
+client requests. Mode defaults to REPLICATION_MODE (active if unset);
+--replication-mode overrides it.
 
 Registration with the paired LFD (S1→LFD1, S2→LFD2, S3→LFD3) uses connection
 attempts bounded by a one-second timeout and is retried from the serve loop.
@@ -240,7 +241,12 @@ class Server:
         req = msg.get("request_num")
         payload = msg.get("payload", "")
 
-        # sonia: if self.role == "backup", print the ignore line and return
+        if self.role == "backup":
+            log(
+                f"{self.replica_id} (backup): ignoring request from {client}",
+                kind="info",
+            )
+            return
 
         log(f"Received <{client}, {self.replica_id}, {req}, {payload}>", kind="receive")
         log(f"my_state = {self.state} before processing", kind="state")
@@ -256,6 +262,20 @@ class Server:
         }
         log(f"Sending <{client}, {self.replica_id}, {req}, reply>", kind="send")
         self._send_json(sock, reply)
+
+    def handle_checkpoint(self, msg: dict[str, object]) -> None:
+        if msg.get("type") != "checkpoint" or msg.get("replica_id") != self.primary_id:
+            return
+        my_state = msg.get("my_state")
+        checkpoint_count = msg.get("checkpoint_count")
+        if type(my_state) is not int or type(checkpoint_count) is not int:
+            return
+        self.state = my_state
+        self.checkpoint_count = checkpoint_count
+        log(
+            f"{self.replica_id} received checkpoint from {self.primary_id}: my_state = {my_state}, checkpoint_count = {checkpoint_count}",
+            kind="checkpoint",
+        )
 
     def _register(self, sock: socket.socket, kind: str) -> None:
         self._connections[sock] = BufferedJsonConnection(sock)
@@ -300,6 +320,7 @@ class Server:
                 why = "client disconnected"
             self._close_sock(sock, why)
             return
+        
         for raw_message in messages:
             if not isinstance(raw_message, dict):
                 raise ValueError("Expected a JSON object")  # noqa: TRY004 - close malformed peer
@@ -308,15 +329,17 @@ class Server:
                 self.handle_lfd(sock, msg)
             elif kind == "backup":
                 pass  # primary's outbound channel. backups don't send anything back
-            elif kind == "primary":
-                pass  # sonia: handle_checkpoint(msg) goes here
-            elif msg.get("type") == "register_primary":
-                # backup side: this 'client' is actually the primary, route its messages as checkpoints from now on
+            elif (self.role == "backup" and msg.get("type") == "register_primary"):
+                # this accepted socket is the primary. later messages on it are checkpoints,
+                # including one that arrived in this same read.
                 self._relabel_socket(sock, "primary")
+                kind = "primary"
                 log(
                     f"{self.replica_id} (backup): checkpoint channel from {msg.get('replica_id')}",
                     kind="registration",
                 )
+            elif kind == "primary":
+                self.handle_checkpoint(msg)
             else:
                 self.handle_client(sock, msg)
 
@@ -421,7 +444,7 @@ def _parse_args() -> argparse.Namespace:
         "--replication-mode",
         choices=["active", "passive"],
         default=REPLICATION_MODE,
-        help=f"Replication mode (default {REPLICATION_MODE}); passive server support is incomplete",
+        help=f"Replication mode (default {REPLICATION_MODE})",
     )
     _ = parser.add_argument(
         "--primary",
