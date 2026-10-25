@@ -1,4 +1,4 @@
-"""Shared M3 configuration contracts, independent of server implementation."""
+"""Shared configuration contracts, independent of server implementation."""
 
 import os
 import runpy
@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "src/distributed_system/config.py"
 
 
-class M3ConfigTests(unittest.TestCase):
+class ConfigTests(unittest.TestCase):
     def read_config(self, values: dict[str, str]) -> dict[str, object]:
         # Isolate each import from the developer's shell and local .env.
         with patch.dict(os.environ, values, clear=True), patch("dotenv.load_dotenv"):
