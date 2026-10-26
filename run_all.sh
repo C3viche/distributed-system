@@ -1,22 +1,32 @@
 #!/bin/bash
-# Launch helper for the M2 demo. Every process gets its own Terminal window
-# so Priya can watch each console, same as running the uv commands by hand.
+# Launch helper for the M2 and M3 demos. Every process gets its own Terminal
+# window so Priya can watch each console, same as running the uv commands by
+# hand. The replication mode (active for M2, passive for M3) comes from
+# REPLICATION_MODE in .env; flipping that single value is enough to switch the
+# demo this script runs.
 #
 #   ./run_all.sh local              everything on this Mac, in rubric order
+#   ./run_all.sh local m3           same, but force passive mode (M3) for this run
+#   ./run_all.sh local m2           same, but force active mode (M2) for this run
 #   ./run_all.sh gfd                client laptop: GFD only
 #   ./run_all.sh clients            client laptop: C1 C2 C3
 #   ./run_all.sh replica 2          replica laptop: LFD2 then S2
 #   ./run_all.sh lfd 2              just LFD2
 #   ./run_all.sh server 2           just S2
 #   ./run_all.sh kill server 1      crash S1 (same effect as Ctrl-C in its window)
+#   ./run_all.sh kill server 2      M3 first fault: kill backup S2
+#   ./run_all.sh kill server 3      M3 second fault: kill backup S3 after S2
 #   ./run_all.sh kill lfd 1         crash LFD1; also works for client 1 and gfd
 #   ./run_all.sh kill all           stop every process this script can find
 #
 # Add --headless to write each process's output to logs/<name>.log instead of
 # opening windows. Handy for rehearsing without ten windows on screen.
 #
-# Addresses come from .env (see .env.example). Heartbeat rate and client
-# interval can be overridden: HEARTBEAT_FREQ=2 INTERVAL=0.5 ./run_all.sh local
+# Addresses, replication mode, primary, and checkpoint frequency come from
+# .env (see .env.example). Shell overrides win over .env:
+#   HEARTBEAT_FREQ=2 INTERVAL=0.5 ./run_all.sh local
+#   CHECKPOINT_FREQ=2 ./run_all.sh local m3
+#   REPLICATION_MODE=passive ./run_all.sh local
 
 set -u
 
@@ -24,6 +34,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HEARTBEAT_FREQ="${HEARTBEAT_FREQ:-1}"
 TIMEOUT="${TIMEOUT:-2}"
 INTERVAL="${INTERVAL:-1}"
+# Project guide: checkpoint_freq is a CLI parameter, never hardcoded in the
+# server. Default 1 Hz (one checkpoint per second); override via the
+# environment or .env. REPLICATION_MODE / PRIMARY_ID stay optional here so
+# config.py can still take them from .env when this script does not export them.
+CHECKPOINT_FREQ="${CHECKPOINT_FREQ:-1}"
 HEADLESS=0
 LOGDIR="$ROOT/logs"
 
@@ -43,7 +58,18 @@ port_of() {
     echo "${value:-$default}"
 }
 
-usage() { sed -n '2,20p' "$0"; exit 1; }
+usage() { sed -n '2,29p' "$0"; exit 1; }
+
+# Prepend a child-process env prefix so the terminal that runs `uv run ...`
+# inherits our shell overrides even when launched through osascript. config.py
+# calls load_dotenv() without override, so a non-empty value here beats .env.
+env_prefix() {
+    local out=""
+    [ -n "${REPLICATION_MODE:-}" ] && out="REPLICATION_MODE=$REPLICATION_MODE "
+    [ -n "${CHECKPOINT_FREQ:-}" ]  && out="${out}CHECKPOINT_FREQ=$CHECKPOINT_FREQ "
+    [ -n "${PRIMARY_ID:-}" ]       && out="${out}PRIMARY_ID=$PRIMARY_ID "
+    printf "%s" "$out"
+}
 
 # Open one Terminal window running `cmd`, titled `name`. In headless mode
 # run it in the background and log to logs/name.log instead.
@@ -82,10 +108,25 @@ EOF
     fi
 }
 
-start_gfd()    { launch "GFD"   "uv run gfd --heartbeat_freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
-start_lfd()    { launch "LFD$1" "uv run lfd --id LFD$1 --heartbeat_freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
-start_server() { launch "S$1"   "uv run server --id S$1"; }
-start_client() { launch "C$1"   "uv run client --id C$1 --interval $INTERVAL"; }
+# Visible on the process command line so Priya can see the configurable
+# checkpoint_freq (and, in M3, the primary id) without opening the source.
+server_flags() {
+    local flags="--checkpoint-freq $CHECKPOINT_FREQ"
+    [ -n "${REPLICATION_MODE:-}" ] && flags="--replication-mode $REPLICATION_MODE $flags"
+    [ -n "${PRIMARY_ID:-}" ] && flags="$flags --primary $PRIMARY_ID"
+    printf "%s" "$flags"
+}
+
+client_flags() {
+    local flags="--interval $INTERVAL"
+    [ -n "${REPLICATION_MODE:-}" ] && flags="--replication-mode $REPLICATION_MODE $flags"
+    printf "%s" "$flags"
+}
+
+start_gfd()    { launch "GFD"   "$(env_prefix)uv run gfd --heartbeat_freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
+start_lfd()    { launch "LFD$1" "$(env_prefix)uv run lfd --id LFD$1 --heartbeat_freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
+start_server() { launch "S$1"   "$(env_prefix)uv run server --id S$1 $(server_flags)"; }
+start_client() { launch "C$1"   "$(env_prefix)uv run client --id C$1 $(client_flags)"; }
 
 # Crash one of our processes by finding what is listening on its port.
 # Only kills something launched from this repo's .venv; anything else on the
@@ -158,9 +199,22 @@ fi
 
 case "$1" in
     local)
+        # Optional second arg forces the replication mode for this run only.
+        case "${2:-}" in
+            m2|active)  export REPLICATION_MODE=active ;;
+            m3|passive)
+                export REPLICATION_MODE=passive
+                # Guide: S1 is primary because it is the first replica to show up.
+                export PRIMARY_ID="${PRIMARY_ID:-S1}"
+                ;;
+            "")         ;;  # keep whatever REPLICATION_MODE / .env says
+            *) echo "unknown local mode: $2 (want m2|m3|active|passive)"; exit 1 ;;
+        esac
         check_ports_free GFD LFD1 LFD2 LFD3 S1 S2 S3
         start_gfd;               sleep 1
         for n in 1 2 3; do start_lfd "$n"; done;    sleep 1
+        # Start S1 first so, in passive mode, the primary can open its outbound
+        # checkpoint channel to S2 and S3 as soon as their listen sockets exist.
         for n in 1 2 3; do start_server "$n"; sleep 1; done
         sleep 1
         for n in 1 2 3; do start_client "$n"; sleep 1; done
