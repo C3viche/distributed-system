@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch helper for M2/M3 and the M4 integration scaffold. Every process gets its own Terminal
+# Launch helper for M2-M4. Every process gets its own Terminal
 # window so Priya can watch each console, same as running the uv commands by
 # hand. The replication mode (active for M2, passive for M3) comes from
 # REPLICATION_MODE in .env; flipping that single value is enough to switch the
@@ -8,8 +8,8 @@
 #   ./run_all.sh local              everything on this Mac, in rubric order
 #   ./run_all.sh local m3           same, but force passive mode (M3) for this run
 #   ./run_all.sh local m2           same, but force active mode (M2) for this run
-#   ./run_all.sh local m4-active    active scaffold, starting RM before GFD
-#   ./run_all.sh local m4-passive   passive scaffold, starting RM before GFD
+#   ./run_all.sh local m4-active    active mode with RM
+#   ./run_all.sh local m4-passive   passive mode with RM
 #   ./run_all.sh rm                 client laptop: RM only
 #   ./run_all.sh infrastructure     client laptop: RM, then GFD
 #   ./run_all.sh gfd                client laptop: GFD only
@@ -135,8 +135,7 @@ start_lfd()    { launch "LFD$1" "$(env_prefix)uv run lfd --id LFD$1 --heartbeat_
 start_server() { launch "S$1"   "$(env_prefix)uv run server --id S$1 $(server_flags)"; }
 start_client() { launch "C$1"   "$(env_prefix)uv run client --id C$1 $(client_flags)"; }
 
-# Wait for the RM listener before launching GFD. This checks availability only;
-# GFD registration and forwarding remain a teammate integration dependency.
+# Wait for RM's listener before launching GFD.
 wait_for_rm() {
     (cd "$ROOT" && uv run python - <<'PY'
 import socket

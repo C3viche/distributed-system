@@ -1,8 +1,6 @@
-"""M4 RM receiver. GFD forwarding and recovery integration are pending.
+"""Track replica membership reported by GFD.
 
-Provisional JSON-line contract: register_gfd (gfd_id=GFD), then add_replica /
-delete_replica (replica_id), or membership (members, member_count) for resync.
-This tracks reported membership only; it does not certify recovery readiness.
+Run with ``uv run rm``. See README for the proposed GFD message format.
 """
 
 from __future__ import annotations
@@ -25,7 +23,6 @@ class ReplicationManager:
 
     @property
     def member_count(self) -> int:
-        # Derive the count so duplicate notifications cannot make it drift.
         return len(self.membership)
 
     def _print_membership(self) -> None:
@@ -75,7 +72,7 @@ class ReplicationManager:
         else:
             raise ValueError("Unsupported RM message type")
 
-        # Full reports must be visible even when the initial group is still empty.
+        # Print snapshots even when unchanged, including GFD's initial empty report.
         if kind == "membership" or updated != self.membership:
             self.membership = updated
             self._print_membership()
