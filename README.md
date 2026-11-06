@@ -8,7 +8,7 @@ The overall system models an asynchronous distributed application split into nod
 - **Server Replicas (`S1`, `S2`, `S3`)**: Stateful, deterministic server nodes. Each server maintains internal state (`my_state`) and handles incoming client requests and heartbeat checks.
 - **Local Fault Detector (`LFD1`, `LFD2`, `LFD3`)**: Resides on the same physical/virtual host as its assigned server replica. Sends periodic heartbeats to monitor replica health and reports crashes.
 - **Global Fault Detector (`GFD`)**: Aggregates local health notifications from all LFDs, maintains central system group membership, and broadcasts membership updates.
-- **Replication Manager (`RM`)**: Orchestrates high-level system fault tolerance, tracks healthy members, and automates replica recovery/re-launch.
+- **Replication Manager (`RM`)**: M4 membership receiver for GFD reports. GFD forwarding and recovery/failover integration are pending; automatic replica relaunch is deferred to M5.
 - **Clients (`C1`, `C2`, `C3`)**: Independent client processes issuing requests with unique `<client_id, replica_id, request_num>` tuples.
 
 ## Prerequisites & Installation
@@ -36,7 +36,7 @@ server and its LFD on the same machine. Use consistent addresses across machines
 Existing shell environment variables take precedence over `.env` values.
 
 Heartbeat frequency and timeout remain CLI options (`--heartbeat_freq` and
-`--timeout`); use the same frequency for all three LFDs. GFD uses `GFD_HOST` and `GFD_PORT`; RM remains reserved for a future milestone.
+`--timeout`); use the same frequency for all three LFDs. GFD uses `GFD_HOST` and `GFD_PORT`; the M4 RM receiver uses `RM_HOST` and `RM_PORT`.
 
 ### Setting up `.env` for a multi-laptop run
 
@@ -480,6 +480,128 @@ Console outputs are timestamped in UTC and the rest of the line is color-coded b
 - Cyan: Membership changes
 - Light cyan: Checkpoint send and receive (primary $\leftrightarrow$ backups)
 - Red: Process failures & socket tear-downs
+
+## Milestone #4 PM / RM Integration Work
+
+Chris owns the RM receiver, launch scripts, integration checklist, and rehearsal.
+The receiver is implemented; the complete M4 system is **not integrated yet**.
+The current GFD does not connect to RM, so starting the full scaffold leaves RM
+at `RM: 0 members` until Sonia's sender is connected. M2/M3 launches are unchanged.
+
+### RM receiver and provisional interface
+
+Start with `uv run rm` (optional `--host` / `--port` overrides). The RM listens
+on its configured address, prints `RM: 0 members`, and accepts newline-delimited
+JSON. Reuse this receiver-side proposal when agreeing the interface with Sonia;
+these messages are not yet emitted by the repository's GFD:
+
+```json
+{"type":"register_gfd","gfd_id":"GFD"}
+{"type":"membership","members":["S1","S2"],"member_count":2}
+{"type":"add_replica","replica_id":"S3"}
+{"type":"delete_replica","replica_id":"S1"}
+```
+
+Register first on every connection. The proposed GFD sender should send a full
+snapshot immediately afterward, including an empty snapshot when appropriate,
+then send changes over the same connection. RM does not send acknowledgments.
+Only configured replica IDs are accepted. Repeated additions/deletions are
+no-ops, and `member_count` is always derived from the membership list. Invalid
+messages close that peer's connection without stopping RM or partially applying
+the message. A new GFD registration replaces the old connection.
+
+After the example above, RM prints `RM: 2 members: S2, S3`. If GFD disconnects,
+RM logs the disconnect and retains the last reported membership until a new
+snapshot arrives; this retained view is not a fresh health assessment.
+
+RM currently records reported membership only. Primary selection, promotion,
+and readiness decisions have no implementation here. In particular, membership
+must not be interpreted as proof that a restarted replica has synchronized.
+
+### Launch and manual restart commands
+
+For local integration, run one mode at a time:
+
+```bash
+./run_all.sh local m4-active --headless
+./run_all.sh kill all
+./run_all.sh local m4-passive --headless
+./run_all.sh kill all
+```
+
+These are scaffolds, not working recovery/failover demos yet. They start RM,
+wait up to ten seconds for its TCP listener, then launch GFD, LFDs, servers,
+and clients. The RM check verifies a listener, not successful GFD registration.
+Passive mode still uses the existing static `PRIMARY_ID` until the team's
+dynamic primary integration is complete. Headless output is in `logs/RM.log`
+and the existing per-process log files; omit `--headless` for Terminal windows.
+
+For four laptops, share consistent `.env` settings with reachable LAN addresses.
+Set both `RM_HOST` and `GFD_HOST` to laptop 4's address:
+
+| Laptop | Launch commands |
+|---|---|
+| 4: RM, GFD, clients | `./run_all.sh infrastructure`, then `./run_all.sh clients` after replicas are ready |
+| 1: LFD1, S1 | `./run_all.sh replica 1` |
+| 2: LFD2, S2 | `./run_all.sh replica 2` |
+| 3: LFD3, S3 | `./run_all.sh replica 3` |
+
+Start infrastructure first, then replica laptops in order. Set the same
+`REPLICATION_MODE` on all laptops. These commands are also available individually:
+
+```bash
+./run_all.sh rm                # RM only, before starting GFD separately
+./run_all.sh kill rm           # stop this repository's RM listener
+./run_all.sh kill server 1     # on S1's laptop, inject a crash
+./run_all.sh server 1          # on S1's laptop, manually relaunch S1
+./run_all.sh kill all          # run on each laptop to stop its local processes
+```
+
+Relaunching a process currently does not guarantee recovered state or readiness.
+Automatic respawning and an automatic recovery loop are deferred to M5.
+
+### Pending handoffs — intentionally unimplemented
+
+| Dependency | Owner | Still to agree / connect |
+|---|---|---|
+| GFD → RM registration and membership relay | Sonia | Final wire contract; initial/reconnect snapshot; add/delete forwarding |
+| Primary failover decision and notification | Nikhil + Sonia, coordinated by Chris | Single decision owner; message route; promotion completion before client routing |
+| State transfer and `i_am_ready` | Cristian + Sonia | Readiness message route; when a recovered replica becomes eligible for traffic |
+| Client transition and reconnection | Joshua | Consume updated membership/primary; verify request continuity |
+
+Final primary-notification message: **TBD**.
+
+Final recovered-readiness message: **TBD**.
+
+### Integration and rehearsal gates
+
+- [x] RM receiver: registration, membership updates, idempotency, resynchronization.
+- [x] RM CLI and launcher support, including headless logs and cleanup.
+- [ ] Sonia's GFD connects; RM/GFD membership matches after add/delete/reconnect.
+- [ ] Active recovery: crash S1, continue on survivors, manually restart S1,
+      synchronize its state, mark ready, and verify client reconnection.
+- [ ] Passive failover: crash S1, promote S2, verify client routing to S2 and
+      checkpoint delivery from S2 to S3.
+- [ ] Verify request continuity with Joshua and state/log consistency with Cristian.
+- [ ] Run both scenarios on localhost after dependent changes are integrated.
+- [ ] Repeat both on four laptops with shared configuration and visible logs.
+
+Four-laptop rehearsal date: **TBD**. Result / log locations: **TBD**.
+
+Receiver and launcher checks (the TCP tests use a simulated GFD, not the real sender):
+
+```bash
+uv run python -m unittest discover -s tests -p 'test_rm*.py' -v
+bash -n run_all.sh
+```
+
+Run the full existing test suite before the team integration rehearsal. Select
+active mode explicitly for older server/GFD tests that expect every replica to
+answer client requests; this does not change `.env`:
+
+```bash
+REPLICATION_MODE=active uv run python -m unittest discover -s tests -v
+```
 
 ## Project Milestones Roadmap
 - Milestone #1: Single stateful server replica (`S1`), 3 clients, and `LFD1` heartbeat monitoring.
