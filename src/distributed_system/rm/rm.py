@@ -78,11 +78,6 @@ class ReplicationManager:
             self.membership = updated
             self._print_membership()
 
-        # TODO(Sonia): connect the GFD sender and finalize this wire contract.
-        # TODO(Nikhil/Sonia): agree primary-decision ownership and notification.
-        # TODO(Cristian/Sonia): agree how recovered readiness reaches membership.
-        # No election, promotion, or recovery action is implemented here yet.
-
     def _close_peer(self, sock: socket.socket) -> None:
         self._connections.pop(sock, None)
         try:

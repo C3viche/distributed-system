@@ -569,10 +569,6 @@ Automatic respawning and an automatic recovery loop are deferred to M5.
 | State transfer and `i_am_ready` | Cristian + Sonia | Readiness message route; when a recovered replica becomes eligible for traffic |
 | Client transition and reconnection | Joshua | Consume updated membership/primary; verify request continuity |
 
-Final primary-notification message: **TBD**.
-
-Final recovered-readiness message: **TBD**.
-
 ### Integration and rehearsal gates
 
 - [x] RM receiver: registration, membership updates, idempotency, resynchronization.
@@ -585,8 +581,6 @@ Final recovered-readiness message: **TBD**.
 - [ ] Verify request continuity with Joshua and state/log consistency with Cristian.
 - [ ] Run both scenarios on localhost after dependent changes are integrated.
 - [ ] Repeat both on four laptops with shared configuration and visible logs.
-
-Four-laptop rehearsal date: **TBD**. Result / log locations: **TBD**.
 
 Receiver and launcher checks (the TCP tests use a simulated GFD, not the real sender):
 
