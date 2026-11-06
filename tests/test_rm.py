@@ -63,6 +63,19 @@ class ReplicationManagerTests(unittest.TestCase):
     def send(sock, message):
         sock.sendall((json.dumps(message) + "\n").encode())
 
+    def test_initial_empty_and_unchanged_snapshots_are_printed(self):
+        sock = self.connect()
+        self.wait_for("GFD registered with RM")
+        self.assertEqual(self.logs().count("RM: 0 members"), 1)
+        self.send(sock, {"type": "membership", "members": [], "member_count": 0})
+        self.wait_for("RM: 0 members", count=2)
+        snapshot = {"type": "membership", "members": ["S1"], "member_count": 1}
+        self.send(sock, snapshot)
+        self.wait_for("RM: 1 member: S1")
+        self.send(sock, snapshot)
+        self.wait_for("RM: 1 member: S1", count=2)
+        self.assertNotIn("RM: 1 members:", self.logs())
+
     def test_membership_is_idempotent_and_framing_handles_partial_lines(self):
         sock = self.connect()
         sock.sendall(b'{"type":"add_replica","replica_')
@@ -73,14 +86,14 @@ class ReplicationManagerTests(unittest.TestCase):
         for _ in range(2):
             self.send(sock, {"type": "delete_replica", "replica_id": "S1"})
         self.send(sock, {"type": "delete_replica", "replica_id": "S2"})
-        self.wait_for("RM: 1 members: S3")
-        self.assertEqual(self.logs().count("RM: 1 members: S1"), 1)
+        self.wait_for("RM: 1 member: S3")
+        self.assertEqual(self.logs().count("RM: 1 member: S1"), 1)
         self.assertEqual(self.logs().count("RM: 2 members: S2, S3"), 1)
 
     def test_reconnect_resynchronizes_without_treating_disconnect_as_crash(self):
         sock = self.connect()
         self.send(sock, {"type": "add_replica", "replica_id": "S1"})
-        self.wait_for("RM: 1 members: S1")
+        self.wait_for("RM: 1 member: S1")
         sock.close()
         self.wait_for("retaining last reported membership")
         self.assertEqual(self.logs().count("RM: 0 members"), 1)
@@ -100,12 +113,12 @@ class ReplicationManagerTests(unittest.TestCase):
             self.send(self.connect(register=False), message)
             self.wait_for("RM rejected/disconnected peer", count=index)
         self.send(self.connect(), {"type": "add_replica", "replica_id": "S2"})
-        self.wait_for("RM: 1 members: S2")
+        self.wait_for("RM: 1 member: S2")
 
     def test_invalid_snapshot_does_not_partially_replace_membership(self):
         sock = self.connect()
         self.send(sock, {"type": "add_replica", "replica_id": "S1"})
-        self.wait_for("RM: 1 members: S1")
+        self.wait_for("RM: 1 member: S1")
         for index, (members, count) in enumerate([
             (["S2", "S9"], 2), (["S2", "S2"], 2), (["S2"], 2), (["S2"], True),
         ], 1):
@@ -122,7 +135,7 @@ class ReplicationManagerTests(unittest.TestCase):
         self.wait_for("GFD registered with RM", count=2)
         self.assertEqual(old.recv(1), b"")
         self.send(new, {"type": "add_replica", "replica_id": "S3"})
-        self.wait_for("RM: 1 members: S3")
+        self.wait_for("RM: 1 member: S3")
 
 
 if __name__ == "__main__":

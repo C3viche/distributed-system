@@ -505,6 +505,8 @@ these messages are not yet emitted by the repository's GFD:
 Register first on every connection. The proposed GFD sender should send a full
 snapshot immediately afterward, including an empty snapshot when appropriate,
 then send changes over the same connection. RM does not send acknowledgments.
+Every accepted full snapshot is printed, even if unchanged, so GFD's initial
+empty report produces `RM: 0 members` again after RM's startup message.
 Only configured replica IDs are accepted. Repeated additions/deletions are
 no-ops, and `member_count` is always derived from the membership list. Invalid
 messages close that peer's connection without stopping RM or partially applying
@@ -578,9 +580,16 @@ Automatic respawning and an automatic recovery loop are deferred to M5.
       synchronize its state, mark ready, and verify client reconnection.
 - [ ] Passive failover: crash S1, promote S2, verify client routing to S2 and
       checkpoint delivery from S2 to S3.
+- [ ] Passive backup recovery (start with S1 primary): kill S2 with
+      `./run_all.sh kill server 2`, verify GFD/RM report S1 and S3, then manually
+      restart S2 with `./run_all.sh server 2` on its laptop. Verify LFD2
+      re-registration and GFD/RM restoration to three members; verify S2 receives
+      and applies S1's checkpoint before becoming ready. S2 must resume as a
+      backup, receive subsequent checkpoints, and leave client replies to S1
+      throughout the crash and recovery.
 - [ ] Verify request continuity with Joshua and state/log consistency with Cristian.
-- [ ] Run both scenarios on localhost after dependent changes are integrated.
-- [ ] Repeat both on four laptops with shared configuration and visible logs.
+- [ ] Run all three scenarios on localhost after dependent changes are integrated.
+- [ ] Repeat all three on four laptops with shared configuration and visible logs.
 
 Receiver and launcher checks (the TCP tests use a simulated GFD, not the real sender):
 

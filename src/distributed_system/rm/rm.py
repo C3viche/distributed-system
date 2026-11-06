@@ -30,7 +30,8 @@ class ReplicationManager:
 
     def _print_membership(self) -> None:
         suffix = f": {', '.join(self.membership)}" if self.membership else ""
-        log(f"RM: {self.member_count} members{suffix}", kind="membership")
+        word = "member" if self.member_count == 1 else "members"
+        log(f"RM: {self.member_count} {word}{suffix}", kind="membership")
 
     @staticmethod
     def _replica(value: object) -> str:
@@ -74,7 +75,8 @@ class ReplicationManager:
         else:
             raise ValueError("Unsupported RM message type")
 
-        if updated != self.membership:
+        # Full reports must be visible even when the initial group is still empty.
+        if kind == "membership" or updated != self.membership:
             self.membership = updated
             self._print_membership()
 
