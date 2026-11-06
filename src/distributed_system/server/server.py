@@ -35,8 +35,10 @@ from distributed_system.config import (
     PRIMARY_ID,
     REPLICA_LFDS,
     REPLICATION_MODE,
+    ReplicaStatus,
     get_address,
     get_server_addresses,
+
 )
 
 
@@ -56,6 +58,7 @@ class Server:
         replication_mode: str = REPLICATION_MODE,
         primary_id: str = PRIMARY_ID,
         checkpoint_freq: float = CHECKPOINT_FREQ,
+        replica_status: ReplicaStatus = ReplicaStatus.UP
     ):
         if replication_mode not in {"active", "passive"}:
             raise ValueError("replication_mode must be active or passive")
@@ -68,6 +71,7 @@ class Server:
         self.primary_id: str = primary_id
         self.replica_id: str = replica_id
         self.lfd_id: str = lfd_id_for(replica_id)
+        self.replica_status: ReplicaStatus = replica_status
         self.state: int = 0
         self._connections: dict[socket.socket, BufferedJsonConnection] = {}
         self._client_ids: dict[socket.socket, str] = {}
@@ -270,10 +274,14 @@ class Server:
         checkpoint_count = msg.get("checkpoint_count")
         if type(my_state) is not int or type(checkpoint_count) is not int:
             return
+
+        previous_state = self.state
         self.state = my_state
         self.checkpoint_count = checkpoint_count
+        self.replica_status = ReplicaStatus.READY
+
         log(
-            f"{self.replica_id} received checkpoint from {self.primary_id}: my_state = {my_state}, checkpoint_count = {checkpoint_count}",
+            f"{self.replica_id} applied checkpoint [{checkpoint_count}]: {self.primary_id}: my_state = {previous_state} -> {my_state}",
             kind="checkpoint",
         )
 

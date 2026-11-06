@@ -12,11 +12,18 @@ Public API:
 import math
 import os
 from typing import cast
+from enum import Enum
 
 from dotenv import load_dotenv
 
 # Load variables from .env file if it exists locally
 _ = load_dotenv()
+
+class ReplicaStatus(Enum):
+    UP = 1, # Just started up but unsynced from other replicas
+    READY = 2,  # received update from checkpoint
+    RUNNING = 3, # currently receiving requests and serving responses
+    FAILED = 4 # a state to mark failure
 
 # Dedicated mappings for each service component
 SERVERS: dict[str, dict[str, str | int]] = {
