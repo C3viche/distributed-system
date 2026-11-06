@@ -21,9 +21,8 @@ _ = load_dotenv()
 
 class ReplicaStatus(Enum):
     UP = 1, # Just started up but unsynced from other replicas
-    READY = 2,  # received update from checkpoint
-    RUNNING = 3, # currently receiving requests and serving responses
-    FAILED = 4 # a state to mark failure
+    SYNCED = 2,  # received update from checkpoint
+    FAILED = 3 # a state to mark failure
 
 # Dedicated mappings for each service component
 SERVERS: dict[str, dict[str, str | int]] = {

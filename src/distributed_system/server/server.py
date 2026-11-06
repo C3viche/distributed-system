@@ -38,7 +38,6 @@ from distributed_system.config import (
     ReplicaStatus,
     get_address,
     get_server_addresses,
-
 )
 
 
@@ -58,7 +57,7 @@ class Server:
         replication_mode: str = REPLICATION_MODE,
         primary_id: str = PRIMARY_ID,
         checkpoint_freq: float = CHECKPOINT_FREQ,
-        replica_status: ReplicaStatus = ReplicaStatus.UP
+        replica_status: ReplicaStatus = ReplicaStatus.UP,
     ):
         if replication_mode not in {"active", "passive"}:
             raise ValueError("replication_mode must be active or passive")
@@ -112,6 +111,9 @@ class Server:
 
         # Outbound connection to the assigned LFD; None while we have no LFD.
         self._lfd: socket.socket | None = None
+        self._rm: socket.socket | None = None
+        self._rm_retry_at: float = 0.0
+        self.recovery_source_id: str | None = None
 
     def try_connect_to_lfd(self) -> None:
         """Attempt registration with the assigned LFD (up to one second).
@@ -139,6 +141,49 @@ class Server:
         self._register(s, "lfd")
         self._send_json(s, {"type": "registration", "replica_id": self.replica_id})
         log(f"{self.replica_id} registered with {self.lfd_id}", kind="registration")
+
+    def try_connect_to_rm(self) -> None:
+        """Open the RM control channel and request instructions for joining.
+
+        Like the client's GFD channel, this uses a bounded connection attempt,
+        buffered asynchronous messages, and a one-second reconnect backoff.
+        The RM owns membership decisions; this connection does not transfer state.
+        The join protocol is a proposed contract until the RM is implemented.
+        """
+        if self._rm is not None or time.monotonic() < self._rm_retry_at:
+            return
+        rm_host, rm_port = get_address("RM")
+        log(
+            f"{self.replica_id} trying to connect to RM at {rm_host}:{rm_port}",
+            kind="info",
+        )
+        try:
+            # Short timeout bounds the TCP handshake if the RM is unreachable.
+            s = socket.create_connection((rm_host, rm_port), timeout=1.0)
+        except OSError as exc:
+            log(
+                f"{self.replica_id} could not reach RM ({exc}); retrying in 1s",
+                kind="failure",
+            )
+            self._rm_retry_at = time.monotonic() + 1.0
+            return
+
+        self._rm = s
+        self._register(s, "rm")
+        # This request identifies the replica and asks the RM how it should join.
+        self._send_json(
+            s,
+            {
+                "type": "join_request",
+                "replica_id": self.replica_id,
+                "replication_mode": self.replication_mode,
+                "status": self.replica_status.name,
+            },
+        )
+        log(
+            f"{self.replica_id} requested join instructions from RM",
+            kind="registration",
+        )
 
     def try_connect_to_backups(self) -> None:
         """Open the checkpoint channel to one backup. One try per second so a slow host
@@ -174,6 +219,8 @@ class Server:
 
     def send_checkpoint(self) -> None:
         """Push my_state to every connected backup, print it, bump the count."""
+        if self.role != "primary" or self.replica_status != ReplicaStatus.SYNCED:
+            return
         if not self._backups:
             # nobody to send to, does'nt bump the count
             log(
@@ -201,6 +248,8 @@ class Server:
         waits: list[float] = []
         if self._lfd is None:
             waits.append(1.0)
+        if self._rm is None:
+            waits.append(max(0.0, self._rm_retry_at - time.monotonic()))
         if self._pending_backups:
             waits.append(max(0.0, self._next_backup_retry - time.monotonic()))
         if self.role == "primary":
@@ -217,6 +266,7 @@ class Server:
         while self._next_checkpoint <= now:
             self._next_checkpoint += self._checkpoint_interval
 
+    # Handle lfd, rm, or client request
     def handle_lfd(self, sock: socket.socket, msg: dict[str, object]) -> None:
         if msg.get("type") != "heartbeat":
             return
@@ -252,6 +302,15 @@ class Server:
             )
             return
 
+        # Check if the replica is actually synced before handling the client
+        if self.replica_status != ReplicaStatus.SYNCED:
+            log(
+                f"{self.replica_id}: ignore request while {self.replica_status.name}",
+                kind="info",
+            )
+            return
+
+        # Replica is synced so handle client request
         log(f"Received <{client}, {self.replica_id}, {req}, {payload}>", kind="receive")
         log(f"my_state = {self.state} before processing", kind="state")
         self.state += 1
@@ -267,6 +326,42 @@ class Server:
         log(f"Sending <{client}, {self.replica_id}, {req}, reply>", kind="send")
         self._send_json(sock, reply)
 
+    def handle_rm(self, msg: dict[str, object]) -> None:
+        """Handle proposed RM instructions, separately from state transfer.
+
+        initialize: explicitly authorize fresh startup with the initial state.
+        recover: select a source; remain UP until state transfer completes.
+        wait: remain UP while the RM decides how to admit this replica.
+        Promotion and active state transfer are not implemented here.
+        """
+        if self.replica_status != ReplicaStatus.UP:
+            return
+        instruction = msg.get("type")
+        if instruction == "initialize":
+            self.recovery_source_id = None
+            self.replica_status = ReplicaStatus.SYNCED
+            log(f"{self.replica_id}: RM authorized fresh initialization", kind="info")
+        elif instruction == "recover":
+            source_id = msg.get("source_id")
+            if (
+                not isinstance(source_id, str)
+                or source_id == self.replica_id
+                or source_id not in get_server_addresses()
+            ):
+                raise ValueError("Invalid RM recovery source")
+            self.recovery_source_id = source_id
+            # TODO: Start coordinated state transfer from source_id. Merely
+            # receiving an instruction does not make the replica synchronized.
+            log(
+                f"{self.replica_id}: RM selected recovery source {source_id}; waiting for state transfer (not implemented)",
+                kind="info",
+            )
+        elif instruction == "wait":
+            self.recovery_source_id = None
+            log(f"{self.replica_id}: waiting for RM join instructions", kind="info")
+        else:
+            raise ValueError("Invalid RM join instruction")
+
     def handle_checkpoint(self, msg: dict[str, object]) -> None:
         if msg.get("type") != "checkpoint" or msg.get("replica_id") != self.primary_id:
             return
@@ -278,7 +373,7 @@ class Server:
         previous_state = self.state
         self.state = my_state
         self.checkpoint_count = checkpoint_count
-        self.replica_status = ReplicaStatus.READY
+        self.replica_status = ReplicaStatus.SYNCED  # replica is now synced
 
         log(
             f"{self.replica_id} applied checkpoint [{checkpoint_count}]: {self.primary_id}: my_state = {previous_state} -> {my_state}",
@@ -324,20 +419,24 @@ class Server:
                 why = f"lost checkpoint channel to {self._backups.get(sock, '?')}"
             elif kind == "primary":
                 why = "lost connection to primary"
+            elif kind == "rm":
+                why = "lost connection to replication manager"
             else:
                 why = "client disconnected"
             self._close_sock(sock, why)
             return
-        
+
         for raw_message in messages:
             if not isinstance(raw_message, dict):
                 raise ValueError("Expected a JSON object")  # noqa: TRY004 - close malformed peer
             msg = cast(dict[str, object], raw_message)
             if kind == "lfd":
                 self.handle_lfd(sock, msg)
+            elif kind == "rm":
+                self.handle_rm(msg)
             elif kind == "backup":
                 pass  # primary's outbound channel. backups don't send anything back
-            elif (self.role == "backup" and msg.get("type") == "register_primary"):
+            elif self.role == "backup" and msg.get("type") == "register_primary":
                 # this accepted socket is the primary. later messages on it are checkpoints,
                 # including one that arrived in this same read.
                 self._relabel_socket(sock, "primary")
@@ -360,6 +459,10 @@ class Server:
         sock.close()
         if sock is self._lfd:
             self._lfd = None  # serve loop will try to re-register
+        elif sock is self._rm:
+            self._rm = None
+            self._rm_retry_at = time.monotonic() + 1.0
+            why = "lost connection to RM; will retry"
         elif backup_id:
             # backup died, put it back in the queue so we reconnect if it comes back up
             self._pending_backups.append(backup_id)
@@ -398,6 +501,8 @@ class Server:
                 self.try_connect_to_lfd()
             if self._pending_backups:
                 self.try_connect_to_backups()
+            if self._rm is None:
+                self.try_connect_to_rm()
 
             for key, events in self.sel.select(
                 timeout=self._seconds_until_next_wakeup()
