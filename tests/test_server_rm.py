@@ -114,3 +114,60 @@ class ServerRMTests(unittest.TestCase):
             )
         send.assert_not_called()
         self.assertEqual(server.state, 0)
+
+    def test_active_replica_serves_only_after_initialization(self) -> None:
+        server = self.make_server()
+        peer = MagicMock(spec=socket.socket)
+        request: dict[str, object] = {
+            "type": "request",
+            "client_id": "C1",
+            "request_num": 1,
+        }
+        with patch.object(server, "_send_json") as send:
+            server.handle_client(peer, request)
+            server.handle_rm({"type": "recover", "source_id": "S2"})
+            server.handle_client(peer, request)
+            send.assert_not_called()
+            self.assertEqual(server.state, 0)
+
+            server.handle_rm({"type": "initialize"})
+            server.handle_client(peer, request)
+            self.assertEqual(server.state, 1)
+            self.assertIsNone(server.recovery_source_id)
+            send.assert_called_once_with(
+                peer,
+                {
+                    "type": "reply",
+                    "client_id": "C1",
+                    "replica_id": "S1",
+                    "request_num": 1,
+                    "state": 1,
+                },
+            )
+
+    def test_checkpoint_synchronizes_backup_without_authorizing_client_work(
+        self,
+    ) -> None:
+        server = self.make_server(replica_id="S2", mode="passive")
+        server.handle_checkpoint(
+            {
+                "type": "checkpoint",
+                "replica_id": "S1",
+                "my_state": 7,
+                "checkpoint_count": 3,
+            }
+        )
+        self.assertEqual(server.replica_status, ReplicaStatus.SYNCED)
+        self.assertEqual(server.state, 7)
+        self.assertEqual(server.checkpoint_count, 3)
+        with patch.object(server, "_send_json") as send:
+            server.handle_client(
+                MagicMock(spec=socket.socket),
+                {
+                    "type": "request",
+                    "client_id": "C1",
+                    "request_num": 1,
+                },
+            )
+        send.assert_not_called()
+        self.assertEqual(server.state, 7)
