@@ -65,7 +65,7 @@ try:
 finally:
     client.conns.close()
     for server in servers:
-        server.sel.close()
+        server.close()
 """
 
 

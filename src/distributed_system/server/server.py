@@ -1,34 +1,22 @@
-"""Server replica for 18-749 (S1, S2, or S3).
+"""Server lifecycle, service registration, and replication behavior.
 
-Active mode: every replica handles every request.
-Passive mode: the configured primary opens a connection to each backup and
-sends a checkpoint of my_state every 1/checkpoint_freq seconds. A backup
-copies my_state and checkpoint_count from each checkpoint and does not answer
-client requests. Mode defaults to REPLICATION_MODE (active if unset);
---replication-mode overrides it.
+transport.py owns socket buffers, selector events, and channel labels.
+cli.py owns command-line parsing. This module decides how to handle client
+requests, LFD heartbeats, and passive checkpoints.
 
-Registration with the paired LFD (S1→LFD1, S2→LFD2, S3→LFD3) uses connection
-attempts bounded by a one-second timeout and is retried from the serve loop.
-Client requests, LFD heartbeats, the backup channel and the checkpoint timer
-all live in one select loop. No threads, timers, or randomness.
+Active replicas process client requests. In passive mode the configured primary
+processes requests and sends periodic checkpoints; backups apply checkpoints
+and ignore client requests. All channels share one selector loop.
 
-The listen socket binds 0.0.0.0 so other machines can connect. The port, and
-the host printed at startup, come from config.
-
-
-To Run:
-    uv run server --id S1                         # shared config defaults
-    uv run server --id S2 --checkpoint-freq 2     # frequency only matters on the primary
-    uv run server --id S1 --replication-mode active
+Run with ``uv run server --id S1``; shared config supplies replication defaults.
 """
 
 import math
-import selectors
 import socket
 import time
 from typing import cast
 
-from distributed_system.common import BufferedJsonConnection, log, set_process_id
+from distributed_system.common import log, set_process_id
 from distributed_system.config import (
     CHECKPOINT_FREQ,
     PRIMARY_ID,
@@ -38,6 +26,7 @@ from distributed_system.config import (
     get_server_addresses,
 )
 from distributed_system.server.cli import parse_args as _parse_args
+from distributed_system.server.transport import ServerTransport
 
 
 def lfd_id_for(replica_id: str) -> str:
@@ -49,7 +38,9 @@ def lfd_id_for(replica_id: str) -> str:
 
 
 class Server:
-    # Lifecycle
+    """Coordinate application behavior through a dedicated socket transport."""
+
+    # Lifecycle: construction and the running event loop
 
     def __init__(
         self,
@@ -59,6 +50,7 @@ class Server:
         primary_id: str = PRIMARY_ID,
         checkpoint_freq: float = CHECKPOINT_FREQ,
     ):
+        """Configure role, application state, and channels without opening sockets."""
         if replication_mode not in {"active", "passive"}:
             raise ValueError("replication_mode must be active or passive")
         if not math.isfinite(checkpoint_freq) or checkpoint_freq <= 0:
@@ -71,11 +63,11 @@ class Server:
         self.replica_id: str = replica_id
         self.lfd_id: str = lfd_id_for(replica_id)
         self.state: int = 0
-        self._connections: dict[socket.socket, BufferedJsonConnection] = {}
-        self._client_ids: dict[socket.socket, str] = {}
-        self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
+        self.transport: ServerTransport = ServerTransport(
+            self.handle_message, self.connection_lost
+        )
 
-        # here we define the type of server (role)
+        # The configured mode and primary determine this replica's role.
         if replication_mode == "active":
             self.role: str = "active"  # M2: every replica handles every request
         elif replica_id == primary_id:
@@ -83,7 +75,7 @@ class Server:
         else:
             self.role = "backup"  # M3: ignores requests, receives checkpoints
 
-        # this section controls the checkpoint timer, only the primary uses it
+        # Replication state and primary-only checkpoint scheduling.
         self.checkpoint_count: int = 1
         self._checkpoint_interval: float = (
             1.0 / checkpoint_freq
@@ -116,16 +108,12 @@ class Server:
         self._start_listener()
         while True:
             self._maintain_connections()
-            self._poll_connections()
+            self.transport.poll(self._seconds_until_next_wakeup())
             self._send_checkpoint_if_time()
 
     def _start_listener(self) -> None:
         """Expose the replica port and start the checkpoint clock."""
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # lets us restart right after a ctrl-c instead of "address already in use"
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("0.0.0.0", self.port))
-        listener.listen()
+        self.transport.listen(self.port)
         log(
             f"{self.replica_id} starting in {self.replication_mode} mode"
             + (
@@ -137,9 +125,6 @@ class Server:
             kind="info",
         )
 
-        # tag each socket so the loop knows what it's looking at
-        _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
-
         # start the checkpoint clock now that the server is actually running
         self._next_checkpoint = time.monotonic() + self._checkpoint_interval
 
@@ -150,7 +135,7 @@ class Server:
         if self._pending_backups:
             self.try_connect_to_backups()
 
-    # Checkpoints
+    # State synchronization: passive checkpoint receive and publish
 
     def handle_checkpoint(self, msg: dict[str, object]) -> None:
         """Validate a checkpoint from the configured primary before applying it."""
@@ -188,14 +173,14 @@ class Server:
             "checkpoint_count": self.checkpoint_count,
         }
         for sock, backup_id in list(self._backups.items()):
-            self._send_json(sock, message)
+            self.transport.send(sock, message)
             log(
                 f"{self.replica_id} sending checkpoint [{self.checkpoint_count}] to {backup_id}: my_state={self.state}",
                 kind="checkpoint",
             )
         self.checkpoint_count += 1
 
-    # Client requests and LFD health checks
+    # Serving: client admission, application mutation, and health checks
 
     def handle_client(self, sock: socket.socket, msg: dict[str, object]) -> None:
         """Ignore backup requests; execute and reply on active replicas and the primary."""
@@ -204,7 +189,7 @@ class Server:
 
         client = msg.get("client_id")
         if isinstance(client, str) and client:
-            self._client_ids[sock] = client
+            self.transport.remember_client(sock, client)
 
         if self.role == "backup":
             log(
@@ -237,9 +222,10 @@ class Server:
             "state": self.state,
         }
         log(f"Sending <{client}, {self.replica_id}, {req}, reply>", kind="send")
-        self._send_json(sock, reply)
+        self.transport.send(sock, reply)
 
     def handle_lfd(self, sock: socket.socket, msg: dict[str, object]) -> None:
+        """Answer heartbeat checks from the assigned LFD."""
         if msg.get("type") != "heartbeat":
             return
 
@@ -248,7 +234,7 @@ class Server:
             f"{self.replica_id} got heartbeat [{count}] from {self.lfd_id}",
             kind="heartbeat",
         )
-        self._send_json(
+        self.transport.send(
             sock,
             {"type": "heartbeat_ack", "replica_id": self.replica_id, "count": count},
         )
@@ -257,7 +243,7 @@ class Server:
             kind="heartbeat",
         )
 
-    # Service connections
+    # Service connections: LFD registration and backup checkpoints
 
     def try_connect_to_lfd(self) -> None:
         """Attempt registration with the assigned LFD (up to one second).
@@ -273,7 +259,7 @@ class Server:
         )
         try:
             # Short timeout bounds the TCP handshake if the LFD host is unreachable.
-            s = socket.create_connection((lfd_host, lfd_port), timeout=1.0)
+            s = self.transport.connect((lfd_host, lfd_port), "lfd", timeout=1.0)
         except OSError as exc:
             log(
                 f"{self.replica_id} could not reach {self.lfd_id} ({exc}); retrying in 1s",
@@ -282,8 +268,7 @@ class Server:
             return
 
         self._lfd = s
-        self._register(s, "lfd")
-        self._send_json(s, {"type": "registration", "replica_id": self.replica_id})
+        self.transport.send(s, {"type": "registration", "replica_id": self.replica_id})
         log(f"{self.replica_id} registered with {self.lfd_id}", kind="registration")
 
     def try_connect_to_backups(self) -> None:
@@ -300,7 +285,7 @@ class Server:
             kind="info",
         )
         try:
-            s = socket.create_connection((host, port), timeout=0.5)
+            s = self.transport.connect((host, port), "backup", timeout=0.5)
         except OSError as exc:
             log(
                 f"{self.replica_id} could not reach {backup_id} ({exc}); retrying",
@@ -310,54 +295,62 @@ class Server:
             return
 
         self._backups[s] = backup_id
-        self._register(s, "backup")
         # first message on the socket tells the backup this isn't a client
-        self._send_json(s, {"type": "register_primary", "replica_id": self.replica_id})
+        self.transport.send(
+            s, {"type": "register_primary", "replica_id": self.replica_id}
+        )
         log(
             f"{self.replica_id} opened checkpoint channel to {backup_id}",
             kind="registration",
         )
 
-    # Scheduling and socket helpers
+    # Protocol routing and channel lifecycle callbacks
 
-    def _poll_connections(self) -> None:
-        """Dispatch one batch of socket events, bounded by scheduled work."""
-        for key, events in self.sel.select(timeout=self._seconds_until_next_wakeup()):
-            if not isinstance(key.fileobj, socket.socket):
-                continue
-            sock = key.fileobj
-            kind = cast(str, key.data)
-            if kind == "listener":
-                self._accept_connection(sock)
-            else:
-                self._handle_socket_event(sock, kind, events)
+    def handle_message(
+        self, sock: socket.socket, kind: str, msg: dict[str, object]
+    ) -> str:
+        """Dispatch a decoded message and return the channel's protocol label.
 
-    def _accept_connection(self, listener: socket.socket) -> None:
-        """Accept a peer; primary registration can later relabel its channel."""
-        conn, client_addr = cast(
-            tuple[socket.socket, tuple[str, int]], listener.accept()
-        )
-        self._register(conn, "client")
-        log(
-            f"new client connection from {client_addr[0]}:{client_addr[1]}",
-            kind="registration",
-        )
+        Accepted peers begin as clients. A backup recognizes primary registration
+        and routes subsequent messages on that channel to checkpoint handling.
+        Socket framing and selector changes belong to ServerTransport.
+        """
+        if kind == "lfd":
+            self.handle_lfd(sock, msg)
+        elif kind == "backup":
+            pass  # The primary's outbound checkpoint channel has no replies.
+        elif self.role == "backup" and msg.get("type") == "register_primary":
+            log(
+                f"{self.replica_id} (backup): checkpoint channel from {msg.get('replica_id')}",
+                kind="registration",
+            )
+            return "primary"
+        elif kind == "primary":
+            self.handle_checkpoint(msg)
+        else:
+            self.handle_client(sock, msg)
+        return kind
 
-    def _handle_socket_event(self, sock: socket.socket, kind: str, events: int) -> None:
-        """Read/flush one peer and isolate channel failures from the server loop."""
-        try:
-            if events & selectors.EVENT_READ:
-                self._read_messages(sock, kind)
-            if sock in self._connections and events & selectors.EVENT_WRITE:
-                self._write_pending(sock)
-        except BlockingIOError:
-            pass  # Try again when the selector reports readiness.
-        except (OSError, ValueError) as exc:
-            self._close_sock(sock, f"Connection lost: {exc}")
+    def connection_lost(self, sock: socket.socket, why: str) -> None:
+        """Retry LFD registration or a backup channel after a disconnect."""
+        backup_id = self._backups.pop(sock, None)
+        if sock is self._lfd:
+            self._lfd = None
+            if why == "lost connection to LFD":
+                why = f"lost connection to {self.lfd_id}"
+        elif backup_id:
+            self._pending_backups.append(backup_id)
+            why = f"lost checkpoint channel to {backup_id}; will retry"
+        log(why, kind="failure")
+
+    def close(self) -> None:
+        """Release network resources when this server process stops."""
+        self.transport.close()
+
+    # Deadlines for connection retries and checkpoint publication
 
     def _seconds_until_next_wakeup(self) -> float | None:
-        # no threads, so the select() timeout is the only clock. 1s while retrying a
-        # connection, until the next checkpoint on the primary, None (forever) otherwise
+        """Wake for the earliest connection retry or checkpoint deadline."""
         waits: list[float] = []
         if self._lfd is None:
             waits.append(1.0)
@@ -368,7 +361,7 @@ class Server:
         return min(waits) if waits else None
 
     def _send_checkpoint_if_time(self) -> None:
-        # the other half of the timer: runs once per loop, after select() wakes up
+        """Run the primary's checkpoint timer without drifting its deadline."""
         now = time.monotonic()
         if self.role != "primary" or now < self._next_checkpoint:
             return
@@ -376,91 +369,6 @@ class Server:
         # step from the old deadline not from now, otherwise the timer drifts
         while self._next_checkpoint <= now:
             self._next_checkpoint += self._checkpoint_interval
-
-    def _register(self, sock: socket.socket, kind: str) -> None:
-        self._connections[sock] = BufferedJsonConnection(sock)
-        _ = self.sel.register(sock, selectors.EVENT_READ, kind)
-
-    def _relabel_socket(self, sock: socket.socket, kind: str) -> None:
-        # every socket in the selector carries a label ("lfd", "client", "backup", "primary")
-        # that _read_messages uses to route its messages. the primary connects to a backup
-        # through the normal listen port, so it gets labelled "client" on accept. once
-        # register_primary shows up, this swaps the label to "primary". selectors has no
-        # "change label" call, only modify(), so the read/write mask is passed back unchanged.
-        key = self.sel.get_key(sock)
-        _ = self.sel.modify(sock, key.events, kind)
-
-    def _send_json(self, sock: socket.socket, message: dict[str, object]) -> None:
-        self._connections[sock].queue(message)
-        key = self.sel.get_key(sock)
-        _ = self.sel.modify(
-            sock, selectors.EVENT_READ | selectors.EVENT_WRITE, cast(str, key.data)
-        )
-
-    def _write_pending(self, sock: socket.socket) -> None:
-        connection = self._connections[sock]
-        connection.flush()
-        if not connection.has_pending_output:
-            # look the label up again, a read on this same tick might have relabelled it
-            _ = self.sel.modify(
-                sock, selectors.EVENT_READ, cast(str, self.sel.get_key(sock).data)
-            )
-
-    def _read_messages(self, sock: socket.socket, kind: str) -> None:
-        messages = self._connections[sock].receive()
-        if messages is None:
-            if kind == "lfd":
-                why = f"lost connection to {self.lfd_id}"
-            elif kind == "backup":
-                # backup closed its end
-                why = f"lost checkpoint channel to {self._backups.get(sock, '?')}"
-            elif kind == "primary":
-                why = "lost connection to primary"
-            else:
-                why = "client disconnected"
-            self._close_sock(sock, why)
-            return
-
-        for raw_message in messages:
-            if not isinstance(raw_message, dict):
-                raise ValueError("Expected a JSON object")  # noqa: TRY004 - close malformed peer
-            msg = cast(dict[str, object], raw_message)
-            if kind == "lfd":
-                self.handle_lfd(sock, msg)
-            elif kind == "backup":
-                pass  # primary's outbound channel. backups don't send anything back
-            elif self.role == "backup" and msg.get("type") == "register_primary":
-                # this accepted socket is the primary. later messages on it are checkpoints,
-                # including one that arrived in this same read.
-                self._relabel_socket(sock, "primary")
-                kind = "primary"
-                log(
-                    f"{self.replica_id} (backup): checkpoint channel from {msg.get('replica_id')}",
-                    kind="registration",
-                )
-            elif kind == "primary":
-                self.handle_checkpoint(msg)
-            else:
-                self.handle_client(sock, msg)
-
-    def _close_sock(self, sock: socket.socket, why: str):
-        # have to unregister or select() keeps waking up on the dead socket
-        _ = self.sel.unregister(sock)
-        _ = self._connections.pop(sock, None)
-        client_id = self._client_ids.pop(sock, None)
-        backup_id = self._backups.pop(sock, None)
-        sock.close()
-        if sock is self._lfd:
-            self._lfd = None  # serve loop will try to re-register
-        elif backup_id:
-            # backup died, put it back in the queue so we reconnect if it comes back up
-            self._pending_backups.append(backup_id)
-            why = f"lost checkpoint channel to {backup_id}; will retry"
-        elif client_id and "client disconnected" in why:
-            why = f"{client_id} disconnected"
-        elif client_id and why.startswith("Connection lost"):
-            why = f"{client_id} disconnected ({why})"
-        log(why, kind="failure")
 
 
 def main() -> None:
@@ -480,6 +388,8 @@ def main() -> None:
         server.serve()
     except KeyboardInterrupt:
         log(f"{replica_id} shutting down", kind="failure")
+    finally:
+        server.close()
 
 
 if __name__ == "__main__":
