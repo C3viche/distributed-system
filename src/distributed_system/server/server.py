@@ -22,7 +22,6 @@ To Run:
     uv run server --id S1 --replication-mode active
 """
 
-import argparse
 import math
 import selectors
 import socket
@@ -38,6 +37,7 @@ from distributed_system.config import (
     get_address,
     get_server_addresses,
 )
+from distributed_system.server.cli import parse_args as _parse_args
 
 
 def lfd_id_for(replica_id: str) -> str:
@@ -425,41 +425,6 @@ class Server:
 
             # after handling whatever woke select() up, see if it's checkpoint time
             self._send_checkpoint_if_time()
-
-
-def positive_float(text: str) -> float:
-    value = float(text)
-    if not math.isfinite(value) or value <= 0:
-        raise argparse.ArgumentTypeError("must be finite and positive")
-    return value
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    _ = parser.add_argument(
-        "--id", choices=list(REPLICA_LFDS), required=True, help="Replica ID"
-    )
-    _ = parser.add_argument("--port", type=int, default=None, help="Override port")
-    _ = parser.add_argument(
-        "--replication-mode",
-        choices=["active", "passive"],
-        default=REPLICATION_MODE,
-        help=f"Replication mode (default {REPLICATION_MODE})",
-    )
-    _ = parser.add_argument(
-        "--primary",
-        choices=list(REPLICA_LFDS),
-        default=PRIMARY_ID,
-        help=f"who the primary is in passive mode (default PRIMARY_ID={PRIMARY_ID})",
-    )
-    _ = parser.add_argument(
-        "--checkpoint-freq",
-        type=positive_float,
-        default=CHECKPOINT_FREQ,
-        help=f"checkpoints per second, primary only (default {CHECKPOINT_FREQ})",
-    )
-
-    return parser.parse_args()
 
 
 def main() -> None:
