@@ -17,7 +17,7 @@ class ServerTransportTests(unittest.TestCase):
         local, peer = socket.socketpair()
         self.addCleanup(peer.close)
         peer.settimeout(1.0)
-        server.transport._register(local, "client")
+        server.transport.io.register(local, "client")
         return peer
 
     def test_registration_and_checkpoint_in_same_read_change_routing(self) -> None:

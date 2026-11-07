@@ -10,7 +10,8 @@ import socket
 from collections.abc import Callable
 from typing import cast
 
-from distributed_system.common import BufferedJsonConnection, log
+from distributed_system.common import log
+from distributed_system.transport import SocketTransport
 
 
 class ServerTransport:
@@ -30,39 +31,23 @@ class ServerTransport:
             on_message
         )
         self._on_disconnect: Callable[[socket.socket, str], None] = on_disconnect
-        self._selector: selectors.DefaultSelector = selectors.DefaultSelector()
-        self._connections: dict[socket.socket, BufferedJsonConnection] = {}
+        self.io: SocketTransport = SocketTransport()
         self._client_ids: dict[socket.socket, str] = {}
         self._listener: socket.socket | None = None
 
     def listen(self, port: int) -> None:
         """Bind the replica listener on all interfaces."""
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind(("0.0.0.0", port))
-            listener.listen()
-            _ = self._selector.register(listener, selectors.EVENT_READ, "listener")
-        except OSError:
-            listener.close()
-            raise
-        self._listener = listener
+        self._listener = self.io.listen(port)
 
     def connect(
         self, address: tuple[str, int], kind: str, timeout: float
     ) -> socket.socket:
-        """Make a bounded connection and attach nonblocking JSON buffers."""
-        sock = socket.create_connection(address, timeout=timeout)
-        self._register(sock, kind)
-        return sock
+        """Open a service channel through the shared socket interface."""
+        return self.io.connect(address, kind, timeout)
 
     def send(self, sock: socket.socket, message: dict[str, object]) -> None:
-        """Queue output and request write readiness without blocking."""
-        self._connections[sock].queue(message)
-        key = self._selector.get_key(sock)
-        _ = self._selector.modify(
-            sock, selectors.EVENT_READ | selectors.EVENT_WRITE, cast(str, key.data)
-        )
+        """Queue a server protocol message without blocking."""
+        self.io.send(sock, message)
 
     def remember_client(self, sock: socket.socket, client_id: str) -> None:
         """Retain a client's identity for disconnect logging."""
@@ -70,56 +55,34 @@ class ServerTransport:
 
     def poll(self, timeout: float | None) -> None:
         """Dispatch one batch of events, waiting at most until the next deadline."""
-        for key, events in self._selector.select(timeout):
-            if not isinstance(key.fileobj, socket.socket):
-                continue
-            sock = key.fileobj
+        for sock, kind, events in self.io.ready(timeout):
             if sock is self._listener:
                 self._accept(sock)
                 continue
             try:
                 if events & selectors.EVENT_READ:
-                    self._read_messages(sock, cast(str, key.data))
-                if sock in self._connections and events & selectors.EVENT_WRITE:
-                    self._write_pending(sock)
+                    self._read_messages(sock, kind)
+                if self.io.has_connection(sock) and events & selectors.EVENT_WRITE:
+                    self.io.flush(sock)
             except BlockingIOError:
                 pass
             except (OSError, ValueError) as exc:
                 self._close_peer(sock, f"Connection lost: {exc}")
 
     def close(self) -> None:
-        """Release owned sockets and the selector at shutdown, without retries."""
-        for sock in self._connections:
-            sock.close()
-        self._connections.clear()
+        """Release owned sockets at shutdown, without service retries."""
+        self.io.close()
         self._client_ids.clear()
-        if self._listener is not None:
-            self._listener.close()
-            self._listener = None
-        self._selector.close()
-
-    def _register(self, sock: socket.socket, kind: str) -> None:
-        self._connections[sock] = BufferedJsonConnection(sock)
-        _ = self._selector.register(sock, selectors.EVENT_READ, kind)
+        self._listener = None
 
     def _accept(self, listener: socket.socket) -> None:
-        conn, address = cast(tuple[socket.socket, tuple[str, int]], listener.accept())
-        self._register(conn, "client")
+        _, address = self.io.accept(listener, "client")
         log(
             f"new client connection from {address[0]}:{address[1]}", kind="registration"
         )
 
-    def _write_pending(self, sock: socket.socket) -> None:
-        connection = self._connections[sock]
-        connection.flush()
-        if not connection.has_pending_output:
-            # Reading may have changed the channel label during this event batch.
-            _ = self._selector.modify(
-                sock, selectors.EVENT_READ, cast(str, self._selector.get_key(sock).data)
-            )
-
     def _read_messages(self, sock: socket.socket, kind: str) -> None:
-        messages = self._connections[sock].receive()
+        messages = self.io.receive(sock)
         if messages is None:
             reason = {
                 "lfd": "lost connection to LFD",
@@ -133,15 +96,12 @@ class ServerTransport:
                 raise ValueError("Expected a JSON object")  # noqa: TRY004 - close malformed peer
             next_kind = self._on_message(sock, kind, cast(dict[str, object], message))
             if next_kind != kind:
-                key = self._selector.get_key(sock)
-                _ = self._selector.modify(sock, key.events, next_kind)
+                self.io.relabel(sock, next_kind)
                 kind = next_kind
 
     def _close_peer(self, sock: socket.socket, reason: str) -> None:
-        _ = self._selector.unregister(sock)
-        _ = self._connections.pop(sock)
+        self.io.disconnect(sock)
         client_id = self._client_ids.pop(sock, None)
-        sock.close()
         if client_id and "client disconnected" in reason:
             reason = f"{client_id} disconnected"
         elif client_id and reason.startswith("Connection lost"):
