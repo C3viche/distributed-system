@@ -49,6 +49,8 @@ def lfd_id_for(replica_id: str) -> str:
 
 
 class Server:
+    # Lifecycle
+
     def __init__(
         self,
         replica_id: str,
@@ -148,40 +150,114 @@ class Server:
         if self._pending_backups:
             self.try_connect_to_backups()
 
-    def _poll_connections(self) -> None:
-        """Dispatch one batch of socket events, bounded by scheduled work."""
-        for key, events in self.sel.select(timeout=self._seconds_until_next_wakeup()):
-            if not isinstance(key.fileobj, socket.socket):
-                continue
-            sock = key.fileobj
-            kind = cast(str, key.data)
-            if kind == "listener":
-                self._accept_connection(sock)
-            else:
-                self._handle_socket_event(sock, kind, events)
+    # Checkpoints
 
-    def _accept_connection(self, listener: socket.socket) -> None:
-        """Accept a peer; primary registration can later relabel its channel."""
-        conn, client_addr = cast(
-            tuple[socket.socket, tuple[str, int]], listener.accept()
-        )
-        self._register(conn, "client")
+    def handle_checkpoint(self, msg: dict[str, object]) -> None:
+        """Validate a checkpoint from the configured primary before applying it."""
+        if msg.get("type") != "checkpoint" or msg.get("replica_id") != self.primary_id:
+            return
+        my_state = msg.get("my_state")
+        checkpoint_count = msg.get("checkpoint_count")
+        if type(my_state) is not int or type(checkpoint_count) is not int:
+            return
+
+        self.apply_checkpoint(my_state, checkpoint_count)
+
+    def apply_checkpoint(self, my_state: int, checkpoint_count: int) -> None:
+        """Install a validated passive checkpoint as the replica's local state."""
+        self.state = my_state
+        self.checkpoint_count = checkpoint_count
         log(
-            f"new client connection from {client_addr[0]}:{client_addr[1]}",
-            kind="registration",
+            f"{self.replica_id} received checkpoint from {self.primary_id}: my_state = {my_state}, checkpoint_count = {checkpoint_count}",
+            kind="checkpoint",
         )
 
-    def _handle_socket_event(self, sock: socket.socket, kind: str, events: int) -> None:
-        """Read/flush one peer and isolate channel failures from the server loop."""
-        try:
-            if events & selectors.EVENT_READ:
-                self._read_messages(sock, kind)
-            if sock in self._connections and events & selectors.EVENT_WRITE:
-                self._write_pending(sock)
-        except BlockingIOError:
-            pass  # Try again when the selector reports readiness.
-        except (OSError, ValueError) as exc:
-            self._close_sock(sock, f"Connection lost: {exc}")
+    def send_checkpoint(self) -> None:
+        """Push my_state to every connected backup, print it, bump the count."""
+        if not self._backups:
+            # nobody to send to, does'nt bump the count
+            log(
+                f"{self.replica_id}: no backups connected, checkpoint [{self.checkpoint_count}] skipped",
+                kind="checkpoint",
+            )
+            return
+        message: dict[str, object] = {
+            "type": "checkpoint",
+            "replica_id": self.replica_id,
+            "my_state": self.state,
+            "checkpoint_count": self.checkpoint_count,
+        }
+        for sock, backup_id in list(self._backups.items()):
+            self._send_json(sock, message)
+            log(
+                f"{self.replica_id} sending checkpoint [{self.checkpoint_count}] to {backup_id}: my_state={self.state}",
+                kind="checkpoint",
+            )
+        self.checkpoint_count += 1
+
+    # Client requests and LFD health checks
+
+    def handle_client(self, sock: socket.socket, msg: dict[str, object]) -> None:
+        """Ignore backup requests; execute and reply on active replicas and the primary."""
+        if msg.get("type") != "request":
+            return
+
+        client = msg.get("client_id")
+        if isinstance(client, str) and client:
+            self._client_ids[sock] = client
+
+        if self.role == "backup":
+            log(
+                f"{self.replica_id} (backup): ignoring request from {client}",
+                kind="info",
+            )
+            return
+
+        self.process_request(sock, msg)
+
+    def process_request(self, sock: socket.socket, msg: dict[str, object]) -> None:
+        """Increment application state and reply after handle_client admits a request.
+
+        This is the application mutation point. Admission belongs to
+        handle_client; repeated request numbers are not deduplicated.
+        """
+        client = msg.get("client_id")
+        req = msg.get("request_num")
+        payload = msg.get("payload", "")
+        log(f"Received <{client}, {self.replica_id}, {req}, {payload}>", kind="receive")
+        log(f"my_state = {self.state} before processing", kind="state")
+        self.state += 1
+        log(f"my_state = {self.state} after processing", kind="state")
+
+        reply = {
+            "type": "reply",
+            "client_id": client,
+            "replica_id": self.replica_id,
+            "request_num": req,
+            "state": self.state,
+        }
+        log(f"Sending <{client}, {self.replica_id}, {req}, reply>", kind="send")
+        self._send_json(sock, reply)
+
+    def handle_lfd(self, sock: socket.socket, msg: dict[str, object]) -> None:
+        if msg.get("type") != "heartbeat":
+            return
+
+        count = msg.get("count")
+        log(
+            f"{self.replica_id} got heartbeat [{count}] from {self.lfd_id}",
+            kind="heartbeat",
+        )
+        self._send_json(
+            sock,
+            {"type": "heartbeat_ack", "replica_id": self.replica_id, "count": count},
+        )
+        log(
+            f"{self.replica_id} sent ack [{count}] back to {self.lfd_id}",
+            kind="heartbeat",
+        )
+
+    # Service connections
 
     def try_connect_to_lfd(self) -> None:
         """Attempt registration with the assigned LFD (up to one second).
@@ -242,28 +318,42 @@ class Server:
             kind="registration",
         )
 
-    def send_checkpoint(self) -> None:
-        """Push my_state to every connected backup, print it, bump the count."""
-        if not self._backups:
-            # nobody to send to, does'nt bump the count
-            log(
-                f"{self.replica_id}: no backups connected, checkpoint [{self.checkpoint_count}] skipped",
-                kind="checkpoint",
-            )
-            return
-        message: dict[str, object] = {
-            "type": "checkpoint",
-            "replica_id": self.replica_id,
-            "my_state": self.state,
-            "checkpoint_count": self.checkpoint_count,
-        }
-        for sock, backup_id in list(self._backups.items()):
-            self._send_json(sock, message)
-            log(
-                f"{self.replica_id} sending checkpoint [{self.checkpoint_count}] to {backup_id}: my_state={self.state}",
-                kind="checkpoint",
-            )
-        self.checkpoint_count += 1
+    # Scheduling and socket helpers
+
+    def _poll_connections(self) -> None:
+        """Dispatch one batch of socket events, bounded by scheduled work."""
+        for key, events in self.sel.select(timeout=self._seconds_until_next_wakeup()):
+            if not isinstance(key.fileobj, socket.socket):
+                continue
+            sock = key.fileobj
+            kind = cast(str, key.data)
+            if kind == "listener":
+                self._accept_connection(sock)
+            else:
+                self._handle_socket_event(sock, kind, events)
+
+    def _accept_connection(self, listener: socket.socket) -> None:
+        """Accept a peer; primary registration can later relabel its channel."""
+        conn, client_addr = cast(
+            tuple[socket.socket, tuple[str, int]], listener.accept()
+        )
+        self._register(conn, "client")
+        log(
+            f"new client connection from {client_addr[0]}:{client_addr[1]}",
+            kind="registration",
+        )
+
+    def _handle_socket_event(self, sock: socket.socket, kind: str, events: int) -> None:
+        """Read/flush one peer and isolate channel failures from the server loop."""
+        try:
+            if events & selectors.EVENT_READ:
+                self._read_messages(sock, kind)
+            if sock in self._connections and events & selectors.EVENT_WRITE:
+                self._write_pending(sock)
+        except BlockingIOError:
+            pass  # Try again when the selector reports readiness.
+        except (OSError, ValueError) as exc:
+            self._close_sock(sock, f"Connection lost: {exc}")
 
     def _seconds_until_next_wakeup(self) -> float | None:
         # no threads, so the select() timeout is the only clock. 1s while retrying a
@@ -286,70 +376,6 @@ class Server:
         # step from the old deadline not from now, otherwise the timer drifts
         while self._next_checkpoint <= now:
             self._next_checkpoint += self._checkpoint_interval
-
-    def handle_lfd(self, sock: socket.socket, msg: dict[str, object]) -> None:
-        if msg.get("type") != "heartbeat":
-            return
-
-        count = msg.get("count")
-        log(
-            f"{self.replica_id} got heartbeat [{count}] from {self.lfd_id}",
-            kind="heartbeat",
-        )
-        self._send_json(
-            sock,
-            {"type": "heartbeat_ack", "replica_id": self.replica_id, "count": count},
-        )
-        log(
-            f"{self.replica_id} sent ack [{count}] back to {self.lfd_id}",
-            kind="heartbeat",
-        )
-
-    def handle_client(self, sock: socket.socket, msg: dict[str, object]) -> None:
-        if msg.get("type") != "request":
-            return
-
-        client = msg.get("client_id")
-        if isinstance(client, str) and client:
-            self._client_ids[sock] = client
-        req = msg.get("request_num")
-        payload = msg.get("payload", "")
-
-        if self.role == "backup":
-            log(
-                f"{self.replica_id} (backup): ignoring request from {client}",
-                kind="info",
-            )
-            return
-
-        log(f"Received <{client}, {self.replica_id}, {req}, {payload}>", kind="receive")
-        log(f"my_state = {self.state} before processing", kind="state")
-        self.state += 1
-        log(f"my_state = {self.state} after processing", kind="state")
-
-        reply = {
-            "type": "reply",
-            "client_id": client,
-            "replica_id": self.replica_id,
-            "request_num": req,
-            "state": self.state,
-        }
-        log(f"Sending <{client}, {self.replica_id}, {req}, reply>", kind="send")
-        self._send_json(sock, reply)
-
-    def handle_checkpoint(self, msg: dict[str, object]) -> None:
-        if msg.get("type") != "checkpoint" or msg.get("replica_id") != self.primary_id:
-            return
-        my_state = msg.get("my_state")
-        checkpoint_count = msg.get("checkpoint_count")
-        if type(my_state) is not int or type(checkpoint_count) is not int:
-            return
-        self.state = my_state
-        self.checkpoint_count = checkpoint_count
-        log(
-            f"{self.replica_id} received checkpoint from {self.primary_id}: my_state = {my_state}, checkpoint_count = {checkpoint_count}",
-            kind="checkpoint",
-        )
 
     def _register(self, sock: socket.socket, kind: str) -> None:
         self._connections[sock] = BufferedJsonConnection(sock)
