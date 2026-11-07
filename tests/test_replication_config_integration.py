@@ -14,7 +14,7 @@ from unittest.mock import patch
 with patch("dotenv.load_dotenv"):
     from distributed_system.client import _parse_args as client_args
     from distributed_system.client.client import Client
-    from distributed_system.common import BufferedJsonConnection, send_json
+    from distributed_system.common import send_json
     from distributed_system.server.server import Server, _parse_args as server_args
 
 expected_mode = os.environ.get("REPLICATION_MODE", "active")
@@ -50,20 +50,22 @@ try:
 
     receiver, publisher = socket.socketpair()
     try:
-        client._gfd = BufferedJsonConnection(receiver)
+        client.gfd.socket = receiver
+        client.gfd.transport.register(receiver, "gfd")
         with patch("distributed_system.client.client.log"):
             send_json(publisher, {"type": "membership", "members": ["S1", "S2", "S3"], "member_count": 3})
-            client._read_gfd()
+            client.gfd.poll(0)
             assert client.primary_id == expected_primary
             send_json(publisher, {"type": "membership", "members": ["S1", "S2", "S3"],
                                   "member_count": 3, "primary_id": "S3"})
-            client._read_gfd()
+            client.gfd.poll(0)
             assert client.primary_id == "S3"
     finally:
         receiver.close()
         publisher.close()
 finally:
     client.conns.close()
+    client.gfd.close()
     for server in servers:
         server.close()
 """

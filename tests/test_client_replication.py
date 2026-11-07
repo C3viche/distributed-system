@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from distributed_system.client import _parse_args
 from distributed_system.client.client import Client
 from distributed_system.client.replica_conns import ReplicaConnections
-from distributed_system.common import BufferedJsonConnection, send_json
+from distributed_system.common import send_json
 from distributed_system.config import PRIMARY_ID, REPLICATION_MODE
 
 
@@ -220,9 +220,11 @@ class ClientTests(unittest.TestCase):
             "C1", replication_mode="passive", count=2, interval=0.001
         )
         self.addCleanup(self.client.conns.close)
+        self.addCleanup(self.client.gfd.close)
         receiver, publisher = socket.socketpair()
         self.publisher: socket.socket = publisher
-        self.client._gfd = BufferedJsonConnection(receiver)
+        self.client.gfd.socket = receiver
+        self.client.gfd.transport.register(receiver, "gfd")
         self.addCleanup(receiver.close)
         self.addCleanup(self.publisher.close)
 
@@ -236,7 +238,7 @@ class ClientTests(unittest.TestCase):
                 **extra,
             },
         )
-        self.client._read_gfd()
+        self.client.gfd.poll(0)
 
     def test_primary_assignment_omission_and_clear(self) -> None:
         self.snapshot(["S1", "S2", "S3"])
@@ -254,7 +256,7 @@ class ClientTests(unittest.TestCase):
         self.snapshot(["S1"], primary_id="S3")
         self.assertEqual(self.client.membership, ["S1", "S2"])
         self.assertEqual(self.client.primary_id, "S2")
-        self.assertIsNone(self.client._gfd)
+        self.assertIsNone(self.client.gfd.socket)
 
     def test_missing_primary_does_not_fall_back(self) -> None:
         self.client.primary_id = "S1"
