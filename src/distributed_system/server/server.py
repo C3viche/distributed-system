@@ -109,6 +109,80 @@ class Server:
         # Outbound connection to the assigned LFD; None while we have no LFD.
         self._lfd: socket.socket | None = None
 
+    def serve(self) -> None:
+        """Listen, maintain service channels, dispatch messages, and checkpoint."""
+        self._start_listener()
+        while True:
+            self._maintain_connections()
+            self._poll_connections()
+            self._send_checkpoint_if_time()
+
+    def _start_listener(self) -> None:
+        """Expose the replica port and start the checkpoint clock."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # lets us restart right after a ctrl-c instead of "address already in use"
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("0.0.0.0", self.port))
+        listener.listen()
+        log(
+            f"{self.replica_id} starting in {self.replication_mode} mode"
+            + (
+                f", primary={self.primary_id}"
+                if self.replication_mode == "passive"
+                else ""
+            )
+            + f", role={self.role}; waiting for clients on {self.host}:{self.port}",
+            kind="info",
+        )
+
+        # tag each socket so the loop knows what it's looking at
+        _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
+
+        # start the checkpoint clock now that the server is actually running
+        self._next_checkpoint = time.monotonic() + self._checkpoint_interval
+
+    def _maintain_connections(self) -> None:
+        """Maintain LFD registration and the primary's backup channels."""
+        if self._lfd is None:
+            self.try_connect_to_lfd()
+        if self._pending_backups:
+            self.try_connect_to_backups()
+
+    def _poll_connections(self) -> None:
+        """Dispatch one batch of socket events, bounded by scheduled work."""
+        for key, events in self.sel.select(timeout=self._seconds_until_next_wakeup()):
+            if not isinstance(key.fileobj, socket.socket):
+                continue
+            sock = key.fileobj
+            kind = cast(str, key.data)
+            if kind == "listener":
+                self._accept_connection(sock)
+            else:
+                self._handle_socket_event(sock, kind, events)
+
+    def _accept_connection(self, listener: socket.socket) -> None:
+        """Accept a peer; primary registration can later relabel its channel."""
+        conn, client_addr = cast(
+            tuple[socket.socket, tuple[str, int]], listener.accept()
+        )
+        self._register(conn, "client")
+        log(
+            f"new client connection from {client_addr[0]}:{client_addr[1]}",
+            kind="registration",
+        )
+
+    def _handle_socket_event(self, sock: socket.socket, kind: str, events: int) -> None:
+        """Read/flush one peer and isolate channel failures from the server loop."""
+        try:
+            if events & selectors.EVENT_READ:
+                self._read_messages(sock, kind)
+            if sock in self._connections and events & selectors.EVENT_WRITE:
+                self._write_pending(sock)
+        except BlockingIOError:
+            pass  # Try again when the selector reports readiness.
+        except (OSError, ValueError) as exc:
+            self._close_sock(sock, f"Connection lost: {exc}")
+
     def try_connect_to_lfd(self) -> None:
         """Attempt registration with the assigned LFD (up to one second).
 
@@ -320,7 +394,7 @@ class Server:
                 why = "client disconnected"
             self._close_sock(sock, why)
             return
-        
+
         for raw_message in messages:
             if not isinstance(raw_message, dict):
                 raise ValueError("Expected a JSON object")  # noqa: TRY004 - close malformed peer
@@ -329,7 +403,7 @@ class Server:
                 self.handle_lfd(sock, msg)
             elif kind == "backup":
                 pass  # primary's outbound channel. backups don't send anything back
-            elif (self.role == "backup" and msg.get("type") == "register_primary"):
+            elif self.role == "backup" and msg.get("type") == "register_primary":
                 # this accepted socket is the primary. later messages on it are checkpoints,
                 # including one that arrived in this same read.
                 self._relabel_socket(sock, "primary")
@@ -361,70 +435,6 @@ class Server:
         elif client_id and why.startswith("Connection lost"):
             why = f"{client_id} disconnected ({why})"
         log(why, kind="failure")
-
-    def serve(self):
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # lets us restart right after a ctrl-c instead of "address already in use"
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("0.0.0.0", self.port))
-        listener.listen()
-        log(
-            f"{self.replica_id} starting in {self.replication_mode} mode"
-            + (
-                f", primary={self.primary_id}"
-                if self.replication_mode == "passive"
-                else ""
-            )
-            + f", role={self.role}; waiting for clients on {self.host}:{self.port}",
-            kind="info",
-        )
-
-        # tag each socket so the loop knows what it's looking at
-        _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
-
-        # start the checkpoint clock now that the server is actually running
-        self._next_checkpoint = time.monotonic() + self._checkpoint_interval
-
-        while True:
-            if self._lfd is None:
-                self.try_connect_to_lfd()
-            if self._pending_backups:
-                self.try_connect_to_backups()
-
-            for key, events in self.sel.select(
-                timeout=self._seconds_until_next_wakeup()
-            ):
-                # Safely narrow key.fileobj to socket.socket
-                if not isinstance(key.fileobj, socket.socket):
-                    continue
-
-                sock: socket.socket = key.fileobj
-                data = cast(str, key.data)
-
-                if data == "listener":
-                    conn, client_addr = cast(
-                        tuple[socket.socket, tuple[str, int]], listener.accept()
-                    )
-
-                    self._register(conn, "client")
-                    log(
-                        f"new client connection from {client_addr[0]}:{client_addr[1]}",
-                        kind="registration",
-                    )
-
-                else:
-                    try:
-                        if events & selectors.EVENT_READ:
-                            self._read_messages(sock, data)
-                        if sock in self._connections and events & selectors.EVENT_WRITE:
-                            self._write_pending(sock)
-                    except BlockingIOError:
-                        pass  # Try again when the selector reports readiness.
-                    except (OSError, ValueError) as exc:
-                        self._close_sock(sock, f"Connection lost: {exc}")
-
-            # after handling whatever woke select() up, see if it's checkpoint time
-            self._send_checkpoint_if_time()
 
 
 def main() -> None:
