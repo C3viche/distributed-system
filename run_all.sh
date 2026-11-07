@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch helper for M2-M4. Every process gets its own Terminal
+# Launch helper. Every process gets its own Terminal
 # window so Priya can watch each console, same as running the uv commands by
 # hand. The replication mode (active for M2, passive for M3) comes from
 # REPLICATION_MODE in .env; flipping that single value is enough to switch the
@@ -251,7 +251,7 @@ case "$1" in
         check_ports_free GFD LFD1 LFD2 LFD3 S1 S2 S3
         if [ "$WITH_RM" = 1 ]; then
             check_ports_free RM
-            echo "M4 scaffold: GFD forwarding, recovery, and dynamic failover integration are pending."
+            echo "GFD forwarding, recovery, and failover integration are pending."
             start_rm && wait_for_rm || exit 1
         fi
         start_gfd;               sleep 1
