@@ -334,7 +334,7 @@ class Server:
         wait: remain UP while the RM decides how to admit this replica.
         Promotion and active state transfer are not implemented here.
         """
-        if self.replica_status != ReplicaStatus.UP:
+        if self.replica_status != ReplicaStatus.UP: # return early if already SYNCED
             return
         instruction = msg.get("type")
         if instruction == "initialize":
@@ -356,6 +356,9 @@ class Server:
                 f"{self.replica_id}: RM selected recovery source {source_id}; waiting for state transfer (not implemented)",
                 kind="info",
             )
+        elif instruction == "send_snapshot":
+            target_id = msg.get("target_id")
+
         elif instruction == "wait":
             self.recovery_source_id = None
             log(f"{self.replica_id}: waiting for RM join instructions", kind="info")
@@ -447,6 +450,10 @@ class Server:
                 )
             elif kind == "primary":
                 self.handle_checkpoint(msg)
+            elif kind == "recovery":
+                pass
+                # handle sending a recovery snapshot to revived active replica
+                # This is ONLY for active replicas
             else:
                 self.handle_client(sock, msg)
 
