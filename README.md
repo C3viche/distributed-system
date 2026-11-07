@@ -11,6 +11,31 @@ The overall system models an asynchronous distributed application split into nod
 - **Replication Manager (`RM`)**: Orchestrates high-level system fault tolerance, tracks healthy members, and automates replica recovery/re-launch.
 - **Clients (`C1`, `C2`, `C3`)**: Independent client processes issuing requests with unique `<client_id, replica_id, request_num>` tuples.
 
+### Code organization
+
+All four implemented services use `SocketTransport` in
+`src/distributed_system/transport.py`. It provides `listen`, `accept`, `connect`,
+`send`, `receive`, `flush`, and socket readiness handling. It owns JSON buffers
+and selector subscriptions; each service owns its protocol and retry decisions.
+`send` queues output, and callers flush it when the socket is writable.
+
+| Module | Responsibility |
+|---|---|
+| `server/server.py` | Server lifecycle, service registration, client requests, and checkpoints |
+| `server/transport.py` | Route accepted peers and service messages through the shared transport |
+| `client/client.py` | Request scheduling, membership application, and active/passive routing |
+| `client/membership.py` | GFD subscription, snapshot validation, and reconnection |
+| `client/replica_conns.py` | Replica connection deadlines, request delivery, and reply matching |
+| `gfd/gfd.py` | LFD registration, group membership, publication, and heartbeat policy |
+| `lfd/lfd.py` | GFD registration, replica monitoring, and health reporting |
+| `gfd/sessions.py`, `lfd/sessions.py` | Peer identities and heartbeat/retry deadlines |
+| `server/cli.py`, `gfd/cli.py`, `lfd/cli.py` | Service command-line parsing |
+| `common.py` | JSON framing and console logging |
+
+Start with `Server.serve`, `Client._loop`, `GlobalFaultDetector.serve`, or
+`LocalFaultDetector.run` to follow a service's main workflow. Wire messages,
+replication modes, and CLI flags retain their existing behavior.
+
 ## Prerequisites & Installation
 - Python: >= 3.13
 - Package & Task Runner: uv
