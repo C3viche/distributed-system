@@ -233,6 +233,26 @@ class Server:
             kind="info",
         )
 
+    def complete_recovery(self) -> None:
+        """Mark an active replica SYNCED after state transfer and catch-up finish.
+
+        This is a completion hook for the future recovery implementation, not
+        a state-transfer operation. The caller must first install current state.
+        Receiving RM's recover instruction alone must never call this hook.
+        Passive backups become SYNCED through checkpoint application instead.
+        """
+        if self.replication_mode != "active":
+            raise ValueError("Active recovery completion requires active replication")
+        if self.replica_status != ReplicaStatus.UP or self.recovery_source_id is None:
+            raise ValueError("No active recovery in progress")
+        source_id = self.recovery_source_id
+        self.recovery_source_id = None
+        self.replica_status = ReplicaStatus.SYNCED
+        log(
+            f"{self.replica_id}: recovery from {source_id} complete; replica is SYNCED",
+            kind="state",
+        )
+
     def wait_for_admission(self) -> None:
         """Clear the pending donor while staying UP and available for heartbeats."""
         self.recovery_source_id = None

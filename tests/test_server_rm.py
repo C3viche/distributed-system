@@ -97,6 +97,52 @@ class ServerRMTests(unittest.TestCase):
             self.assertEqual(server.replica_status, ReplicaStatus.UP)
             self.assertIsNone(server.recovery_source_id)
 
+    def test_active_replica_serves_after_explicit_recovery_completion(self) -> None:
+        server = self.make_server()
+        server.handle_rm({"type": "recover", "source_id": "S2"})
+        peer = MagicMock(spec=socket.socket)
+        request: dict[str, object] = {
+            "type": "request",
+            "client_id": "C1",
+            "request_num": 1,
+        }
+        with patch.object(server, "_send_json") as send:
+            server.handle_client(peer, request)
+            send.assert_not_called()
+            self.assertEqual(server.replica_status, ReplicaStatus.UP)
+
+            # Simulate state installation by the future transfer implementation.
+            server.state = 7
+            server.complete_recovery()
+            self.assertEqual(server.state, 7)
+            self.assertEqual(server.replica_status, ReplicaStatus.SYNCED)
+            self.assertIsNone(server.recovery_source_id)
+            server.handle_client(peer, request)
+            self.assertEqual(server.state, 8)
+            send.assert_called_once_with(
+                peer,
+                {
+                    "type": "reply",
+                    "client_id": "C1",
+                    "replica_id": "S1",
+                    "request_num": 1,
+                    "state": 8,
+                },
+            )
+
+    def test_recovery_completion_requires_an_active_recovery(self) -> None:
+        active = self.make_server()
+        with self.assertRaises(ValueError):
+            active.complete_recovery()
+        self.assertEqual(active.replica_status, ReplicaStatus.UP)
+
+        backup = self.make_server(replica_id="S2", mode="passive")
+        backup.handle_rm({"type": "recover", "source_id": "S1"})
+        with self.assertRaises(ValueError):
+            backup.complete_recovery()
+        self.assertEqual(backup.replica_status, ReplicaStatus.UP)
+        self.assertEqual(backup.recovery_source_id, "S1")
+
     def test_unsynced_primary_does_not_publish_checkpoint(self) -> None:
         server = self.make_server(mode="passive")
         with patch.object(server, "_send_json") as send:
