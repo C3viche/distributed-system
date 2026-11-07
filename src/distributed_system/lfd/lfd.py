@@ -12,7 +12,6 @@ import time
 from typing import cast
 
 from distributed_system.common import (
-    BufferedJsonConnection,
     heartbeat,
     log,
     set_process_id,
@@ -24,6 +23,7 @@ from distributed_system.lfd.sessions import (
     GFDSession,
     ServerSession,
 )
+from distributed_system.transport import SocketTransport
 
 
 class LocalFaultDetector:
@@ -49,11 +49,66 @@ class LocalFaultDetector:
         self.host, self.port = get_address(lfd_id)
         # Counts belong to the LFD lifetime and must survive server reconnects.
         self._counts: itertools.count[int] = itertools.count(1)
-        self._selector: selectors.DefaultSelector = selectors.DefaultSelector()
-        self._connections: dict[socket.socket, ServerSession | GFDSession] = {}
+        self.transport: SocketTransport = SocketTransport()
+        self._sessions: dict[socket.socket, ServerSession | GFDSession] = {}
         self._server: ServerSession | None = None
         self._absent_notice_at: float | None = None
         self._gfd: GFDSession = GFDSession(get_address("GFD"))
+
+    def run(self) -> None:
+        """Listen, maintain the GFD channel, and monitor the assigned replica."""
+        _ = self.transport.listen(self.port, self.host)
+        log(f"{self.lfd_id} listening on {self.host}:{self.port}", kind="info")
+        try:
+            while True:
+                self._tick(time.monotonic())
+                self.poll(self._wait_timeout())
+        finally:
+            self.close()
+
+    def poll(self, timeout: float | None) -> None:
+        """Dispatch socket events while enforcing registration and ACK deadlines."""
+        events = self.transport.ready(timeout)
+        # Enforce deadlines even if a peer continuously trickles bytes.
+        self._tick(time.monotonic())
+        for sock, kind, mask in events:
+            try:
+                if kind == "listener":
+                    self._accept(sock)
+                    continue
+                if sock not in self._sessions:
+                    continue
+                if kind == "gfd" and self._gfd.connecting:
+                    self._finish_gfd_connect()
+                    continue
+                if mask & selectors.EVENT_READ:
+                    messages = self.transport.receive(sock)
+                    if messages is None:
+                        self._drop(sock)
+                        continue
+                    for raw_message in messages:
+                        if not isinstance(raw_message, dict):
+                            raise ValueError("Expected a JSON object")  # noqa: TRY004 - peer validation
+                        message = cast(dict[str, object], raw_message)
+                        if kind == "gfd":
+                            self._handle_gfd(message)
+                        else:
+                            self._message(sock, message)
+                        if sock not in self._sessions:
+                            break
+                if sock in self._sessions and mask & selectors.EVENT_WRITE:
+                    self.transport.flush(sock)
+            except BlockingIOError:
+                pass
+            except (OSError, ValueError) as exc:
+                log(f"{self.lfd_id} connection error: {exc}", kind="failure")
+                if sock in self._sessions:
+                    self._drop(sock)
+
+    def close(self) -> None:
+        """Release service channels and session records without publishing failures."""
+        self.transport.close()
+        self._sessions.clear()
 
     def _membership_changed(self, added: bool) -> None:
         """Queue a membership transition if the GFD connection is ready."""
@@ -61,7 +116,7 @@ class LocalFaultDetector:
         if self._gfd.sock is None or self._gfd.connecting:
             return
         kind = "add_replica" if added else "delete_replica"
-        self._queue(
+        self.transport.send(
             self._gfd.sock,
             {
                 "type": kind,
@@ -99,9 +154,8 @@ class LocalFaultDetector:
         self._gfd.sock = sock
         self._gfd.connecting = True
         self._gfd.connect_deadline = now + self.timeout
-        self._gfd.connection = BufferedJsonConnection(sock)
-        self._connections[sock] = self._gfd
-        _ = self._selector.register(sock, selectors.EVENT_WRITE, "gfd")
+        self._sessions[sock] = self._gfd
+        self.transport.watch_connect(sock, "gfd")
 
     def _finish_gfd_connect(self) -> None:
         """Register with GFD and reannounce the currently healthy replica."""
@@ -110,9 +164,12 @@ class LocalFaultDetector:
         if error:
             self._drop(self._gfd.sock)
             return
+        self.transport.register(self._gfd.sock, "gfd")
         self._gfd.connecting = False
         self._gfd.connect_deadline = None
-        self._queue(self._gfd.sock, {"type": "register_lfd", "lfd_id": self.lfd_id})
+        self.transport.send(
+            self._gfd.sock, {"type": "register_lfd", "lfd_id": self.lfd_id}
+        )
         log(f"{self.lfd_id} connected to GFD; registration queued", kind="registration")
         if self._server is not None and self._server.healthy:
             self._membership_changed(added=True)
@@ -130,31 +187,20 @@ class LocalFaultDetector:
             raise ValueError("Invalid GFD heartbeat")
         assert self._gfd.sock is not None
         log(f"[{count}] {self.lfd_id} receives heartbeat from GFD", kind="heartbeat")
-        self._queue(self._gfd.sock, heartbeat(self.lfd_id, "GFD", count, ack=True))
+        self.transport.send(
+            self._gfd.sock, heartbeat(self.lfd_id, "GFD", count, ack=True)
+        )
         log(f"[{count}] {self.lfd_id} sending heartbeat ACK to GFD", kind="heartbeat")
 
     def _accept(self, listener: socket.socket) -> None:
         """Track an incoming server until it registers or times out."""
-        sock = listener.accept()[0]
-        self._connections[sock] = ServerSession(sock, time.monotonic() + self.timeout)
-        _ = self._selector.register(sock, selectors.EVENT_READ, "server")
-
-    def _queue(self, sock: socket.socket, message: dict[str, object]) -> None:
-        """Buffer a message and request write readiness from the shared selector."""
-        connection = self._connections[sock].connection
-        assert connection is not None
-        connection.queue(message)
-        _ = self._selector.modify(
-            sock,
-            selectors.EVENT_READ | selectors.EVENT_WRITE,
-            cast(str, self._selector.get_key(sock).data),
-        )
+        sock, _ = self.transport.accept(listener, "server")
+        self._sessions[sock] = ServerSession(sock, time.monotonic() + self.timeout)
 
     def _drop(self, sock: socket.socket) -> None:
         """Close one connection and coordinate retry or membership removal."""
-        _ = self._selector.unregister(sock)
-        _ = self._connections.pop(sock)
-        sock.close()
+        self.transport.disconnect(sock)
+        _ = self._sessions.pop(sock)
         if sock is self._gfd.sock:
             was_connecting = self._gfd.connecting
             self._gfd.disconnected(time.monotonic())
@@ -177,7 +223,7 @@ class LocalFaultDetector:
 
     def _message(self, sock: socket.socket, message: dict[str, object]) -> None:
         """Handle server registration or a heartbeat ACK for that session."""
-        session = self._connections[sock]
+        session = self._sessions[sock]
         assert isinstance(session, ServerSession)
         if session.registration_deadline is not None:
             if (
@@ -223,7 +269,7 @@ class LocalFaultDetector:
             and now >= self._gfd.connect_deadline
         ):
             self._drop(self._gfd.sock)
-        for sock, session in list(self._connections.items()):
+        for sock, session in list(self._sessions.items()):
             if (
                 isinstance(session, ServerSession)
                 and session.registration_deadline is not None
@@ -257,7 +303,7 @@ class LocalFaultDetector:
                 f"[{count}] {self.lfd_id} sending heartbeat to {self.replica_id}",
                 kind="heartbeat",
             )
-            self._queue(
+            self.transport.send(
                 self._server.sock,
                 {"type": "heartbeat", "lfd_id": self.lfd_id, "count": count},
             )
@@ -266,7 +312,7 @@ class LocalFaultDetector:
         """Wait only until the earliest deadline owned by either session type."""
         deadlines = [
             session.next_deadline()
-            for session in self._connections.values()
+            for session in self._sessions.values()
             if isinstance(session, ServerSession)
         ]
         deadlines.append(self._gfd.next_deadline())
@@ -274,73 +320,6 @@ class LocalFaultDetector:
             deadlines.append(self._absent_notice_at)
         pending = [deadline for deadline in deadlines if deadline is not None]
         return max(0.0, min(pending) - time.monotonic()) if pending else None
-
-    def run(self) -> None:
-        """Dispatch server and GFD socket events in one nonblocking loop."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind((self.host, self.port))
-            listener.listen()
-            listener.setblocking(False)
-            _ = self._selector.register(listener, selectors.EVENT_READ, "listener")
-            log(f"{self.lfd_id} listening on {self.host}:{self.port}", kind="info")
-            try:
-                while True:
-                    self._tick(time.monotonic())
-                    events = self._selector.select(self._wait_timeout())
-                    # Enforce deadlines even if a peer continuously trickles bytes.
-                    self._tick(time.monotonic())
-                    for key, mask in events:
-                        sock = cast(socket.socket, key.fileobj)
-                        kind = cast(str, key.data)
-                        try:
-                            if kind == "listener":
-                                self._accept(listener)
-                                continue
-                            if sock not in self._connections:
-                                continue
-                            if kind == "gfd" and self._gfd.connecting:
-                                self._finish_gfd_connect()
-                                continue
-                            connection = self._connections[sock].connection
-                            assert connection is not None
-                            if mask & selectors.EVENT_READ:
-                                messages = connection.receive()
-                                if messages is None:
-                                    self._drop(sock)
-                                    continue
-                                for raw_message in messages:
-                                    if not isinstance(raw_message, dict):
-                                        raise ValueError("Expected a JSON object")  # noqa: TRY004 - peer validation
-                                    message = cast(dict[str, object], raw_message)
-                                    if kind == "gfd":
-                                        self._handle_gfd(message)
-                                    else:
-                                        self._message(sock, message)
-                                    if sock not in self._connections:
-                                        break
-                            if (
-                                sock in self._connections
-                                and mask & selectors.EVENT_WRITE
-                            ):
-                                connection.flush()
-                                if not connection.has_pending_output:
-                                    _ = self._selector.modify(
-                                        sock, selectors.EVENT_READ, kind
-                                    )
-                        except BlockingIOError:
-                            pass
-                        except (OSError, ValueError) as exc:
-                            log(
-                                f"{self.lfd_id} connection error: {exc}", kind="failure"
-                            )
-                            if sock in self._connections:
-                                self._drop(sock)
-            finally:
-                for sock in self._connections:
-                    sock.close()
-                self._connections.clear()
-                self._selector.close()
 
 
 def main() -> None:

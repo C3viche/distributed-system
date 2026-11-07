@@ -2,7 +2,6 @@
 
 import socket
 
-from distributed_system.common import BufferedJsonConnection
 from distributed_system.config import REPLICA_LFDS
 
 REPLICA_ASSIGNMENTS = {lfd: replica for replica, lfd in REPLICA_LFDS.items()}
@@ -13,7 +12,6 @@ class ServerSession:
 
     def __init__(self, sock: socket.socket, registration_deadline: float) -> None:
         self.sock: socket.socket = sock
-        self.connection: BufferedJsonConnection = BufferedJsonConnection(sock)
         self.registration_deadline: float | None = registration_deadline
         self.next_heartbeat: float | None = None
         self.ack_deadline: float | None = None
@@ -35,7 +33,6 @@ class GFDSession:
     def __init__(self, address: tuple[str, int]) -> None:
         self.address: tuple[str, int] = address
         self.sock: socket.socket | None = None
-        self.connection: BufferedJsonConnection | None = None
         self.connecting: bool = False
         self.connect_deadline: float | None = None
         self.retry_at: float = 0.0
@@ -43,7 +40,6 @@ class GFDSession:
     def disconnected(self, now: float) -> None:
         """Discard connection state and schedule the next attempt."""
         self.sock = None
-        self.connection = None
         self.connecting = False
         self.connect_deadline = None
         self.retry_at = now + 1.0
