@@ -8,7 +8,7 @@ The overall system models an asynchronous distributed application split into nod
 - **Server Replicas (`S1`, `S2`, `S3`)**: Stateful, deterministic server nodes. Each server maintains internal state (`my_state`) and handles incoming client requests and heartbeat checks.
 - **Local Fault Detector (`LFD1`, `LFD2`, `LFD3`)**: Resides on the same physical/virtual host as its assigned server replica. Sends periodic heartbeats to monitor replica health and reports crashes.
 - **Global Fault Detector (`GFD`)**: Aggregates local health notifications from all LFDs, maintains central system group membership, and broadcasts membership updates.
-- **Replication Manager (`RM`)**: Orchestrates high-level system fault tolerance, tracks healthy members, and automates replica recovery/re-launch.
+- **Replication Manager (`RM`)**: M4 membership receiver for GFD reports. GFD forwarding and recovery/failover integration are pending; automatic replica relaunch is deferred to M5.
 - **Clients (`C1`, `C2`, `C3`)**: Independent client processes issuing requests with unique `<client_id, replica_id, request_num>` tuples.
 
 ## Prerequisites & Installation
@@ -36,7 +36,7 @@ server and its LFD on the same machine. Use consistent addresses across machines
 Existing shell environment variables take precedence over `.env` values.
 
 Heartbeat frequency and timeout remain CLI options (`--heartbeat_freq` and
-`--timeout`); use the same frequency for all three LFDs. GFD uses `GFD_HOST` and `GFD_PORT`; RM remains reserved for a future milestone.
+`--timeout`); use the same frequency for all three LFDs. GFD uses `GFD_HOST` and `GFD_PORT`; the M4 RM receiver uses `RM_HOST` and `RM_PORT`.
 
 ### Setting up `.env` for a multi-laptop run
 
@@ -480,6 +480,107 @@ Console outputs are timestamped in UTC and the rest of the line is color-coded b
 - Cyan: Membership changes
 - Light cyan: Checkpoint send and receive (primary $\leftrightarrow$ backups)
 - Red: Process failures & socket tear-downs
+
+## Milestone #4: RM and Integration
+
+RM is implemented, but GFD does not connect to it yet. Until Sonia's sender is
+connected, RM stays at `RM: 0 members`. Recovery and failover are also pending.
+Automatic replica relaunch belongs to M5.
+
+### RM protocol
+
+Run `uv run rm`, with optional `--host` and `--port` overrides. RM uses
+newline-delimited JSON. This message format still needs agreement with Sonia:
+
+```json
+{"type":"register_gfd","gfd_id":"GFD"}
+{"type":"membership","members":["S1","S2"],"member_count":2}
+{"type":"add_replica","replica_id":"S3"}
+{"type":"delete_replica","replica_id":"S1"}
+```
+
+Register on each connection, then send a full snapshot, including an empty one
+at startup. Send later changes on the same connection. RM sends no acknowledgments.
+
+RM prints every accepted snapshot, even when unchanged. Duplicate add/delete
+messages have no effect. Counts come from the membership list, and invalid
+messages close the sender's connection without changing membership. A new GFD
+registration replaces the old connection. After a disconnect, RM keeps the last
+reported membership until resynchronized; that view may be stale.
+
+Membership does not indicate whether a recovering replica is ready to serve.
+
+### Running M4
+
+Run one mode at a time. Omit `--headless` to open Terminal windows; otherwise
+output goes to `logs/<process>.log`.
+
+```bash
+./run_all.sh local m4-active --headless
+./run_all.sh kill all
+./run_all.sh local m4-passive --headless
+./run_all.sh kill all
+```
+
+Startup order is RM → GFD → LFDs → servers → clients. The script waits up to ten
+seconds for RM's listener before starting GFD. It does not check registration.
+Passive mode still uses the configured `PRIMARY_ID`.
+
+For four laptops, share a `.env` with reachable LAN addresses and the same
+`REPLICATION_MODE`. Point `RM_HOST` and `GFD_HOST` at laptop 4.
+
+| Laptop | Commands |
+|---|---|
+| 4: RM, GFD, clients | `./run_all.sh infrastructure`, then `./run_all.sh clients` after replicas are ready |
+| 1: LFD1, S1 | `./run_all.sh replica 1` |
+| 2: LFD2, S2 | `./run_all.sh replica 2` |
+| 3: LFD3, S3 | `./run_all.sh replica 3` |
+
+Start infrastructure first, then replicas in order. Individual commands:
+
+```bash
+./run_all.sh rm                # start RM separately
+./run_all.sh kill rm           # stop RM
+./run_all.sh kill server 2     # crash S2 on its laptop
+./run_all.sh server 2          # manually restart S2 on its laptop
+./run_all.sh kill all          # run on each laptop to stop local processes
+```
+
+### Remaining team work
+
+| Owner | Work |
+|---|---|
+| Sonia | Agree GFD→RM messages; send registration, snapshots, and membership changes |
+| Nikhil + Sonia | Agree who selects the primary and how promotion is announced |
+| Cristian + Sonia + Chris | Agree readiness signaling and whether RM sends a readiness instruction |
+| Joshua | Handle membership/primary changes and client reconnection |
+
+### Rehearsal checklist
+
+- [x] RM registration, membership tracking, and receiver tests.
+- [x] RM launch commands, logs, and cleanup.
+- [ ] Connect GFD; verify matching GFD/RM membership after add/delete/reconnect.
+- [ ] Active recovery: crash S1, keep survivors running, restart S1, synchronize
+      its state, and verify it resumes serving clients only when ready.
+- [ ] Passive primary failure: crash S1, promote S2, verify clients switch to S2
+      and S2 sends checkpoints to S3.
+- [ ] Passive backup recovery: with S1 primary, kill S2 and verify GFD/RM show
+      S1 and S3. Restart S2; verify LFD registration and restoration to three
+      members. S2 must apply S1's checkpoint before becoming ready, remain a
+      backup, and keep receiving checkpoints. Clients continue receiving S1's replies.
+- [ ] Check request continuity and state consistency during all three scenarios.
+- [ ] Run all three on localhost, then on four laptops with visible logs.
+
+### Tests
+
+RM tests use a simulated GFD. Older server/GFD tests need active mode because
+they expect every replica to answer requests.
+
+```bash
+uv run python -m unittest discover -s tests -p 'test_rm*.py' -v
+bash -n run_all.sh
+REPLICATION_MODE=active uv run python -m unittest discover -s tests -v
+```
 
 ## Project Milestones Roadmap
 - Milestone #1: Single stateful server replica (`S1`), 3 clients, and `LFD1` heartbeat monitoring.
