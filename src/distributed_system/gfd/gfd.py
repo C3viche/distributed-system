@@ -23,6 +23,7 @@ from distributed_system.common import (
 from distributed_system.config import REPLICA_LFDS, resolve_address
 from distributed_system.gfd.cli import parse_args
 from distributed_system.gfd.sessions import PeerSession
+from distributed_system.transport import SocketTransport
 
 
 def replica_id_for_lfd(lfd_id: str) -> str:
@@ -51,7 +52,7 @@ class GlobalFaultDetector:
         self.membership: list[str] = []
         self.member_count: int = 0
         self._sessions: dict[socket.socket, PeerSession] = {}
-        self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
+        self.transport: SocketTransport = SocketTransport()
 
     def membership_text(self) -> str:
         n = self.member_count
@@ -80,7 +81,7 @@ class GlobalFaultDetector:
         # Queue on each nonblocking connection; one slow client cannot hold up LFD heartbeats.
         for session in clients:
             try:
-                self._send_json(session, message)
+                self.transport.send(session.sock, message)
                 log(
                     f"GFD sends membership to {session.client_id}: {self.membership_text()}",
                     kind="membership",
@@ -104,22 +105,12 @@ class GlobalFaultDetector:
         self.member_count = len(self.membership)
         return True
 
-    def _send_json(self, session: PeerSession, message: dict[str, object]) -> None:
-        session.conn.queue(message)
-        key = self.sel.get_key(session.sock)
-        _ = self.sel.modify(
-            session.sock,
-            selectors.EVENT_READ | selectors.EVENT_WRITE,
-            cast(str, key.data),
-        )
-
     def _close_session(self, sock: socket.socket, why: str) -> None:
         session = self._sessions.pop(sock, None)
         try:
-            _ = self.sel.unregister(sock)
+            self.transport.disconnect(sock)
         except KeyError:
-            pass
-        sock.close()
+            sock.close()
         log(why, kind="failure")
         if session is None or session.replica_id is None:
             return
@@ -245,7 +236,7 @@ class GlobalFaultDetector:
         session.ack_deadline = now + self.timeout
         session.next_due = now + self.interval
         log(f"[{count}] GFD sending heartbeat to {session.lfd_id}", kind="heartbeat")
-        self._send_json(session, heartbeat("GFD", session.lfd_id, count))
+        self.transport.send(session.sock, heartbeat("GFD", session.lfd_id, count))
 
     def _tick_heartbeats(self) -> None:
         now = time.monotonic()
@@ -281,7 +272,7 @@ class GlobalFaultDetector:
         session = self._sessions.get(sock)
         if session is None:
             return
-        messages = session.conn.receive()
+        messages = self.transport.receive(sock)
         if messages is None:
             label = session.lfd_id or session.client_id or "Peer"
             self._close_session(sock, f"{label} disconnected")
@@ -289,51 +280,41 @@ class GlobalFaultDetector:
         for msg in messages:
             self._handle_message(session, msg)
 
-    def _write_pending(self, sock: socket.socket) -> None:
-        session = self._sessions.get(sock)
-        if session is None:
-            return
-        session.conn.flush()
-        if not session.conn.has_pending_output:
-            _ = self.sel.modify(sock, selectors.EVENT_READ, "lfd")
-
     def _accept(self, listener: socket.socket) -> None:
-        conn, addr = cast(tuple[socket.socket, tuple[str, int]], listener.accept())
+        conn, addr = self.transport.accept(listener, "peer")
         session = PeerSession(conn)
         self._sessions[conn] = session
-        _ = self.sel.register(conn, selectors.EVENT_READ, "lfd")
         log(f"Connection from {addr[0]}:{addr[1]}", kind="info")
 
     def serve(self) -> None:
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((self.host, self.port))
-        listener.listen()
-        listener.setblocking(False)
+        """Listen for peers, schedule LFD heartbeats, and dispatch their messages."""
+        _ = self.transport.listen(self.port, self.host)
         log(f"GFD listening on {self.host}:{self.port}", kind="info")
         self._print_membership()
-        _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
-
         while True:
             self._tick_heartbeats()
-            timeout = self._select_timeout()
-            for key, events in self.sel.select(timeout=timeout):
-                if not isinstance(key.fileobj, socket.socket):
-                    continue
-                sock = key.fileobj
-                data = cast(str, key.data)
-                if data == "listener":
-                    self._accept(sock)
-                    continue
-                try:
-                    if events & selectors.EVENT_READ:
-                        self._read_messages(sock)
-                    if sock in self._sessions and events & selectors.EVENT_WRITE:
-                        self._write_pending(sock)
-                except BlockingIOError:
-                    pass
-                except (OSError, ValueError) as exc:
-                    self._close_session(sock, f"Connection lost: {exc}")
+            self.poll(self._select_timeout())
+
+    def poll(self, timeout: float | None) -> None:
+        """Dispatch one event batch through the shared socket interface."""
+        for sock, kind, events in self.transport.ready(timeout):
+            if kind == "listener":
+                self._accept(sock)
+                continue
+            try:
+                if events & selectors.EVENT_READ:
+                    self._read_messages(sock)
+                if sock in self._sessions and events & selectors.EVENT_WRITE:
+                    self.transport.flush(sock)
+            except BlockingIOError:
+                pass
+            except (OSError, ValueError) as exc:
+                self._close_session(sock, f"Connection lost: {exc}")
+
+    def close(self) -> None:
+        """Release channels and session records at shutdown."""
+        self.transport.close()
+        self._sessions.clear()
 
 
 def main() -> None:
@@ -350,6 +331,8 @@ def main() -> None:
         detector.serve()
     except KeyboardInterrupt:
         log("GFD shutting down", kind="info")
+    finally:
+        detector.close()
 
 
 if __name__ == "__main__":

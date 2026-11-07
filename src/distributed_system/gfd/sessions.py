@@ -3,15 +3,12 @@
 import itertools
 import socket
 
-from distributed_system.common import BufferedJsonConnection
-
 
 class PeerSession:
     """One connection, identified by its first registration message."""
 
     def __init__(self, sock: socket.socket) -> None:
         self.sock: socket.socket = sock
-        self.conn: BufferedJsonConnection = BufferedJsonConnection(sock)
         # Exactly one identity is set: an LFD owns a replica, a client observes it.
         self.lfd_id: str | None = None
         self.client_id: str | None = None
