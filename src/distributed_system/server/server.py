@@ -1,8 +1,9 @@
 """Server replica for 18-749 (S1, S2, or S3).
 
-RM admission and active state transfer are proposed interfaces. The current
-RM only accepts GFD membership reports, so it cannot yet authorize startup.
-Selecting a recovery source alone does not make a replica SYNCED.
+RM admission is a proposed interface: the current RM only accepts GFD reports.
+Active recovery pulls a point-in-time snapshot from the assigned donor before
+becoming SYNCED. Request-log catch-up during concurrent traffic is not yet
+implemented; recovery currently requires quiescent client traffic for consistency.
 
 Active mode: every synchronized replica handles every request.
 Passive mode: the configured primary opens a connection to each backup and
@@ -132,6 +133,9 @@ class Server:
         self._rm: socket.socket | None = None
         self._rm_retry_at: float = 0.0
         self.recovery_source_id: str | None = None
+        self._recovery: socket.socket | None = None
+        self._recovery_retry_at: float = 0.0
+        self._recovery_deadline: float | None = None
 
     def serve(self) -> None:
         """Start networking, then advance admission/recovery and serving together.
@@ -182,6 +186,7 @@ class Server:
             self.try_connect_to_backups()
         if self._rm is None:
             self.try_connect_to_rm()
+        self.try_connect_to_recovery_source()
 
     # RM admission and recovery: proposed control protocol
 
@@ -191,7 +196,8 @@ class Server:
         initialize: explicitly authorize fresh startup with the initial state.
         recover: select a source; remain UP until state transfer completes.
         wait: remain UP while the RM decides how to admit this replica.
-        Promotion and active state transfer are not implemented here.
+        Active replicas pull snapshots directly from their assigned donor.
+        Promotion is not implemented here.
         """
         if self.replica_status != ReplicaStatus.UP:
             return
@@ -200,10 +206,6 @@ class Server:
             self.initialize_replica()
         elif instruction == "recover":
             self.prepare_recovery(msg.get("source_id"))
-        elif instruction == "send_snapshot":
-            # Reserved donor instruction; no snapshot is sent yet. The UP guard
-            # above must be revisited when donor-side recovery is implemented.
-            pass
         elif instruction == "wait":
             self.wait_for_admission()
         else:
@@ -215,30 +217,49 @@ class Server:
         Construction already set state to zero. This does not reset state and
         must not be used as a replacement for recovering an existing group.
         """
-        self.recovery_source_id = None
+        if self.replica_status != ReplicaStatus.UP:
+            return
+        if self.role == "backup" or self.recovery_source_id is not None:
+            log(
+                f"{self.replica_id}: initialization ignored; waiting for state synchronization"
+            )
+            return
         self.replica_status = ReplicaStatus.SYNCED
         log(f"{self.replica_id}: RM authorized fresh initialization", kind="info")
 
     def prepare_recovery(self, source_id: object) -> None:
-        """Record a valid donor while remaining UP; state transfer is still TODO."""
+        """Assign a donor; the serve loop starts/retries active snapshot pulls.
+
+        Passive backups keep receiving the configured primary's checkpoints.
+        Replacing a donor cancels the previous channel before accepting new state.
+        """
         if (
             not isinstance(source_id, str)
             or source_id == self.replica_id
             or source_id not in get_server_addresses()
         ):
             raise ValueError("Invalid RM recovery source")
+        if self.replication_mode == "passive" and source_id != self.primary_id:
+            raise ValueError("Passive recovery must use the configured primary")
+        if self.replica_status != ReplicaStatus.UP:
+            raise ValueError("Recovery requires an unsynchronized replica")
+        if source_id == self.recovery_source_id:
+            return
+        if self._recovery is not None:
+            self._close_sock(self._recovery, "Recovery donor reassigned")
         self.recovery_source_id = source_id
+        self._recovery_retry_at = 0.0
         log(
-            f"{self.replica_id}: RM selected recovery source {source_id}; waiting for state transfer (not implemented)",
+            f"{self.replica_id}: RM selected recovery source {source_id}; waiting for state synchronization",
             kind="info",
         )
 
     def complete_recovery(self) -> None:
-        """Mark an active replica SYNCED after state transfer and catch-up finish.
+        """Mark an active replica SYNCED after installing its donor's snapshot.
 
-        This is a completion hook for the future recovery implementation, not
-        a state-transfer operation. The caller must first install current state.
-        Receiving RM's recover instruction alone must never call this hook.
+        The snapshot handler calls this only after validating and installing state.
+        This establishes the donor's state at snapshot time; catching up with
+        concurrent client requests still requires a request-log protocol.
         Passive backups become SYNCED through checkpoint application instead.
         """
         if self.replication_mode != "active":
@@ -256,13 +277,107 @@ class Server:
     def wait_for_admission(self) -> None:
         """Clear the pending donor while staying UP and available for heartbeats."""
         self.recovery_source_id = None
+        if self._recovery is not None:
+            self._close_sock(self._recovery, "Recovery canceled by RM")
         log(f"{self.replica_id}: waiting for RM join instructions", kind="info")
+
+    def try_connect_to_recovery_source(self) -> None:
+        """Pull an active snapshot with a bounded connect and response deadline."""
+        if (
+            self.replication_mode != "active"
+            or self.replica_status != ReplicaStatus.UP
+            or self.recovery_source_id is None
+        ):
+            return
+        now = time.monotonic()
+        if self._recovery is not None:
+            if self._recovery_deadline is not None and now >= self._recovery_deadline:
+                self._close_sock(self._recovery, "Recovery snapshot timed out")
+            return
+        if now < self._recovery_retry_at:
+            return
+        try:
+            sock = socket.create_connection(
+                get_address(self.recovery_source_id), timeout=0.5
+            )
+        except OSError as exc:
+            self._recovery_retry_at = time.monotonic() + 1.0
+            log(
+                f"Recovery donor {self.recovery_source_id} unavailable: {exc}; retrying",
+                kind="failure",
+            )
+            return
+        self._recovery = sock
+        self._recovery_deadline = time.monotonic() + 2.0
+        self._register(sock, "recovery")
+        self._send_json(
+            sock,
+            {
+                "type": "recovery_request",
+                "replica_id": self.replica_id,
+                "source_id": self.recovery_source_id,
+            },
+        )
+
+    def handle_recovery_request(
+        self, sock: socket.socket, msg: dict[str, object]
+    ) -> None:
+        """Answer an active replica's pull request while the donor is SYNCED."""
+        requester = msg.get("replica_id")
+        if (
+            self.replication_mode != "active"
+            or self.replica_status != ReplicaStatus.SYNCED
+            or msg.get("type") != "recovery_request"
+            or msg.get("source_id") != self.replica_id
+            or not isinstance(requester, str)
+            or requester == self.replica_id
+            or requester not in get_server_addresses()
+        ):
+            raise ValueError("Invalid recovery request or unavailable donor")
+        self._send_json(
+            sock,
+            {
+                "type": "recovery_snapshot",
+                "replica_id": self.replica_id,
+                "target_id": requester,
+                "my_state": self.state,
+            },
+        )
+        log(
+            f"{self.replica_id}: sending recovery snapshot to {requester}: my_state={self.state}",
+            kind="checkpoint",
+        )
+
+    def handle_recovery_snapshot(
+        self, sock: socket.socket, msg: dict[str, object]
+    ) -> None:
+        """Install a valid snapshot from this attempt's donor, then finish recovery."""
+        state = msg.get("my_state")
+        if (
+            self.replication_mode != "active"
+            or self.replica_status != ReplicaStatus.UP
+            or self.recovery_source_id is None
+            or sock is not self._recovery
+            or msg.get("type") != "recovery_snapshot"
+            or msg.get("replica_id") != self.recovery_source_id
+            or msg.get("target_id") != self.replica_id
+            or type(state) is not int
+            or state < 0
+        ):
+            raise ValueError("Invalid recovery snapshot")
+        self.state = state
+        self.complete_recovery()
+        self._close_sock(sock, "Recovery snapshot installed", kind="state")
 
     # State synchronization: passive checkpoint receive and publish
 
     def handle_checkpoint(self, msg: dict[str, object]) -> None:
         """Validate a checkpoint from the configured primary before applying it."""
-        if msg.get("type") != "checkpoint" or msg.get("replica_id") != self.primary_id:
+        if (
+            self.role != "backup"
+            or msg.get("type") != "checkpoint"
+            or msg.get("replica_id") != self.primary_id
+        ):
             return
         my_state = msg.get("my_state")
         checkpoint_count = msg.get("checkpoint_count")
@@ -280,6 +395,7 @@ class Server:
         previous_state = self.state
         self.state = my_state
         self.checkpoint_count = checkpoint_count
+        self.recovery_source_id = None
         self.replica_status = ReplicaStatus.SYNCED  # replica is now synced
 
         log(
@@ -496,6 +612,18 @@ class Server:
             waits.append(1.0)
         if self._rm is None:
             waits.append(max(0.0, self._rm_retry_at - time.monotonic()))
+        if (
+            self.replication_mode == "active"
+            and self.replica_status == ReplicaStatus.UP
+            and self.recovery_source_id is not None
+        ):
+            deadline = (
+                self._recovery_deadline
+                if self._recovery is not None
+                else self._recovery_retry_at
+            )
+            if deadline is not None:
+                waits.append(max(0.0, deadline - time.monotonic()))
         if self._pending_backups:
             waits.append(max(0.0, self._next_backup_retry - time.monotonic()))
         if self.role == "primary":
@@ -606,6 +734,14 @@ class Server:
                 self.handle_lfd(sock, msg)
             elif kind == "rm":
                 self.handle_rm(msg)
+            elif kind == "recovery":
+                self.handle_recovery_snapshot(sock, msg)
+            elif kind == "recovery_peer" or (
+                kind == "client" and msg.get("type") == "recovery_request"
+            ):
+                self.handle_recovery_request(sock, msg)
+                self._relabel_socket(sock, "recovery_peer")
+                kind = "recovery_peer"
             elif kind == "backup":
                 pass  # primary's outbound channel. backups don't send anything back
             elif self.role == "backup" and msg.get("type") == "register_primary":
@@ -619,14 +755,12 @@ class Server:
                 )
             elif kind == "primary":
                 self.handle_checkpoint(msg)
-            elif kind == "recovery":
-                pass
-                # handle sending a recovery snapshot to revived active replica
-                # This is ONLY for active replicas
             else:
                 self.handle_client(sock, msg)
+            if sock not in self._connections:
+                break
 
-    def _close_sock(self, sock: socket.socket, why: str) -> None:
+    def _close_sock(self, sock: socket.socket, why: str, kind: str = "failure") -> None:
         """Remove a channel and schedule reconnection without changing readiness."""
         # have to unregister or select() keeps waking up on the dead socket
         _ = self.sel.unregister(sock)
@@ -636,6 +770,15 @@ class Server:
         sock.close()
         if sock is self._lfd:
             self._lfd = None  # serve loop will try to re-register
+        elif sock is self._recovery:
+            self._recovery = None
+            self._recovery_deadline = None
+            if (
+                self.replica_status == ReplicaStatus.UP
+                and self.recovery_source_id is not None
+            ):
+                self._recovery_retry_at = time.monotonic() + 1.0
+                why = f"{why}; retrying recovery"
         elif sock is self._rm:
             self._rm = None
             self._rm_retry_at = time.monotonic() + 1.0
@@ -648,7 +791,7 @@ class Server:
             why = f"{client_id} disconnected"
         elif client_id and why.startswith("Connection lost"):
             why = f"{client_id} disconnected ({why})"
-        log(why, kind="failure")
+        log(why, kind=kind)
 
 
 def positive_float(text: str) -> float:

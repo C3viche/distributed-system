@@ -152,7 +152,14 @@ class ServerRMTests(unittest.TestCase):
 
     def test_synced_backup_still_ignores_client_requests(self) -> None:
         server = self.make_server(replica_id="S2", mode="passive")
-        server.handle_rm({"type": "initialize"})
+        server.handle_checkpoint(
+            {
+                "type": "checkpoint",
+                "replica_id": "S1",
+                "my_state": 0,
+                "checkpoint_count": 1,
+            }
+        )
         peer = MagicMock(spec=socket.socket)
         with patch.object(server, "_send_json") as send:
             server.handle_client(
@@ -171,8 +178,6 @@ class ServerRMTests(unittest.TestCase):
         }
         with patch.object(server, "_send_json") as send:
             server.handle_client(peer, request)
-            server.handle_rm({"type": "recover", "source_id": "S2"})
-            server.handle_client(peer, request)
             send.assert_not_called()
             self.assertEqual(server.state, 0)
 
@@ -190,6 +195,16 @@ class ServerRMTests(unittest.TestCase):
                     "state": 1,
                 },
             )
+
+    def test_initialize_cannot_bypass_recovery_or_backup_checkpoint(self) -> None:
+        active = self.make_server()
+        active.handle_rm({"type": "recover", "source_id": "S2"})
+        active.handle_rm({"type": "initialize"})
+        self.assertEqual(active.replica_status, ReplicaStatus.UP)
+        self.assertEqual(active.recovery_source_id, "S2")
+        backup = self.make_server(replica_id="S2", mode="passive")
+        backup.handle_rm({"type": "initialize"})
+        self.assertEqual(backup.replica_status, ReplicaStatus.UP)
 
     def test_checkpoint_synchronizes_backup_without_authorizing_client_work(
         self,
