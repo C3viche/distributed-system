@@ -1,7 +1,9 @@
-"""Global Fault Detector for Milestone 2 18-749.
+"""Global Fault Detector for 18-749.
 
 Runs on the sacred (client) laptop. LFDs report replica health; registered
-clients receive the current membership and every subsequent change.
+clients receive the current membership and every subsequent change. GFD
+registers with the Replication Manager and forwards those changes. In passive
+mode the membership snapshot names the current primary.
 
 Run from the repository root:
     uv run gfd
@@ -11,6 +13,7 @@ Run from the repository root:
 from __future__ import annotations
 
 import argparse
+import errno
 import itertools
 import math
 import selectors
@@ -24,7 +27,12 @@ from distributed_system.common import (
     log,
     set_process_id,
 )
-from distributed_system.config import REPLICA_LFDS, resolve_address
+from distributed_system.config import (
+    REPLICA_LFDS,
+    REPLICATION_MODE,
+    get_address,
+    resolve_address,
+)
 
 
 def positive_number(value: str) -> float:
@@ -80,8 +88,18 @@ class GlobalFaultDetector:
         self.host, self.port = resolve_address("GFD", host_override, port_override)
         self.membership: list[str] = []
         self.member_count: int = 0
+        # Passive mode: the first living member is primary. Active mode leaves this unset.
+        self.primary_id: str | None = None
         self._sessions: dict[socket.socket, PeerSession] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
+        self._rm_address: tuple[str, int] = get_address("RM")
+        self._rm_sock: socket.socket | None = None
+        self._rm_conn: BufferedJsonConnection | None = None
+        self._rm_connecting: bool = False
+        self._rm_registered: bool = False
+        self._rm_retry_at: float = 0.0
+        self._rm_connect_deadline: float = 0.0
+        self._stopped: bool = False
 
     def membership_text(self) -> str:
         n = self.member_count
@@ -90,17 +108,39 @@ class GlobalFaultDetector:
             return f"GFD: 0 {word}"
         return f"GFD: {n} {word}: {', '.join(self.membership)}"
 
-    def _print_membership(self) -> None:
-        # A membership transition is one publish point for the console and clients.
+    def _print_membership(self, rm_event: tuple[str, str] | None = None) -> None:
+        # A membership transition is one publish point for the console, clients, and RM.
+        self._update_primary()
         log(self.membership_text(), kind="membership")
         self._publish_membership()
+        if rm_event is not None:
+            self._notify_rm(rm_event[0], rm_event[1])
+
+    def _update_primary(self) -> None:
+        """In passive mode the primary is the first replica still in membership."""
+        if REPLICATION_MODE != "passive":
+            return
+        new = self.membership[0] if self.membership else None
+        if new == self.primary_id:
+            return
+        self.primary_id = new
+        if new is not None:
+            log(f"GFD promotes {new} to primary", kind="membership")
+
+    def _client_membership(self) -> dict[str, object]:
+        message: dict[str, object] = {
+            "type": "membership",
+            "members": list(self.membership),
+            "member_count": self.member_count,
+        }
+        # Active clients keep their own routing. null clears a passive primary.
+        if REPLICATION_MODE == "passive":
+            message["primary_id"] = self.primary_id
+        return message
 
     def _publish_membership(self, recipient: PeerSession | None = None) -> None:
         """Send a full snapshot so late clients and updates use the same format."""
-        message: dict[str, object] = {
-            "type": "membership", "members": list(self.membership),
-            "member_count": self.member_count,
-        }
+        message = self._client_membership()
         clients = ([recipient] if recipient is not None else
                    [s for s in self._sessions.values() if s.client_id is not None])
         # Queue on each nonblocking connection; one slow client cannot hold up LFD heartbeats.
@@ -147,7 +187,7 @@ class GlobalFaultDetector:
         lfd_id = session.lfd_id or "LFD?"
         if self._delete_replica(replica_id):
             log(f"{lfd_id}: delete replica {replica_id}", kind="membership")
-            self._print_membership()
+            self._print_membership(("delete_replica", replica_id))
 
     def _drop_existing(self, lfd_id: str, incoming: socket.socket) -> None:
         for sock, session in list(self._sessions.items()):
@@ -201,14 +241,14 @@ class GlobalFaultDetector:
         # Repeated add reports do not produce duplicate client notifications.
         if self._add_replica(replica_id):
             log(f"{session.lfd_id}: add replica {replica_id}", kind="membership")
-            self._print_membership()
+            self._print_membership(("add_replica", replica_id))
 
     def _handle_delete(self, session: PeerSession, msg: dict[str, object]) -> None:
         replica_id = self._owned_replica(session, msg)
         session.replica_id = None
         if self._delete_replica(replica_id):
             log(f"{session.lfd_id}: delete replica {replica_id}", kind="membership")
-            self._print_membership()
+            self._print_membership(("delete_replica", replica_id))
 
     def _handle_ack(self, session: PeerSession, msg: dict[str, object]) -> None:
         if session.lfd_id is None or not session.awaiting_ack:
@@ -284,9 +324,119 @@ class GlobalFaultDetector:
                 deadlines.append(max(0.0, session.ack_deadline - now))
             else:
                 deadlines.append(max(0.0, session.next_due - now))
+        if self._rm_sock is None:
+            deadlines.append(max(0.0, self._rm_retry_at - now))
+        elif self._rm_connecting:
+            deadlines.append(max(0.0, self._rm_connect_deadline - now))
         if not deadlines:
             return None
         return min(deadlines)
+
+    def _notify_rm(self, kind: str, replica_id: str) -> None:
+        """Forward one add or delete. A down RM is caught up by the next snapshot."""
+        if not self._rm_registered:
+            return
+        self._queue_rm({"type": kind, "replica_id": replica_id})
+
+    def _queue_rm(self, message: dict[str, object]) -> None:
+        if self._rm_sock is None or self._rm_conn is None or self._rm_connecting:
+            return
+        try:
+            self._rm_conn.queue(message)
+            _ = self.sel.modify(
+                self._rm_sock, selectors.EVENT_READ | selectors.EVENT_WRITE, "rm"
+            )
+        except (OSError, KeyError, ValueError) as exc:
+            self._drop_rm(f"GFD lost RM connection: {exc}")
+
+    def _drop_rm(self, why: str) -> None:
+        sock = self._rm_sock
+        self._rm_sock = None
+        self._rm_conn = None
+        self._rm_connecting = False
+        self._rm_registered = False
+        self._rm_retry_at = time.monotonic() + 1.0
+        if sock is None:
+            return
+        try:
+            _ = self.sel.unregister(sock)
+        except KeyError:
+            pass
+        sock.close()
+        log(why, kind="failure")
+
+    def _start_rm_connect(self, now: float) -> None:
+        """One nonblocking attempt. Failure waits one second and does not stall the loop."""
+        host, port = self._rm_address
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        try:
+            result = sock.connect_ex((host, port))
+        except OSError as exc:
+            sock.close()
+            self._rm_retry_at = now + 1.0
+            log(f"GFD could not reach RM ({exc}); retrying", kind="failure")
+            return
+        if result not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
+            sock.close()
+            self._rm_retry_at = now + 1.0
+            name = errno.errorcode.get(result, result)
+            log(f"GFD could not reach RM ({name}); retrying", kind="failure")
+            return
+        self._rm_sock = sock
+        self._rm_conn = BufferedJsonConnection(sock)
+        self._rm_connecting = True
+        self._rm_registered = False
+        self._rm_connect_deadline = now + 1.0
+        _ = self.sel.register(sock, selectors.EVENT_WRITE, "rm")
+        if result == 0:
+            self._finish_rm_connect()
+
+    def _finish_rm_connect(self) -> None:
+        """Send register_gfd and a snapshot of whoever is alive right now."""
+        sock = self._rm_sock
+        if sock is None:
+            return
+        error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        if error:
+            name = errno.errorcode.get(error, error)
+            self._drop_rm(f"GFD could not reach RM ({name}); retrying")
+            return
+        self._rm_connecting = False
+        self._rm_registered = True
+        self._queue_rm({"type": "register_gfd", "gfd_id": "GFD"})
+        if not self._rm_registered:
+            return
+        self._queue_rm({
+            "type": "membership",
+            "members": list(self.membership),
+            "member_count": self.member_count,
+        })
+        if self._rm_registered:
+            log("GFD registered with RM", kind="registration")
+
+    def _tick_rm(self) -> None:
+        now = time.monotonic()
+        if self._rm_sock is None:
+            if now >= self._rm_retry_at:
+                self._start_rm_connect(now)
+            return
+        if self._rm_connecting and now >= self._rm_connect_deadline:
+            self._drop_rm("GFD could not reach RM (timeout); retrying")
+
+    def _read_rm(self) -> None:
+        if self._rm_conn is None:
+            return
+        messages = self._rm_conn.receive()
+        if messages is None:
+            self._drop_rm("GFD lost RM connection")
+
+    def _write_rm(self) -> None:
+        if self._rm_conn is None or self._rm_sock is None:
+            return
+        self._rm_conn.flush()
+        if not self._rm_conn.has_pending_output:
+            _ = self.sel.modify(self._rm_sock, selectors.EVENT_READ, "rm")
 
     def _read_messages(self, sock: socket.socket) -> None:
         session = self._sessions.get(sock)
@@ -321,12 +471,20 @@ class GlobalFaultDetector:
         listener.bind((self.host, self.port))
         listener.listen()
         listener.setblocking(False)
+        self.port = int(listener.getsockname()[1])
         log(f"GFD listening on {self.host}:{self.port}", kind="info")
         self._print_membership()
         _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
 
-        while True:
+        try:
+            self._serve_loop()
+        finally:
+            self._release(listener)
+
+    def _serve_loop(self) -> None:
+        while not self._stopped:
             self._tick_heartbeats()
+            self._tick_rm()
             timeout = self._select_timeout()
             for key, events in self.sel.select(timeout=timeout):
                 if not isinstance(key.fileobj, socket.socket):
@@ -335,6 +493,20 @@ class GlobalFaultDetector:
                 data = cast(str, key.data)
                 if data == "listener":
                     self._accept(sock)
+                    continue
+                if data == "rm":
+                    try:
+                        if self._rm_connecting and events & selectors.EVENT_WRITE:
+                            self._finish_rm_connect()
+                        if self._rm_sock is sock and not self._rm_connecting:
+                            if events & selectors.EVENT_READ:
+                                self._read_rm()
+                            if self._rm_sock is sock and events & selectors.EVENT_WRITE:
+                                self._write_rm()
+                    except BlockingIOError:
+                        pass
+                    except (OSError, ValueError) as exc:
+                        self._drop_rm(f"GFD lost RM connection: {exc}")
                     continue
                 try:
                     if events & selectors.EVENT_READ:
@@ -345,6 +517,31 @@ class GlobalFaultDetector:
                     pass
                 except (OSError, ValueError) as exc:
                     self._close_session(sock, f"Connection lost: {exc}")
+
+    def _release(self, listener: socket.socket) -> None:
+        sock = self._rm_sock
+        self._rm_sock = None
+        self._rm_conn = None
+        self._rm_connecting = False
+        self._rm_registered = False
+        if sock is not None:
+            try:
+                _ = self.sel.unregister(sock)
+            except KeyError:
+                pass
+            sock.close()
+        for peer in list(self._sessions):
+            try:
+                _ = self.sel.unregister(peer)
+            except KeyError:
+                pass
+            peer.close()
+        self._sessions.clear()
+        try:
+            _ = self.sel.unregister(listener)
+        except KeyError:
+            pass
+        listener.close()
 
 
 def main() -> None:
