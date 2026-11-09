@@ -72,7 +72,7 @@ class ServerElectionTests(unittest.TestCase):
 
     def test_recovered_configured_primary_comes_back_as_backup(self) -> None:
         server = self.make_server("S1")
-        self.assertEqual(server.role, "primary")
+        self.assertEqual(server.role, "backup")
         server.apply_membership(["S2", "S3", "S1"])
         self.assertEqual(server.role, "backup")
         self.assertEqual(server.primary_id, "S2")

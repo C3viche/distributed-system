@@ -111,11 +111,10 @@ class Server:
         self._client_ids: dict[socket.socket, str] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
 
-        # Initial role follows PRIMARY_ID. Passive membership/promote_primary
-        # from GFD/RM can later promote a backup or demote a recovered primary.
+        # Only a bootstrapped PRIMARY_ID starts as primary; a relaunch waits for RM as a backup.
         if replication_mode == "active":
             self.role: str = "active"  # M2: every replica handles every request
-        elif replica_id == primary_id:
+        elif replica_id == primary_id and bootstrap:
             self.role = "primary"  # M3: handles requests, sends checkpoints
         else:
             self.role = "backup"  # M3: ignores requests, receives checkpoints
