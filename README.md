@@ -8,7 +8,7 @@ The overall system models an asynchronous distributed application split into nod
 - **Server Replicas (`S1`, `S2`, `S3`)**: Stateful, deterministic server nodes. Each server maintains internal state (`my_state`) and handles incoming client requests and heartbeat checks.
 - **Local Fault Detector (`LFD1`, `LFD2`, `LFD3`)**: Resides on the same physical/virtual host as its assigned server replica. Sends periodic heartbeats to monitor replica health and reports crashes.
 - **Global Fault Detector (`GFD`)**: Aggregates local health notifications from all LFDs, maintains central system group membership, and broadcasts membership updates.
-- **Replication Manager (`RM`)**: M4 membership receiver for GFD reports. GFD forwarding and recovery/failover integration are pending; automatic replica relaunch is deferred to M5.
+- **Replication Manager (`RM`)**: Tracks GFD liveness and coordinates replica joins and recovery. Server/GFD integration is pending; automatic replica relaunch is deferred to M5.
 - **Clients (`C1`, `C2`, `C3`)**: Independent client processes issuing requests with unique `<client_id, replica_id, request_num>` tuples.
 
 ## Prerequisites & Installation
@@ -483,8 +483,8 @@ Console outputs are timestamped in UTC and the rest of the line is color-coded b
 
 ## Milestone #4: RM and Integration
 
-RM is implemented, but GFD does not connect to it yet. Until Sonia's sender is
-connected, RM stays at `RM: 0 members`. Recovery and failover are also pending.
+RM handles membership and recovery control, but GFD and servers do not connect to it yet. Until Sonia's sender is
+connected, RM stays at `RM: 0 members`. Checkpoint transfer and failover integration are still pending.
 Automatic replica relaunch belongs to M5.
 
 ### RM protocol
@@ -509,6 +509,62 @@ registration replaces the old connection. After a disconnect, RM keeps the last
 reported membership until resynchronized; that view may be stale.
 
 Membership does not indicate whether a recovering replica is ready to serve.
+
+### Replica recovery protocol
+
+These messages are implemented on RM and tested with simulated replicas. The
+`initialize` and `recover`/`source_id` names follow Cristian’s proposed handler in
+`ce/state-transfer`. His server still needs the control connection, recovery token
+handling, completion reporting, and ready acknowledgment gating. Sonia’s
+`m4-gfd-rm` sender needs to include primary updates supplied by election logic. All control messages use the same JSON-line listener.
+
+1. A replica keeps a control connection to RM and sends
+   `{"type":"join","replica_id":"S2"}`. RM replies `join_accepted`. This does
+   not authorize serving requests; the replica waits for a recovery instruction.
+2. After GFD reports it alive and a ready donor is available, RM sends:
+
+   ```json
+   {"type":"recover","replica_id":"S2","recovery_id":"<token>","primary_id":"S1","source_id":"S1","source_address":{"host":"127.0.0.1","port":8080}}
+   ```
+
+3. The joining replica initiates checkpoint transfer from that donor. Cristian's
+   code must apply the checkpoint and catch up intervening requests before sending
+   `{"type":"sync_complete","replica_id":"S2","recovery_id":"<token>"}`.
+4. RM replies `{"type":"ready","replica_id":"S2","recovery_id":"<token>","primary_id":"S1"}`.
+   The server can then leave recovery mode. In passive mode, a recovered backup
+   remains a backup and must not answer client requests.
+
+RM keeps readiness separate from printed GFD membership. Only ready, live replicas
+can donate state. Active recovery chooses the first eligible replica by ID;
+passive recovery uses only the current primary. GFD forwards the elected
+`primary_id` in a membership snapshot (or null while election is pending). RM
+starts with configured `PRIMARY_ID`, clears it on removal, and does not elect or
+promote replicas itself. Omitting `primary_id` preserves the current value.
+
+A duplicate join on the same connection repeats the current instruction. A new
+connection replaces the old session and requires synchronization again. Completion
+must match the connection and current recovery token; stale completion receives
+`recovery_rejected`. Duplicate valid completion repeats the ready acknowledgment.
+
+If a donor fails, disconnects, or ceases to be the passive primary, RM sends
+`{"type":"recovery_cancelled","recovery_id":"<token>"}` and selects another
+eligible donor, or waits. Removal of the joining replica also cancels its attempt.
+The server must stop the cancelled attempt and ignore its delayed transfer data.
+GFD disconnect cancels unfinished transfers; a fresh snapshot is required before
+RM resumes coordination. With no eligible donor, RM waits rather than accepting
+an empty state. A stalled transfer can be retried by reconnecting and joining.
+
+For a **fresh cluster only**, the configured initial primary joins with
+`"bootstrap":true`. RM sends `initialize` with null source fields; the server initializes
+its starting state and sends `sync_complete`. This seeds the first ready donor.
+Once any replica has become ready, bootstrap cannot bypass recovery. Manual
+restarts must omit this flag. RM state is in memory: restarting RM during a live
+run is not supported by this protocol; restart the whole demo as a fresh cluster.
+
+RM coordinates the transfer but does not move checkpoints, verify server state,
+implement request catch-up, or broadcast ready membership to clients. Server
+readiness gating and client propagation remain integration work.
+
 
 ### Running M4
 
@@ -552,12 +608,15 @@ Start infrastructure first, then replicas in order. Individual commands:
 |---|---|
 | Sonia | Agree GFD→RM messages; send registration, snapshots, and membership changes |
 | Nikhil + Sonia | Agree who selects the primary and how promotion is announced |
-| Cristian + Sonia + Chris | Agree readiness signaling and whether RM sends a readiness instruction |
+| Chris | RM join sessions, donor assignment, completion validation, and ready acknowledgment |
+| Cristian | Connect server recovery messages; transfer/catch up state and enforce readiness |
 | Joshua | Handle membership/primary changes and client reconnection |
 
 ### Rehearsal checklist
 
 - [x] RM registration, membership tracking, and receiver tests.
+- [x] RM recovery protocol tested with simulated replicas.
+- [ ] Connect server join/transfer/completion handlers and verify ready gating.
 - [x] RM launch commands, logs, and cleanup.
 - [ ] Connect GFD; verify matching GFD/RM membership after add/delete/reconnect.
 - [ ] Active recovery: crash S1, keep survivors running, restart S1, synchronize
