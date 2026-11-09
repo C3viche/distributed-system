@@ -25,6 +25,7 @@ class ServerElectionTests(unittest.TestCase):
         server.handle_checkpoint(
             {
                 "type": "checkpoint",
+                "request_history": {},
                 "replica_id": "S1",
                 "my_state": 7,
                 "checkpoint_count": 3,
@@ -49,6 +50,7 @@ class ServerElectionTests(unittest.TestCase):
         self.assertEqual(server.state, 7)
 
         peer = MagicMock()
+        server._connections[peer] = MagicMock()
         with patch.object(server, "_send_json") as send:
             server.handle_client(
                 peer,

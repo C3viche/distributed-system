@@ -120,6 +120,7 @@ class ReplicaConnections:
         """Sends payload to a directed target n number of times and returns a reply if received"""
         self.held = False
         if not targets:
+            self.held = True
             return None
         for replica_id in targets:
             sock = self.alive[replica_id]
@@ -137,12 +138,9 @@ class ReplicaConnections:
                 sock = self.alive.get(replica_id)
                 if sock is not None and self._connections[sock].has_pending_output:
                     self.mark_dead(replica_id)
-            # all targets died, hold the number so the resend's reply isn't dropped as late
-            self.held = not set(targets).intersection(self.alive)
-            if self.held:
-                return None
-            log(f"request_num {request_num}: no reply from {', '.join(targets)}; continuing",
-                kind="failure")
+            self.held = True
+            log(f"request_num {request_num}: no reply; holding for retry", kind="failure")
+            return None
         self._last_finished = request_num
         return reply
 

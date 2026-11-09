@@ -165,21 +165,15 @@ class RoutingTests(unittest.TestCase):
         )
         self.assertEqual(len(self.replicas["S1"].requests), 2)
 
-    def test_timeout_late_reply_and_next_request(self) -> None:
+    def test_timeout_retries_same_request_on_a_live_connection(self):
         self.replicas["S1"].answer = False
         self.assertIsNone(self.conns.send_passive(1, "timeout", "S1"))
-        self.replicas["S1"].reply(1)
+        self.assertTrue(self.conns.held)
         self.replicas["S1"].answer = True
+        reply = self.require_reply(self.conns.send_passive(1, "timeout", "S1"))
+        self.assertEqual(reply["request_num"], 1)
         self.assertFalse(self.conns.held)
-        reply = self.conns.send_passive(2, "next", "S1")
-        assert reply is not None
-        self.assertEqual(reply["request_num"], 2)
-        self.assertTrue(
-            any(
-                "Discarded late reply" in call.args[0]
-                for call in self.logs.call_args_list
-            )
-        )
+        self.assertEqual([r["request_num"] for r in self.replicas["S1"].requests], [1, 1])
 
     def test_primary_crash_holds_request_for_new_primary(self) -> None:
         self.replicas["S1"].answer = False

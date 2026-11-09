@@ -1,9 +1,8 @@
 """Server replica for 18-749 (S1, S2, or S3).
 
 RM admits replicas through join requests and confirms synchronization.
-Active recovery pulls a point-in-time snapshot from the assigned donor before
-becoming SYNCED. Request-log catch-up during concurrent traffic is not yet
-implemented; recovery currently requires quiescent client traffic for consistency.
+Active recovery receives a checkpoint and request stream over donor-opened
+secondary channels. Requests are deduplicated across client retries and recovery.
 
 Active mode: every synchronized replica handles every request.
 Passive mode: the configured primary opens a connection to each backup and
@@ -102,6 +101,12 @@ class Server:
         self._state_synced = False
         self.replica_status: ReplicaStatus = replica_status
         self.state: int = 0
+        self.request_history: dict[str, dict[int, int]] = {}
+        self.high_watermark_request_num: dict[str, int] = {}
+        self._buffered_requests: list[tuple[socket.socket | None, dict[str, object]]] = []
+        self._active_peers: dict[socket.socket, str] = {}
+        self._checkpoint_acks: dict[socket.socket, int] = {}
+        self._pending_replies: list[tuple[socket.socket, dict[str, object]]] = []
         self._connections: dict[socket.socket, BufferedJsonConnection] = {}
         self._client_ids: dict[socket.socket, str] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
@@ -126,7 +131,7 @@ class Server:
         self._pending_backups: list[str] = []
         self._backups: dict[socket.socket, str] = {}
         self._next_backup_retry: float = 0.0  # don't redial more than once a second
-        if self.role == "primary":
+        if self.role in {"primary", "active"}:
             self._pending_backups = [
                 rid for rid in get_server_addresses() if rid != replica_id
             ]
@@ -146,7 +151,6 @@ class Server:
         self._rm_retry_at: float = 0.0
         self.recovery_source_id: str | None = None
         self._recovery: socket.socket | None = None
-        self._recovery_retry_at: float = 0.0
         self._recovery_deadline: float | None = None
         self.membership: list[str] = []
 
@@ -195,7 +199,7 @@ class Server:
         """
         if self._lfd is None:
             self.try_connect_to_lfd()
-        if self.role == "primary" and self._pending_backups:
+        if self.role in {"primary", "active"} and self._pending_backups:
             self.try_connect_to_backups()
         if self._rm is None:
             self.try_connect_to_rm()
@@ -223,6 +227,9 @@ class Server:
             if isinstance(token, str) and token == self._recovery_id and self._state_synced:
                 self.replica_status = ReplicaStatus.SYNCED
                 self.bootstrap = False
+                pending, self._buffered_requests = self._buffered_requests, []
+                for sock, request in pending:
+                    self.process_request(sock, request)
                 log(f"{self.replica_id}: RM confirmed readiness", kind="state")
             return
         if instruction not in {"initialize", "recover"}:
@@ -303,7 +310,7 @@ class Server:
             self.role = "primary"
             self.recovery_source_id = None
             if self._recovery is not None:
-                self._close_sock(self._recovery, "promotion canceled recovery pull")
+                self._close_sock(self._recovery, "promotion canceled recovery")
             self._next_checkpoint = time.monotonic() + self._checkpoint_interval
             self._close_inbound_primary_channel()
             log(f"{self.replica_id} role: {old_role} → primary", kind="membership")
@@ -397,7 +404,7 @@ class Server:
         log(f"{self.replica_id}: initial state installed; awaiting RM", kind="info")
 
     def prepare_recovery(self, source_id: object) -> None:
-        """Assign a donor; the serve loop starts/retries active snapshot pulls.
+        """Assign a donor and wait for its secondary channel.
 
         Passive backups keep receiving the configured primary's checkpoints.
         Replacing a donor cancels the previous channel before accepting new state.
@@ -417,7 +424,6 @@ class Server:
         if self._recovery is not None:
             self._close_sock(self._recovery, "Recovery donor reassigned")
         self.recovery_source_id = source_id
-        self._recovery_retry_at = 0.0
         log(
             f"{self.replica_id}: RM selected recovery source {source_id}; waiting for state synchronization",
             kind="info",
@@ -426,9 +432,7 @@ class Server:
     def complete_recovery(self) -> None:
         """Report an installed active snapshot and wait for RM acknowledgment.
 
-        The snapshot handler calls this only after validating and installing state.
-        This establishes the donor's state at snapshot time; catching up with
-        concurrent client requests still requires a request-log protocol.
+        Subsequent requests remain buffered until RM confirms readiness.
         Passive backups report completion through checkpoint application instead.
         """
         if self.replication_mode != "active":
@@ -446,6 +450,7 @@ class Server:
         """Clear the pending donor while staying UP and available for heartbeats."""
         self.replica_status = ReplicaStatus.UP
         self._state_synced = False
+        self._pending_replies.clear()
         self._recovery_id = None
         self.recovery_source_id = None
         if self._recovery is not None:
@@ -453,47 +458,28 @@ class Server:
         log(f"{self.replica_id}: waiting for RM join instructions", kind="info")
 
     def try_connect_to_recovery_source(self) -> None:
-        """Pull an active snapshot with a bounded connect and response deadline."""
-        if (
-            self.replication_mode != "active"
-            or self.replica_status != ReplicaStatus.UP
-            or self.recovery_source_id is None
-        ):
+        """Request a snapshot on the assigned donor's outbound secondary channel."""
+        if (self.replication_mode != "active" or self.recovery_source_id is None
+                or self._state_synced):
             return
-        now = time.monotonic()
         if self._recovery is not None:
-            if self._recovery_deadline is not None and now >= self._recovery_deadline:
+            if self._recovery_deadline is not None and time.monotonic() >= self._recovery_deadline:
                 self._close_sock(self._recovery, "Recovery snapshot timed out")
             return
-        if now < self._recovery_retry_at:
-            return
-        try:
-            sock = socket.create_connection(
-                get_address(self.recovery_source_id), timeout=0.5
-            )
-        except OSError as exc:
-            self._recovery_retry_at = time.monotonic() + 1.0
-            log(
-                f"Recovery donor {self.recovery_source_id} unavailable: {exc}; retrying",
-                kind="failure",
-            )
-            return
-        self._recovery = sock
-        self._recovery_deadline = time.monotonic() + 2.0
-        self._register(sock, "recovery")
-        self._send_json(
-            sock,
-            {
-                "type": "recovery_request",
-                "replica_id": self.replica_id,
-                "source_id": self.recovery_source_id,
-            },
-        )
+        for sock, donor in self._active_peers.items():
+            if donor == self.recovery_source_id:
+                self._recovery = sock
+                self._recovery_deadline = time.monotonic() + 2.0
+                self._send_json(sock, {
+                    "type": "recovery_request", "replica_id": self.replica_id,
+                    "source_id": donor, "recovery_id": self._recovery_id,
+                })
+                return
 
     def handle_recovery_request(
         self, sock: socket.socket, msg: dict[str, object]
     ) -> None:
-        """Answer an active replica's pull request while the donor is SYNCED."""
+        """Queue a snapshot before subsequent requests on this secondary channel."""
         requester = msg.get("replica_id")
         if (
             self.replication_mode != "active"
@@ -512,6 +498,8 @@ class Server:
                 "replica_id": self.replica_id,
                 "target_id": requester,
                 "my_state": self.state,
+                "request_history": self._history_payload(),
+                "recovery_id": msg.get("recovery_id"),
             },
         )
         log(
@@ -532,13 +520,16 @@ class Server:
             or msg.get("type") != "recovery_snapshot"
             or msg.get("replica_id") != self.recovery_source_id
             or msg.get("target_id") != self.replica_id
+            or msg.get("recovery_id") != self._recovery_id
             or type(state) is not int
             or state < 0
         ):
             raise ValueError("Invalid recovery snapshot")
+        self._install_history(msg.get("request_history"))
         self.state = state
         self.complete_recovery()
-        self._close_sock(sock, "Recovery snapshot installed", kind="state")
+        self._recovery = None
+        self._recovery_deadline = None
 
     # State synchronization: passive checkpoint receive and publish
 
@@ -555,6 +546,9 @@ class Server:
         if type(my_state) is not int or type(checkpoint_count) is not int:
             return
 
+        if self.replica_status != ReplicaStatus.SYNCED and self._recovery_id is None:
+            return
+        self._install_history(msg.get("request_history"))
         self.apply_checkpoint(my_state, checkpoint_count)
 
     def apply_checkpoint(self, my_state: int, checkpoint_count: int) -> None:
@@ -592,6 +586,7 @@ class Server:
             "replica_id": self.replica_id,
             "my_state": self.state,
             "checkpoint_count": self.checkpoint_count,
+            "request_history": self._history_payload(),
         }
         for sock, backup_id in list(self._backups.items()):
             self._send_json(sock, message)
@@ -600,6 +595,7 @@ class Server:
                 kind="checkpoint",
             )
         self.checkpoint_count += 1
+        self._release_replies()
 
     # Serving: client admission, application mutation, and health checks
 
@@ -619,39 +615,88 @@ class Server:
             )
             return
 
-        # Check if the replica is actually synced before handling the client
+        self._record_request(msg)
         if self.replica_status != ReplicaStatus.SYNCED:
-            log(
-                f"{self.replica_id}: ignore request while {self.replica_status.name}",
-                kind="info",
-            )
+            self._buffered_requests.append((sock, dict(msg)))
+            log(f"{self.replica_id}: logged <{client}, {msg.get('request_num')}> while UP",
+                kind="receive")
             return
 
         self.process_request(sock, msg)
 
-    def process_request(self, sock: socket.socket, msg: dict[str, object]) -> None:
-        """Increment application state and reply after handle_client admits a request.
+    def _record_request(self, msg: dict[str, object]) -> None:
+        """Track the highest request number seen for each client, including recovery."""
+        client, number = msg.get("client_id"), msg.get("request_num")
+        if not isinstance(client, str) or not client or type(number) is not int or number < 1:
+            raise ValueError("Invalid client request")
+        self.high_watermark_request_num[client] = max(
+            number, self.high_watermark_request_num.get(client, 0))
 
-        This is the application mutation point. Admission belongs to
-        handle_client; repeated request numbers are not deduplicated.
-        """
-        client = msg.get("client_id")
-        req = msg.get("request_num")
-        payload = msg.get("payload", "")
-        log(f"Received <{client}, {self.replica_id}, {req}, {payload}>", kind="receive")
-        log(f"my_state = {self.state} before processing", kind="state")
-        self.state += 1
-        log(f"my_state = {self.state} after processing", kind="state")
+    def _history_payload(self) -> dict[str, dict[str, int]]:
+        """Serialize request identities and their original results with a checkpoint."""
+        return {client: {str(number): result for number, result in history.items()}
+                for client, history in self.request_history.items()}
 
-        reply = {
-            "type": "reply",
-            "client_id": client,
-            "replica_id": self.replica_id,
-            "request_num": req,
-            "state": self.state,
-        }
-        log(f"Sending <{client}, {self.replica_id}, {req}, reply>", kind="send")
-        self._send_json(sock, reply)
+    def _install_history(self, payload: object) -> None:
+        """Validate the complete history before replacing local deduplication state."""
+        if not isinstance(payload, dict):
+            raise ValueError("Checkpoint requires request history")
+        history = {}
+        for client, entries in payload.items():
+            if not isinstance(client, str) or not isinstance(entries, dict):
+                raise ValueError("Invalid request history")
+            parsed = {}
+            for number, result in entries.items():
+                if (not isinstance(number, str) or not number.isdecimal()
+                        or int(number) < 1 or type(result) is not int or result < 1):
+                    raise ValueError("Invalid request history entry")
+                parsed[int(number)] = result
+            history[client] = parsed
+        self.request_history = history
+        for client, entries in history.items():
+            self.high_watermark_request_num[client] = max(
+                self.high_watermark_request_num.get(client, 0), max(entries, default=0))
+
+    def process_request(self, sock: socket.socket | None, msg: dict[str, object]) -> None:
+        """Apply each request once and return its cached result on retries."""
+        self._record_request(msg)
+        client, req = cast(str, msg["client_id"]), cast(int, msg["request_num"])
+        history = self.request_history.setdefault(client, {})
+        if req not in history:
+            log(f"Received <{client}, {self.replica_id}, {req}, {msg.get('payload', '')}>",
+                kind="receive")
+            log(f"my_state = {self.state} before processing", kind="state")
+            self.state += 1
+            history[req] = self.state
+            log(f"my_state = {self.state} after processing", kind="state")
+            if self.role == "active":
+                for peer in list(self._backups):
+                    self._send_json(peer, {**msg, "type": "replicated_request"})
+        else:
+            log(f"{self.replica_id}: duplicate <{client}, {req}>; returning cached result",
+                kind="info")
+        if sock is not None and sock in self._connections:
+            reply = {"type": "reply", "client_id": client, "replica_id": self.replica_id,
+                     "request_num": req, "state": history[req]}
+            self._pending_replies.append((sock, reply))
+            self._release_replies()
+
+    def _release_replies(self) -> None:
+        """Reply after connected passive backups have checkpointed the operation."""
+        durable_state = self.state
+        if self.role == "primary" and self._backups:
+            durable_state = min(self._checkpoint_acks.get(peer, -1) for peer in self._backups)
+        waiting = []
+        for sock, reply in self._pending_replies:
+            if sock not in self._connections:
+                continue
+            if cast(int, reply["state"]) > durable_state:
+                waiting.append((sock, reply))
+                continue
+            self._send_json(sock, reply)
+            log(f"Sending <{reply['client_id']}, {self.replica_id}, {reply['request_num']}, reply>",
+                kind="send")
+        self._pending_replies = waiting
 
     def handle_lfd(self, sock: socket.socket, msg: dict[str, object]) -> None:
         """Answer health checks in both UP and SYNCED states."""
@@ -771,7 +816,8 @@ class Server:
         self._backups[s] = backup_id
         self._register(s, "backup")
         # first message on the socket tells the backup this isn't a client
-        self._send_json(s, {"type": "register_primary", "replica_id": self.replica_id})
+        self._send_json(s, {"type": "register_active" if self.role == "active" else "register_primary",
+                            "replica_id": self.replica_id})
         log(
             f"{self.replica_id} opened checkpoint channel to {backup_id}",
             kind="registration",
@@ -794,11 +840,11 @@ class Server:
             deadline = (
                 self._recovery_deadline
                 if self._recovery is not None
-                else self._recovery_retry_at
+                else time.monotonic() + 0.1
             )
             if deadline is not None:
                 waits.append(max(0.0, deadline - time.monotonic()))
-        if self.role == "primary" and self._pending_backups:
+        if self.role in {"primary", "active"} and self._pending_backups:
             waits.append(max(0.0, self._next_backup_retry - time.monotonic()))
         if self.role == "primary":
             waits.append(max(0.0, self._next_checkpoint - time.monotonic()))
@@ -908,16 +954,33 @@ class Server:
                 self.handle_lfd(sock, msg)
             elif kind == "rm":
                 self.handle_rm(msg)
-            elif kind == "recovery":
-                self.handle_recovery_snapshot(sock, msg)
-            elif kind == "recovery_peer" or (
-                kind == "client" and msg.get("type") == "recovery_request"
-            ):
-                self.handle_recovery_request(sock, msg)
-                self._relabel_socket(sock, "recovery_peer")
-                kind = "recovery_peer"
             elif kind == "backup":
-                pass  # primary's outbound channel. backups don't send anything back
+                if msg.get("type") == "recovery_request":
+                    self.handle_recovery_request(sock, msg)
+                elif self.role == "primary" and msg.get("type") == "checkpoint_ack":
+                    state = msg.get("my_state")
+                    if type(state) is not int or not 0 <= state <= self.state:
+                        raise ValueError("Invalid checkpoint acknowledgment")
+                    self._checkpoint_acks[sock] = max(state, self._checkpoint_acks.get(sock, -1))
+                    self._release_replies()
+            elif self.role == "active" and msg.get("type") == "register_active":
+                peer = msg.get("replica_id")
+                if not isinstance(peer, str) or peer not in get_server_addresses() or peer == self.replica_id:
+                    raise ValueError("Invalid active peer")
+                self._active_peers[sock] = peer
+                self._relabel_socket(sock, "active_peer")
+                kind = "active_peer"
+            elif kind == "active_peer":
+                if msg.get("type") == "recovery_snapshot":
+                    self.handle_recovery_snapshot(sock, msg)
+                elif msg.get("type") == "replicated_request":
+                    self._record_request(msg)
+                    if self.replica_status == ReplicaStatus.SYNCED:
+                        self.process_request(None, msg)
+                    else:
+                        self._buffered_requests.append((None, dict(msg)))
+                        log(f"{self.replica_id}: logged <{msg['client_id']}, {msg['request_num']}> while UP",
+                            kind="receive")
             elif self.role == "backup" and msg.get("type") == "register_primary":
                 sender = msg.get("replica_id")
                 if sender != self.primary_id:
@@ -936,6 +999,9 @@ class Server:
                 )
             elif kind == "primary":
                 self.handle_checkpoint(msg)
+                if (msg.get("type") == "checkpoint" and msg.get("replica_id") == self.primary_id
+                        and (self.replica_status == ReplicaStatus.SYNCED or self._state_synced)):
+                    self._send_json(sock, {"type": "checkpoint_ack", "my_state": self.state})
             else:
                 self.handle_client(sock, msg)
             if sock not in self._connections:
@@ -955,6 +1021,8 @@ class Server:
         _ = self._connections.pop(sock, None)
         client_id = self._client_ids.pop(sock, None)
         backup_id = self._backups.pop(sock, None)
+        self._active_peers.pop(sock, None)
+        self._checkpoint_acks.pop(sock, None)
         sock.close()
         if sock is self._lfd:
             self._lfd = None  # serve loop will try to re-register
@@ -965,14 +1033,13 @@ class Server:
                 self.replica_status == ReplicaStatus.UP
                 and self.recovery_source_id is not None
             ):
-                self._recovery_retry_at = time.monotonic() + 1.0
                 why = f"{why}; retrying recovery"
         elif sock is self._rm:
             self._rm = None
             self.wait_for_admission()
             self._rm_retry_at = time.monotonic() + 1.0
             why = "lost connection to RM; will retry"
-        elif backup_id and retry_backup and self.role == "primary":
+        elif backup_id and retry_backup and self.role in {"primary", "active"}:
             # backup died, put it back in the queue so we reconnect if it comes back up
             self._pending_backups.append(backup_id)
             why = f"lost checkpoint channel to {backup_id}; will retry"

@@ -362,24 +362,21 @@ even though only the primary is addressed. Routing follows this precedence:
 1. An explicit non-null `primary_id` in a `membership` snapshot from GFD.
 2. The configured `PRIMARY_ID` (or `--primary`), used until GFD overrides it.
 
-GFD does not yet publish `primary_id`, so clients stay on `PRIMARY_ID` for all
-of Milestone #3. A membership snapshot that omits `primary_id` preserves the
+GFD publishes RM's current `primary_id`. A membership snapshot that omits it preserves the
 previous assignment; `null` clears it. An explicit assignment must name a
 member listed in the same snapshot, otherwise the whole snapshot is rejected
 and the previous view is kept.
 
-The optional field format, for Milestone #4:
+The assignment format:
 
 ```json
 {"type":"membership","members":["S1","S2","S3"],"member_count":3,"primary_id":"S2"}
 ```
 
-A client request without a reply within its timeout is logged and the next
-request uses a fresh number, and late replies are discarded. The exception is
-when every target dies mid-request (e.g. the primary is killed): the client
-holds that `request_num` and resends it once GFD names a live primary. The
-server doesn't deduplicate yet, so if the old primary ran it and checkpointed
-before dying, the new primary applies it twice. If the
+A client request without a reply keeps the same request number on retry, even
+when its connection stays open. Replicas deduplicate by `(client_id, request_num)`
+and return the cached result. Checkpoints carry this history, so a new primary
+also recognizes requests completed before failover. If the
 primary is unreachable, the client keeps looping, retries its connections on a
 one-second backoff, and waits for either reconnection or a GFD snapshot that
 changes the assignment. Clients never promote a backup themselves.
@@ -413,7 +410,7 @@ The `S2 (backup): ignoring request from C1` line only appears if a client misrou
 - **Primary designation.** `PRIMARY_ID=S1` in `.env` is read by both the server (role = primary vs backup) and the clients (who to send to). The project guide says the primary is "the first replica to show up"; we make that explicit and launch S1 first. The Replication Manager replaces this static assignment in Milestone #4.
 - **Secondary channel.** The primary dials each backup on the backup's existing listen port (two TCP connections, S1→S2 and S1→S3). The first message is `register_primary`, which retags that socket so later `checkpoint` payloads are applied instead of being treated as client requests. `checkpoint_freq` is a CLI parameter (`--checkpoint-freq`, default 1 Hz); `checkpoint_count` starts at 1 and is sent with `my_state` on every checkpoint. The timer lives in the same `select` loop (no threads).
 - **Why backups still accept client connections.** Rubric step 7 requires each client to open three TCP connections. Backups accept the socket, ignore any request (`S2 (backup): ignoring request from C1`), and do not reply. Clients never promote a backup themselves.
-- **What this demo does not show.** Primary crash, primary re-election, recovery of a dead backup, state transfer on relaunch, and the RM. Those are Milestone #4. GFD does not yet publish `primary_id`, so clients stay on the configured `PRIMARY_ID` for the whole demo.
+- **What this demo does not show.** Primary crash, primary re-election, recovery of a dead backup, state transfer on relaunch, and the RM. Those are covered by the Milestone #4 scenarios below.
 - **Log colors to watch.** Yellow = client/server request/reply; magenta = heartbeats; green = `my_state`; blue = registration / checkpoint-channel open; cyan = membership; light cyan = checkpoint send/receive; red = deaths and socket tear-downs. Confirm on each teammate's terminal that light cyan is distinct from heartbeat magenta.
 
 ## Wire Protocol & Logging Format
@@ -453,11 +450,12 @@ an optional `primary_id`:
 {"type":"membership","members":["S1","S2","S3"],"member_count":3,"primary_id":"S1"}
 ```
 
-The primary-to-backup secondary channel adds two message types:
+The primary-to-backup secondary channel uses:
 
 ```json
 {"type":"register_primary","replica_id":"S1"}
-{"type":"checkpoint","replica_id":"S1","my_state":7,"checkpoint_count":3}
+{"type":"checkpoint","replica_id":"S1","my_state":1,"checkpoint_count":3,"request_history":{"C1":{"1":1}}}
+{"type":"checkpoint_ack","my_state":1}
 ```
 
 `register_primary` is the first message on each outbound socket the primary
@@ -487,9 +485,9 @@ Console outputs are timestamped in UTC and the rest of the line is color-coded b
 ## Milestone #4: RM and Integration
 
 The integration branch connects GFD membership, server admission, and RM readiness.
-Real-process tests cover fresh startup, active restart with traffic paused during
-transfer, passive backup restart, and primary failover with three replicas and
-three clients. Concurrent request catch-up and request deduplication remain unfinished.
+Real-process tests cover fresh startup, active recovery during live traffic,
+passive backup recovery, and primary failover with three replicas and three
+clients. Request history prevents duplicate application across retries and recovery.
 Automatic replica relaunch belongs to M5.
 
 ### RM protocol
@@ -529,11 +527,14 @@ primary and sends the decision to servers and GFD. GFD forwards it to clients. A
    {"type":"recover","replica_id":"S2","recovery_id":"<token>","primary_id":"S1","source_id":"S1","source_address":{"host":"127.0.0.1","port":8080}}
    ```
 
-3. The joining replica initiates checkpoint transfer from that donor. Cristian's
-   code must apply the checkpoint and catch up intervening requests before sending
+3. In active mode, the donor opens a secondary connection to the joining replica.
+   The replica requests a checkpoint on that connection. The donor sends its state
+   and request history, followed by live requests in TCP order. The receiver buffers
+   requests while UP, installs the checkpoint, and sends
    `{"type":"sync_complete","replica_id":"S2","recovery_id":"<token>"}`.
 4. RM replies `{"type":"ready","replica_id":"S2","recovery_id":"<token>","primary_id":"S1"}`.
-   The server can then leave recovery mode. In passive mode, a recovered backup
+   The active server replays buffered requests, skipping those already in the
+   checkpoint, before handling new client traffic. In passive mode, a recovered backup
    remains a backup and must not answer client requests.
 
 RM keeps readiness separate from printed GFD membership. Only ready, live replicas
@@ -566,7 +567,23 @@ run is not supported by this protocol; restart the whole demo as a fresh cluster
 
 RM coordinates the transfer; servers apply checkpoints and wait for its ready
 acknowledgment before becoming SYNCED. RM does not verify application state or
-broadcast ready membership to clients. Active catch-up and deduplication still need implementation.
+broadcast ready membership to clients.
+
+Active replicas each open secondary channels to the other two replicas, including
+S1's connections to S2 and S3. Channels reconnect after failure. The same channel
+carries the donor checkpoint and subsequent requests. Recovering replicas log
+request numbers and maintain `high_watermark_request_num` per client; they do not
+reply until RM confirms readiness. Deduplication uses exact request identities,
+so out-of-order requests below a watermark are not lost. This fits the current
+application's commutative increment operation; it is not a total-order protocol
+for arbitrary operations.
+
+Passive checkpoints include request history. The primary waits for every connected
+backup to acknowledge the checkpoint containing a request before replying to the
+client. Periodic checkpoints still use `--checkpoint-freq`; reply latency therefore
+depends on that interval. With no connected backups, the primary serves alone,
+without protection against its own failure. History stays in memory for the demo;
+client IDs/request numbers must not be reused for a new workload in the same run.
 
 
 ### Running M4
@@ -619,8 +636,21 @@ Individual commands:
 | Sonia + Chris | GFD registration, snapshots, membership and primary updates connected |
 | Nikhil + Sonia + Chris | Promotion/demotion connected to RM election and GFD client updates |
 | Chris | RM join sessions, donor assignment, completion validation, and ready acknowledgment |
-| Cristian + Chris | Admission and readiness connected; concurrent request catch-up pending |
+| Cristian + Chris | Admission, buffered recovery, and request-history transfer connected |
 | Joshua | Handle membership/primary changes and client reconnection |
+
+### Local integration checks
+
+```bash
+PYTHONPATH=src uv run python -m unittest discover -s tests -p test_admission_integration.py -v
+```
+
+The live-traffic tests run three replicas, three LFDs, three independent clients,
+GFD, and RM on loopback ports. They check active S1/S2 recovery, passive backup
+recovery, primary promotion, checkpoint continuation, complete request-number
+sequences, and exact final state counts. A separate lost-reply case verifies that
+a checkpointed request is not applied again after failover. These checks do not
+replace the four-laptop rehearsal.
 
 ### Rehearsal checklist
 
@@ -629,16 +659,16 @@ Individual commands:
 - [x] Connect server join/transfer/completion handlers and verify ready gating.
 - [x] RM launch commands, logs, and cleanup.
 - [x] Connect GFD; verify matching GFD/RM membership during startup and restart.
-- [ ] Active recovery: crash S1, keep survivors running, restart S1, synchronize
+- [x] Local active recovery: crash S1, keep survivors running, restart S1, synchronize
       its state, and verify it resumes serving clients only when ready.
 - [x] Local passive primary failure: crash S1, promote S2, verify clients switch to S2
       and S2 sends checkpoints to S3.
-- [ ] Passive backup recovery: with S1 primary, kill S2 and verify GFD/RM show
+- [x] Local passive backup recovery: with S1 primary, kill S2 and verify GFD/RM show
       S1 and S3. Restart S2; verify LFD registration and restoration to three
       members. S2 must apply S1's checkpoint before becoming ready, remain a
       backup, and keep receiving checkpoints. Clients continue receiving S1's replies.
-- [ ] Check request continuity and state consistency during all three scenarios.
-- [ ] Run all three on localhost, then on four laptops with visible logs.
+- [x] Check request continuity and state consistency during all three local scenarios.
+- [ ] Repeat all three on four laptops with visible logs.
 
 ### Tests
 

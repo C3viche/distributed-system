@@ -230,7 +230,7 @@ class Client:
         self._holding = self.conns.held
         if self._holding:
             log(
-                f"{self.client_id}: lost {target} mid-request, holding request_num {self.request_num}",
+                f"{self.client_id}: no reply from {target}, holding request_num {self.request_num}",
                 kind="failure",
             )
             return False

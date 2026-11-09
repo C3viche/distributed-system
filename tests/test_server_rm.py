@@ -78,6 +78,7 @@ class ServerRMTests(unittest.TestCase):
             server.try_connect_to_rm()
             self.assertEqual(connect.call_count, 1)
             server._lfd = MagicMock(spec=socket.socket)
+            server._pending_backups.clear()
             self.assertEqual(server._seconds_until_next_wakeup(), 0.5)
             now.return_value = 11.0
             server.try_connect_to_rm()
@@ -110,6 +111,7 @@ class ServerRMTests(unittest.TestCase):
         server = self.make_server()
         server.handle_rm({"type": "recover", "recovery_id": "recovery", "source_id": "S2"})
         peer = MagicMock(spec=socket.socket)
+        server._connections[peer] = MagicMock()
         request: dict[str, object] = {
             "type": "request",
             "client_id": "C1",
@@ -120,11 +122,12 @@ class ServerRMTests(unittest.TestCase):
             send.assert_not_called()
             self.assertEqual(server.replica_status, ReplicaStatus.UP)
 
-            # Simulate state installation by the future transfer implementation.
+            # Install a donor checkpoint; the buffered request is still pending.
             server.state = 7
             server.complete_recovery()
             self.acknowledge(server)
-            self.assertEqual(server.state, 7)
+            self.assertEqual(server.state, 8)
+            send.reset_mock()
             self.assertEqual(server.replica_status, ReplicaStatus.SYNCED)
             self.assertIsNone(server.recovery_source_id)
             server.handle_client(peer, request)
@@ -166,12 +169,14 @@ class ServerRMTests(unittest.TestCase):
         server.handle_checkpoint(
             {
                 "type": "checkpoint",
+                "request_history": {},
                 "replica_id": "S1",
                 "my_state": 0,
                 "checkpoint_count": 1,
             }
         )
         peer = MagicMock(spec=socket.socket)
+        server._connections[peer] = MagicMock()
         with patch.object(server, "_send_json") as send:
             server.handle_client(
                 peer, {"type": "request", "client_id": "C1", "request_num": 1}
@@ -182,6 +187,7 @@ class ServerRMTests(unittest.TestCase):
     def test_active_replica_serves_only_after_initialization(self) -> None:
         server = self.make_server()
         peer = MagicMock(spec=socket.socket)
+        server._connections[peer] = MagicMock()
         request: dict[str, object] = {
             "type": "request",
             "client_id": "C1",
@@ -193,6 +199,7 @@ class ServerRMTests(unittest.TestCase):
             self.assertEqual(server.state, 0)
 
             self.initialize(server)
+            send.reset_mock()
             server.handle_client(peer, request)
             self.assertEqual(server.state, 1)
             self.assertIsNone(server.recovery_source_id)
@@ -225,6 +232,7 @@ class ServerRMTests(unittest.TestCase):
         server.handle_checkpoint(
             {
                 "type": "checkpoint",
+                "request_history": {},
                 "replica_id": "S1",
                 "my_state": 7,
                 "checkpoint_count": 3,
