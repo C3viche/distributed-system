@@ -165,17 +165,50 @@ class RoutingTests(unittest.TestCase):
         )
         self.assertEqual(len(self.replicas["S1"].requests), 2)
 
-    def test_timeout_late_reply_and_next_request(self) -> None:
+    def test_timeout_retries_same_request_on_a_live_connection(self):
         self.replicas["S1"].answer = False
         self.assertIsNone(self.conns.send_passive(1, "timeout", "S1"))
-        self.replicas["S1"].reply(1)
+        self.assertTrue(self.conns.held)
         self.replicas["S1"].answer = True
-        reply = self.conns.send_passive(2, "next", "S1")
-        assert reply is not None
-        self.assertEqual(reply["request_num"], 2)
+        reply = self.require_reply(self.conns.send_passive(1, "timeout", "S1"))
+        self.assertEqual(reply["request_num"], 1)
+        self.assertFalse(self.conns.held)
+        self.assertEqual([r["request_num"] for r in self.replicas["S1"].requests], [1, 1])
+
+    def test_primary_crash_holds_request_for_new_primary(self) -> None:
+        self.replicas["S1"].answer = False
+        crash = threading.Timer(0.05, self.replicas["S1"].close)
+        crash.start()
+        self.addCleanup(crash.cancel)
+        self.assertIsNone(self.conns.send_passive(1, "in flight", "S1"))
+        self.assertTrue(self.conns.held)
+        self.assertNotIn("S1", self.conns.alive)
+        # The resend keeps its number, so its reply must not be discarded as late.
+        reply = self.require_reply(self.conns.send_passive(1, "in flight", "S2"))
+        self.assertEqual((reply["replica_id"], reply["request_num"]), ("S2", 1))
+        self.assertFalse(self.conns.held)
+        self.assertEqual(
+            self.require_reply(self.conns.send_passive(2, "next", "S2"))[
+                "request_num"
+            ],
+            2,
+        )
+
+    def test_silent_rejoined_replica_stays_connected(self) -> None:
+        # A relaunched active replica logs requests but stays quiet until synced.
+        self.replicas["S2"].answer = False
+        self.assertIsNotNone(self.conns.send_active(1, "while syncing"))
+        self.conns.receive_pending(0.25)
+        self.assertIn("S2", self.conns.alive)
+        self.assertEqual(len(self.replicas["S2"].requests), 1)
+        self.replicas["S2"].answer = True
+        self.assertIsNotNone(self.conns.send_active(2, "synced"))
+        self.conns.receive_pending(0.05)
+        self.assertEqual(len(self.replicas["S2"].requests), 2)
         self.assertTrue(
             any(
-                "Discarded late reply" in call.args[0]
+                "Discarded duplicate reply from S2" in call.args[0]
+                or "Discarded duplicate reply from S1" in call.args[0]
                 for call in self.logs.call_args_list
             )
         )
@@ -263,6 +296,14 @@ class ClientTests(unittest.TestCase):
             self.snapshot(["S2"], primary_id="S2")
             self.assertTrue(self.client._has_request_target())
 
+    def test_active_waits_for_pending_connects(self) -> None:
+        self.client.replication_mode = "active"
+        with patch.object(self.client.conns, "alive", {"S1": object()}):
+            self.client.conns._connecting["S2"] = (MagicMock(), time.monotonic() + 1)
+            self.assertFalse(self.client._has_request_target())
+            del self.client.conns._connecting["S2"]
+            self.assertTrue(self.client._has_request_target())
+
     def test_loop_continues_after_timeout_and_counts_issued_requests(self) -> None:
         with (
             patch.object(self.client, "_has_request_target", return_value=True),
@@ -274,6 +315,22 @@ class ClientTests(unittest.TestCase):
         ):
             self.client._loop()
         self.assertEqual([call.args[0] for call in send.call_args_list], [1, 2])
+        self.assertEqual(self.client.request_num, 3)
+
+    def test_held_request_is_resent_with_same_number(self) -> None:
+        outcomes = iter([None, {"request_num": 1}, {"request_num": 2}])
+
+        def send(*_: object) -> dict[str, object] | None:
+            reply = next(outcomes)
+            self.client.conns.held = reply is None
+            return reply
+
+        with (
+            patch.object(self.client, "_has_request_target", return_value=True),
+            patch.object(self.client.conns, "send_passive", side_effect=send) as sent,
+        ):
+            self.client._loop()
+        self.assertEqual([call.args[0] for call in sent.call_args_list], [1, 1, 2])
         self.assertEqual(self.client.request_num, 3)
 
     def test_cli_defaults_and_passive_flag(self) -> None:

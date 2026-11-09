@@ -8,7 +8,7 @@ The overall system models an asynchronous distributed application split into nod
 - **Server Replicas (`S1`, `S2`, `S3`)**: Stateful, deterministic server nodes. Each server maintains internal state (`my_state`) and handles incoming client requests and heartbeat checks.
 - **Local Fault Detector (`LFD1`, `LFD2`, `LFD3`)**: Resides on the same physical/virtual host as its assigned server replica. Sends periodic heartbeats to monitor replica health and reports crashes.
 - **Global Fault Detector (`GFD`)**: Aggregates local health notifications from all LFDs, maintains central system group membership, and broadcasts membership updates.
-- **Replication Manager (`RM`)**: Orchestrates high-level system fault tolerance, tracks healthy members, and automates replica recovery/re-launch.
+- **Replication Manager (`RM`)**: Tracks GFD liveness and coordinates replica joins and recovery; automatic replica relaunch is deferred to M5.
 - **Clients (`C1`, `C2`, `C3`)**: Independent client processes issuing requests with unique `<client_id, replica_id, request_num>` tuples.
 
 ## Prerequisites & Installation
@@ -35,8 +35,8 @@ addresses with the corresponding machines' reachable LAN IPs, keeping each
 server and its LFD on the same machine. Use consistent addresses across machines.
 Existing shell environment variables take precedence over `.env` values.
 
-Heartbeat frequency and timeout remain CLI options (`--heartbeat_freq` and
-`--timeout`); use the same frequency for all three LFDs. GFD uses `GFD_HOST` and `GFD_PORT`; RM remains reserved for a future milestone.
+Heartbeat frequency and timeout remain CLI options (`--heartbeat-freq` and
+`--timeout`); use the same frequency for all three LFDs. GFD uses `GFD_HOST` and `GFD_PORT`; the M4 RM receiver uses `RM_HOST` and `RM_PORT`.
 
 ### Setting up `.env` for a multi-laptop run
 
@@ -84,13 +84,13 @@ To run everything on one machine for testing:
 
 ```bash
 # Client C1
-uv run client --id C1 --num_replicas 1
+uv run client --id C1 --num-replicas 1
 
 # Client C2
-uv run client --id C2 --num_replicas 1
+uv run client --id C2 --num-replicas 1
 
 # Client C3
-uv run client --id C3 --num_replicas 1
+uv run client --id C3 --num-replicas 1
 ./run_all.sh local
 ```
 
@@ -110,10 +110,10 @@ The script will not start if one of the ports is already in use, which usually m
 Run each command in a separate terminal tab/window:
 
 ```bash
-uv run gfd --heartbeat_freq 1 --timeout 2
-uv run lfd --id LFD1 --heartbeat_freq 1 --timeout 2
-uv run lfd --id LFD2 --heartbeat_freq 1 --timeout 2
-uv run lfd --id LFD3 --heartbeat_freq 1 --timeout 2
+uv run gfd --heartbeat-freq 1 --timeout 2
+uv run lfd --id LFD1 --heartbeat-freq 1 --timeout 2
+uv run lfd --id LFD2 --heartbeat-freq 1 --timeout 2
+uv run lfd --id LFD3 --heartbeat-freq 1 --timeout 2
 uv run server --id S1
 uv run server --id S2
 uv run server --id S3
@@ -122,7 +122,7 @@ uv run client --id C2 --interval 1
 uv run client --id C3 --interval 1
 ```
 
-`--heartbeat_freq` is in heartbeats per second (Hz); use the same value for the GFD and all three LFDs. `--timeout` is how many seconds the LFD waits for an ACK before declaring the server dead. `--interval` is the number of seconds between client requests.
+`--heartbeat-freq` is in heartbeats per second (Hz); use the same value for the GFD and all three LFDs. `--timeout` is how many seconds the LFD waits for an ACK before declaring the server dead. `--interval` is the number of seconds between client requests.
 
 ### What happens at each step
 
@@ -147,7 +147,7 @@ and reports current healthy membership after reconnecting.
 Clients register with GFD before sending requests. GFD immediately sends the
 current replica IDs and member count, then sends a new full snapshot whenever
 membership changes. Both sides log each delivery. Clients use those IDs to
-open or close replica connections; `--num_replicas` is a legacy option and does
+open or close replica connections; `--num-replicas` is a legacy option and does
 not limit GFD membership.
 
 Run the local integration tests with:
@@ -252,10 +252,10 @@ primary) is never killed in Milestone #3.
 Run each command in a separate terminal tab/window:
 
 ```bash
-uv run gfd --heartbeat_freq 1 --timeout 2
-uv run lfd --id LFD1 --heartbeat_freq 1 --timeout 2
-uv run lfd --id LFD2 --heartbeat_freq 1 --timeout 2
-uv run lfd --id LFD3 --heartbeat_freq 1 --timeout 2
+uv run gfd --heartbeat-freq 1 --timeout 2
+uv run lfd --id LFD1 --heartbeat-freq 1 --timeout 2
+uv run lfd --id LFD2 --heartbeat-freq 1 --timeout 2
+uv run lfd --id LFD3 --heartbeat-freq 1 --timeout 2
 uv run server --id S1 --replication-mode passive --primary S1 --checkpoint-freq 1
 uv run server --id S2 --replication-mode passive --primary S1
 uv run server --id S3 --replication-mode passive --primary S1
@@ -362,21 +362,21 @@ even though only the primary is addressed. Routing follows this precedence:
 1. An explicit non-null `primary_id` in a `membership` snapshot from GFD.
 2. The configured `PRIMARY_ID` (or `--primary`), used until GFD overrides it.
 
-GFD does not yet publish `primary_id`, so clients stay on `PRIMARY_ID` for all
-of Milestone #3. A membership snapshot that omits `primary_id` preserves the
+GFD publishes RM's current `primary_id`. A membership snapshot that omits it preserves the
 previous assignment; `null` clears it. An explicit assignment must name a
 member listed in the same snapshot, otherwise the whole snapshot is rejected
 and the previous view is kept.
 
-The optional field format, for Milestone #4:
+The assignment format:
 
 ```json
 {"type":"membership","members":["S1","S2","S3"],"member_count":3,"primary_id":"S2"}
 ```
 
-A client request without a reply within its timeout is logged and the next
-request uses a fresh number; requests are not replayed because the current
-server does not deduplicate operations, and late replies are discarded. If the
+A client request without a reply keeps the same request number on retry, even
+when its connection stays open. Replicas deduplicate by `(client_id, request_num)`
+and return the cached result. Checkpoints carry this history, so a new primary
+also recognizes requests completed before failover. If the
 primary is unreachable, the client keeps looping, retries its connections on a
 one-second backoff, and waits for either reconnection or a GFD snapshot that
 changes the assignment. Clients never promote a backup themselves.
@@ -410,7 +410,7 @@ The `S2 (backup): ignoring request from C1` line only appears if a client misrou
 - **Primary designation.** `PRIMARY_ID=S1` in `.env` is read by both the server (role = primary vs backup) and the clients (who to send to). The project guide says the primary is "the first replica to show up"; we make that explicit and launch S1 first. The Replication Manager replaces this static assignment in Milestone #4.
 - **Secondary channel.** The primary dials each backup on the backup's existing listen port (two TCP connections, S1→S2 and S1→S3). The first message is `register_primary`, which retags that socket so later `checkpoint` payloads are applied instead of being treated as client requests. `checkpoint_freq` is a CLI parameter (`--checkpoint-freq`, default 1 Hz); `checkpoint_count` starts at 1 and is sent with `my_state` on every checkpoint. The timer lives in the same `select` loop (no threads).
 - **Why backups still accept client connections.** Rubric step 7 requires each client to open three TCP connections. Backups accept the socket, ignore any request (`S2 (backup): ignoring request from C1`), and do not reply. Clients never promote a backup themselves.
-- **What this demo does not show.** Primary crash, primary re-election, recovery of a dead backup, state transfer on relaunch, and the RM. Those are Milestone #4. GFD does not yet publish `primary_id`, so clients stay on the configured `PRIMARY_ID` for the whole demo.
+- **What this demo does not show.** Primary crash, primary re-election, recovery of a dead backup, state transfer on relaunch, and the RM. Those are covered by the Milestone #4 scenarios below.
 - **Log colors to watch.** Yellow = client/server request/reply; magenta = heartbeats; green = `my_state`; blue = registration / checkpoint-channel open; cyan = membership; light cyan = checkpoint send/receive; red = deaths and socket tear-downs. Confirm on each teammate's terminal that light cyan is distinct from heartbeat magenta.
 
 ## Wire Protocol & Logging Format
@@ -450,11 +450,12 @@ an optional `primary_id`:
 {"type":"membership","members":["S1","S2","S3"],"member_count":3,"primary_id":"S1"}
 ```
 
-The primary-to-backup secondary channel adds two message types:
+The primary-to-backup secondary channel uses:
 
 ```json
 {"type":"register_primary","replica_id":"S1"}
-{"type":"checkpoint","replica_id":"S1","my_state":7,"checkpoint_count":3}
+{"type":"checkpoint","replica_id":"S1","my_state":1,"checkpoint_count":3,"request_history":{"C1":{"1":1}}}
+{"type":"checkpoint_ack","my_state":1}
 ```
 
 `register_primary` is the first message on each outbound socket the primary
@@ -480,6 +481,205 @@ Console outputs are timestamped in UTC and the rest of the line is color-coded b
 - Cyan: Membership changes
 - Light cyan: Checkpoint send and receive (primary $\leftrightarrow$ backups)
 - Red: Process failures & socket tear-downs
+
+## Milestone #4: RM and Integration
+
+The integration branch connects GFD membership, server admission, and RM readiness.
+Real-process tests cover fresh startup, active recovery during live traffic,
+passive backup recovery, and primary failover with three replicas and three
+clients. Request history prevents duplicate application across retries and recovery.
+Automatic replica relaunch belongs to M5.
+
+### RM protocol
+
+Run `uv run rm`, with optional `--host` and `--port` overrides. RM uses
+newline-delimited JSON. GFD sends:
+
+```json
+{"type":"register_gfd","gfd_id":"GFD"}
+{"type":"membership","members":["S1","S2"],"member_count":2}
+{"type":"add_replica","replica_id":"S3"}
+{"type":"delete_replica","replica_id":"S1"}
+```
+
+Register on each connection, then send a full snapshot, including an empty one
+at startup. Send later changes on the same connection. RM sends no acknowledgments.
+
+RM prints every accepted snapshot, even when unchanged. Duplicate add/delete
+messages have no effect. Counts come from the membership list, and invalid
+messages close the sender's connection without changing membership. A new GFD
+registration replaces the old connection. After a disconnect, RM keeps the last
+reported membership until resynchronized; that view may be stale.
+
+Membership does not indicate whether a recovering replica is ready to serve.
+
+### Replica recovery protocol
+
+Servers send `join_request` to RM. RM chooses the first synchronized, live member as passive
+primary and sends the decision to servers and GFD. GFD forwards it to clients. All control messages use the same JSON-line listener.
+
+1. A replica keeps a control connection to RM and sends
+   `{"type":"join_request","replica_id":"S2"}`. RM replies `join_accepted`. This does
+   not authorize serving requests; the replica waits for a recovery instruction.
+2. After GFD reports it alive and a ready donor is available, RM sends:
+
+   ```json
+   {"type":"recover","replica_id":"S2","recovery_id":"<token>","primary_id":"S1","source_id":"S1","source_address":{"host":"127.0.0.1","port":8080}}
+   ```
+
+3. In active mode, the donor opens a secondary connection to the joining replica.
+   The replica requests a checkpoint on that connection. The donor sends its state
+   and request history, followed by live requests in TCP order. The receiver buffers
+   requests while UP, installs the checkpoint, and sends
+   `{"type":"sync_complete","replica_id":"S2","recovery_id":"<token>"}`.
+4. RM replies `{"type":"ready","replica_id":"S2","recovery_id":"<token>","primary_id":"S1"}`.
+   The active server replays buffered requests, skipping those already in the
+   checkpoint, before handling new client traffic. In passive mode, a recovered backup
+   remains a backup and must not answer client requests.
+
+RM keeps readiness separate from printed GFD membership. Only ready, live replicas
+can donate state. Active recovery chooses the first eligible replica by ID;
+passive recovery uses only the current primary. RM keeps GFD membership order,
+but only synchronized replicas are eligible for election. It sends `membership`
+with an explicit `primary_id` to servers and `primary_update` to GFD. Servers
+apply Nikhil's promotion/demotion logic; GFD publishes the same assignment to
+clients. A recovered former primary rejoins as a backup.
+
+A duplicate join on the same connection repeats the current instruction. A new
+connection replaces the old session and requires synchronization again. Completion
+must match the connection and current recovery token; stale completion receives
+`recovery_rejected`. Duplicate valid completion repeats the ready acknowledgment.
+
+If a donor fails, disconnects, or ceases to be the passive primary, RM sends
+`{"type":"recovery_cancelled","recovery_id":"<token>"}` and selects another
+eligible donor, or waits. Removal of the joining replica also cancels its attempt.
+The server must stop the cancelled attempt and ignore its delayed transfer data.
+GFD disconnect cancels unfinished transfers; a fresh snapshot is required before
+RM resumes coordination. With no eligible donor, RM waits rather than accepting
+an empty state. A stalled transfer can be retried by reconnecting and joining.
+
+For a **fresh cluster only**, the configured initial primary joins with
+`"bootstrap":true`. RM sends `initialize` with null source fields; the server initializes
+its starting state and sends `sync_complete`. This seeds the first ready donor.
+Once any replica has become ready, bootstrap cannot bypass recovery. Manual
+restarts must omit this flag. RM state is in memory: restarting RM during a live
+run is not supported by this protocol; restart the whole demo as a fresh cluster.
+
+RM coordinates the transfer; servers apply checkpoints and wait for its ready
+acknowledgment before becoming SYNCED. RM does not verify application state or
+broadcast ready membership to clients.
+
+Active replicas each open secondary channels to the other two replicas, including
+S1's connections to S2 and S3. Channels reconnect after failure. The same channel
+carries the donor checkpoint and subsequent requests. Recovering replicas log
+request numbers and maintain `high_watermark_request_num` per client; they do not
+reply until RM confirms readiness. Deduplication uses exact request identities,
+so out-of-order requests below a watermark are not lost. This fits the current
+application's commutative increment operation; it is not a total-order protocol
+for arbitrary operations.
+
+Passive checkpoints include request history. The primary waits for every connected
+backup to acknowledge the checkpoint containing a request before replying to the
+client. Periodic checkpoints still use `--checkpoint-freq`; reply latency therefore
+depends on that interval. With no connected backups, the primary serves alone,
+without protection against its own failure. History stays in memory for the demo;
+client IDs/request numbers must not be reused for a new workload in the same run.
+
+
+### Running M4
+
+Run one mode at a time. Omit `--headless` to open Terminal windows; otherwise
+output goes to `logs/<process>.log`.
+
+```bash
+./run_all.sh local m4-active --headless
+./run_all.sh kill all
+./run_all.sh local m4-passive --headless
+./run_all.sh kill all
+```
+
+Startup order is RM → GFD → LFDs → servers → clients. The script waits up to ten
+seconds for RM's listener before starting GFD. It does not check registration.
+Passive failover is coordinated by RM; the promoted server opens checkpoint
+channels to the remaining backups.
+
+For four laptops, share a `.env` with reachable LAN addresses and the same
+`REPLICATION_MODE`. Point `RM_HOST` and `GFD_HOST` at laptop 4.
+
+| Laptop | Commands |
+|---|---|
+| 4: RM, GFD, clients | `./run_all.sh infrastructure`, then `./run_all.sh clients` after replicas are ready |
+| 1: LFD1, S1 | `./run_all.sh replica 1` |
+| 2: LFD2, S2 | `./run_all.sh replica 2` |
+| 3: LFD3, S3 | `./run_all.sh replica 3` |
+
+Start infrastructure first, then replicas in order. On a fresh four-laptop run,
+start LFD1 with `./run_all.sh lfd 1`, then initialize the first server explicitly:
+`uv run server --id S1 --bootstrap`. Start S2/S3 normally. Local `m4-active` and
+`m4-passive` runs pass `--bootstrap` to S1 automatically; use these only for a
+fresh group. Individual server restart commands never pass that flag.
+
+Individual commands:
+
+```bash
+./run_all.sh rm                # start RM separately
+./run_all.sh kill rm           # stop RM
+./run_all.sh kill server 2     # crash S2 on its laptop
+./run_all.sh server 2          # manually restart S2 on its laptop
+./run_all.sh kill all          # run on each laptop to stop local processes
+```
+
+### Remaining team work
+
+| Owner | Work |
+|---|---|
+| Sonia + Chris | GFD registration, snapshots, membership and primary updates connected |
+| Nikhil + Sonia + Chris | Promotion/demotion connected to RM election and GFD client updates |
+| Chris | RM join sessions, donor assignment, completion validation, and ready acknowledgment |
+| Cristian + Chris | Admission, buffered recovery, and request-history transfer connected |
+| Joshua | Handle membership/primary changes and client reconnection |
+
+### Local integration checks
+
+```bash
+PYTHONPATH=src uv run python -m unittest discover -s tests -p test_admission_integration.py -v
+```
+
+The live-traffic tests run three replicas, three LFDs, three independent clients,
+GFD, and RM on loopback ports. They check active S1/S2 recovery, passive backup
+recovery, primary promotion, checkpoint continuation, complete request-number
+sequences, and exact final state counts. A separate lost-reply case verifies that
+a checkpointed request is not applied again after failover. These checks do not
+replace the four-laptop rehearsal.
+
+### Rehearsal checklist
+
+- [x] RM registration, membership tracking, and receiver tests.
+- [x] RM recovery protocol tested with simulated replicas.
+- [x] Connect server join/transfer/completion handlers and verify ready gating.
+- [x] RM launch commands, logs, and cleanup.
+- [x] Connect GFD; verify matching GFD/RM membership during startup and restart.
+- [x] Local active recovery: crash S1, keep survivors running, restart S1, synchronize
+      its state, and verify it resumes serving clients only when ready.
+- [x] Local passive primary failure: crash S1, promote S2, verify clients switch to S2
+      and S2 sends checkpoints to S3.
+- [x] Local passive backup recovery: with S1 primary, kill S2 and verify GFD/RM show
+      S1 and S3. Restart S2; verify LFD registration and restoration to three
+      members. S2 must apply S1's checkpoint before becoming ready, remain a
+      backup, and keep receiving checkpoints. Clients continue receiving S1's replies.
+- [x] Check request continuity and state consistency during all three local scenarios.
+- [ ] Repeat all three on four laptops with visible logs.
+
+### Tests
+
+RM tests use a simulated GFD. Older server/GFD tests need active mode because
+they expect every replica to answer requests.
+
+```bash
+uv run python -m unittest discover -s tests -p 'test_rm*.py' -v
+bash -n run_all.sh
+REPLICATION_MODE=active uv run python -m unittest discover -s tests -v
+```
 
 ## Project Milestones Roadmap
 - Milestone #1: Single stateful server replica (`S1`), 3 clients, and `LFD1` heartbeat monitoring.

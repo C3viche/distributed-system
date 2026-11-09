@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch helper for the M2 and M3 demos. Every process gets its own Terminal
+# Launch helper. Every process gets its own Terminal
 # window so Priya can watch each console, same as running the uv commands by
 # hand. The replication mode (active for M2, passive for M3) comes from
 # REPLICATION_MODE in .env; flipping that single value is enough to switch the
@@ -8,6 +8,10 @@
 #   ./run_all.sh local              everything on this Mac, in rubric order
 #   ./run_all.sh local m3           same, but force passive mode (M3) for this run
 #   ./run_all.sh local m2           same, but force active mode (M2) for this run
+#   ./run_all.sh local m4-active    active mode with RM
+#   ./run_all.sh local m4-passive   passive mode with RM
+#   ./run_all.sh rm                 client laptop: RM only
+#   ./run_all.sh infrastructure     client laptop: RM, then GFD
 #   ./run_all.sh gfd                client laptop: GFD only
 #   ./run_all.sh clients            client laptop: C1 C2 C3
 #   ./run_all.sh replica 2          replica laptop: LFD2 then S2
@@ -48,6 +52,7 @@ port_of() {
     local name="$1" var="${1}_PORT" value default
     case "$name" in
         GFD) default=9001 ;;
+        RM) default=9002 ;;
         S1) default=8080 ;; S2) default=8082 ;; S3) default=8083 ;;
         LFD1) default=8081 ;; LFD2) default=8084 ;; LFD3) default=8085 ;;
     esac
@@ -58,7 +63,7 @@ port_of() {
     echo "${value:-$default}"
 }
 
-usage() { sed -n '2,29p' "$0"; exit 1; }
+usage() { sed -n '2,/^set -u/{ /^set -u/d; p; }' "$0"; exit 1; }
 
 # Prepend a child-process env prefix so the terminal that runs `uv run ...`
 # inherits our shell overrides even when launched through osascript. config.py
@@ -105,6 +110,7 @@ EOF
             sleep 1
         done
         echo "could not open a Terminal window for $name"
+        return 1
     fi
 }
 
@@ -123,10 +129,34 @@ client_flags() {
     printf "%s" "$flags"
 }
 
-start_gfd()    { launch "GFD"   "$(env_prefix)uv run gfd --heartbeat_freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
-start_lfd()    { launch "LFD$1" "$(env_prefix)uv run lfd --id LFD$1 --heartbeat_freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
-start_server() { launch "S$1"   "$(env_prefix)uv run server --id S$1 $(server_flags)"; }
+start_rm()     { launch "RM"    "$(env_prefix)uv run rm"; }
+start_gfd()    { launch "GFD"   "$(env_prefix)uv run gfd --heartbeat-freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
+start_lfd()    { launch "LFD$1" "$(env_prefix)uv run lfd --id LFD$1 --heartbeat-freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
+start_server() { launch "S$1"   "$(env_prefix)uv run server --id S$1 $(server_flags) ${2:-}"; }
 start_client() { launch "C$1"   "$(env_prefix)uv run client --id C$1 $(client_flags)"; }
+
+# Wait for RM's listener before launching GFD.
+wait_for_rm() {
+    (cd "$ROOT" && uv run python - <<'PY'
+import socket
+import time
+from distributed_system.config import get_address
+
+host, port = get_address("RM")
+if host == "0.0.0.0":
+    host = "127.0.0.1"
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            break
+    except OSError:
+        time.sleep(0.1)
+else:
+    raise SystemExit("RM did not become reachable; inspect its console or logs/RM.log")
+PY
+    )
+}
 
 # Crash one of our processes by finding what is listening on its port.
 # Only kills something launched from this repo's .venv; anything else on the
@@ -172,6 +202,7 @@ check_ports_free() {
 
 kill_all() {
     kill_port GFD "$(port_of GFD)"
+    kill_port RM "$(port_of RM)"
     for n in 1 2 3; do
         kill_port "S$n" "$(port_of S$n)"
         kill_port "LFD$n" "$(port_of LFD$n)"
@@ -200,24 +231,48 @@ fi
 case "$1" in
     local)
         # Optional second arg forces the replication mode for this run only.
+        WITH_RM=0
         case "${2:-}" in
             m2|active)  export REPLICATION_MODE=active ;;
+            m4-active) export REPLICATION_MODE=active; WITH_RM=1 ;;
+            m4-passive)
+                export REPLICATION_MODE=passive
+                export PRIMARY_ID="${PRIMARY_ID:-S1}"
+                WITH_RM=1
+                ;;
             m3|passive)
                 export REPLICATION_MODE=passive
                 # Guide: S1 is primary because it is the first replica to show up.
                 export PRIMARY_ID="${PRIMARY_ID:-S1}"
                 ;;
             "")         ;;  # keep whatever REPLICATION_MODE / .env says
-            *) echo "unknown local mode: $2 (want m2|m3|active|passive)"; exit 1 ;;
+            *) echo "unknown local mode: $2 (want m2|m3|active|passive|m4-active|m4-passive)"; exit 1 ;;
         esac
         check_ports_free GFD LFD1 LFD2 LFD3 S1 S2 S3
+        if [ "$WITH_RM" = 1 ]; then
+            check_ports_free RM
+            echo "Fresh group: bootstrapping S1. Live-traffic catch-up and request deduplication are pending."
+            start_rm && wait_for_rm || exit 1
+        fi
         start_gfd;               sleep 1
         for n in 1 2 3; do start_lfd "$n"; done;    sleep 1
         # Start S1 first so, in passive mode, the primary can open its outbound
         # checkpoint channel to S2 and S3 as soon as their listen sockets exist.
-        for n in 1 2 3; do start_server "$n"; sleep 1; done
+        for n in 1 2 3; do
+            if [ "$WITH_RM" = 1 ] && [ "$n" = 1 ]; then
+                start_server "$n" --bootstrap
+            else
+                start_server "$n"
+            fi
+            sleep 1
+        done
         sleep 1
         for n in 1 2 3; do start_client "$n"; sleep 1; done
+        ;;
+    rm)       check_ports_free RM; start_rm ;;
+    infrastructure)
+        check_ports_free RM GFD
+        start_rm && wait_for_rm && start_gfd
         ;;
     gfd)      check_ports_free GFD; start_gfd ;;
     clients)  for n in 1 2 3; do start_client "$n"; sleep 1; done ;;
@@ -231,6 +286,7 @@ case "$1" in
             server) [ $# -eq 3 ] || usage; kill_port "S$3" "$(port_of S$3)" ;;
             lfd)    [ $# -eq 3 ] || usage; kill_port "LFD$3" "$(port_of LFD$3)" ;;
             gfd)    kill_port GFD "$(port_of GFD)" ;;
+            rm)     kill_port RM "$(port_of RM)" ;;
             client) [ $# -eq 3 ] || usage
                     # Clients don't listen on a port, so match the command line instead.
                     pattern="$ROOT/.venv/bin/client --id C$3( |\$)"

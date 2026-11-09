@@ -94,6 +94,7 @@ class ReplicationConfigIntegrationTests(unittest.TestCase):
     def test_removed_underscore_flags_and_invalid_frequency(self) -> None:
         for command, arguments in (
             ("client", ["--replication_mode", "passive"]),
+            ("client", ["--num_replicas", "1"]),
             ("server", ["--replication_mode", "passive"]),
             ("server", ["--checkpoint_freq", "2"]),
             *(
@@ -131,3 +132,13 @@ _parse_args()
                 )
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("error:", result.stderr)
+
+    def test_hyphenated_cli_help(self):
+        for module, option in (("client", "--num-replicas"),
+                               ("gfd.gfd", "--heartbeat-freq"),
+                               ("lfd.lfd", "--heartbeat-freq")):
+            result = subprocess.run([sys.executable, "-m", "distributed_system." + module, "--help"],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(option, result.stdout)
+            self.assertNotIn("--" + option[2:].replace("-", "_"), result.stdout)

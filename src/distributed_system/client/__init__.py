@@ -1,9 +1,9 @@
 """Client entry point for active and passive replication.
 
 Usage:
-    uv run client --id C1 --num_replicas 1
-    uv run client --id C2 --num_replicas 1 --interval 0.5
-    uv run client --id C3 --num_replicas 1 --count 5
+    uv run client --id C1 --num-replicas 1
+    uv run client --id C2 --num-replicas 1 --interval 0.5
+    uv run client --id C3 --num-replicas 1 --count 5
 
 The GFD supplies live replica IDs; config.py resolves their host/port values.
 """
@@ -39,7 +39,7 @@ def _parse_args() -> argparse.Namespace:
         help="Client identifier (C1, C2, C3, etc).",
     )
     _ = parser.add_argument(
-        "--num_replicas",
+        "--num-replicas",
         dest="num_replicas",
         type=_positive_int,
         default=None,
