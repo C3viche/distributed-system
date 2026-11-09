@@ -84,6 +84,18 @@ class ServerElectionTests(unittest.TestCase):
         self.assertEqual(server.role, "backup")
         self.assertEqual(server.primary_id, "S2")
 
+    def test_passive_servers_print_who_is_primary(self) -> None:
+        backup = self.make_server("S2")
+        primary = Server("S1", replication_mode="passive", primary_id="S1", bootstrap=True)
+        self.addCleanup(primary.sel.close)
+        primary._backups = {MagicMock(): "S3", MagicMock(): "S2"}
+        with patch("distributed_system.server.server.log") as log:
+            backup._print_role_if_time()
+            primary._print_role_if_time()
+            primary._print_role_if_time()
+        lines = [call.args[0] for call in log.call_args_list]
+        self.assertEqual(lines, ["S2 (backup): primary is S1", "S1 (primary): backups S2, S3"])
+
     def test_active_replicas_do_not_change_role(self) -> None:
         server = Server("S2", replication_mode="active")
         self.addCleanup(server.sel.close)

@@ -50,6 +50,10 @@ from distributed_system.config import (
 from distributed_system.server.election import backups_for, elect_primary
 
 
+# seconds between "who's primary" lines in passive mode
+ROLE_PRINT_INTERVAL = 5.0
+
+
 def lfd_id_for(replica_id: str) -> str:
     """Return the LFD that heartbeats this replica: S1→LFD1, S2→LFD2, S3→LFD3."""
     try:
@@ -125,6 +129,7 @@ class Server:
             1.0 / checkpoint_freq
         )  # seconds between checkpoints
         self._next_checkpoint: float = 0.0  # set when serve() starts
+        self._next_role_print: float = 0.0  # passive only, so the demo shows who's primary
 
         # other replicas: primary moves ids from _pending_backups to _backups (sock -> id)
         self._pending_backups: list[str] = []
@@ -165,6 +170,7 @@ class Server:
             self._maintain_connections()
             self._poll_connections()
             self._send_checkpoint_if_time()
+            self._print_role_if_time()
 
     def _start_listener(self) -> None:
         """Expose the replica port and start its clock without marking it ready."""
@@ -189,6 +195,7 @@ class Server:
 
         # start the checkpoint clock now that the server is actually running
         self._next_checkpoint = time.monotonic() + self._checkpoint_interval
+        self._next_role_print = time.monotonic() + ROLE_PRINT_INTERVAL
 
     def _maintain_connections(self) -> None:
         """Retry LFD, checkpoint, and RM channels while preserving readiness.
@@ -847,6 +854,8 @@ class Server:
             waits.append(max(0.0, self._next_backup_retry - time.monotonic()))
         if self.role == "primary":
             waits.append(max(0.0, self._next_checkpoint - time.monotonic()))
+        if self.replication_mode == "passive":
+            waits.append(max(0.0, self._next_role_print - time.monotonic()))
         return min(waits) if waits else None
 
     def _send_checkpoint_if_time(self) -> None:
@@ -858,6 +867,18 @@ class Server:
         # step from the old deadline not from now, otherwise the timer drifts
         while self._next_checkpoint <= now:
             self._next_checkpoint += self._checkpoint_interval
+
+    def _print_role_if_time(self) -> None:
+        """Every few seconds in passive mode, say who the primary is."""
+        now = time.monotonic()
+        if self.replication_mode != "passive" or now < self._next_role_print:
+            return
+        self._next_role_print = now + ROLE_PRINT_INTERVAL
+        if self.role == "primary":
+            backups = ", ".join(sorted(self._backups.values())) or "none"
+            log(f"{self.replica_id} (primary): backups {backups}", kind="membership")
+        else:
+            log(f"{self.replica_id} (backup): primary is {self.primary_id}", kind="membership")
 
     def _poll_connections(self) -> None:
         """Dispatch one batch of socket events, bounded by scheduled work."""
