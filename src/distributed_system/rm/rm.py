@@ -138,7 +138,9 @@ class ReplicationManager:
         if not token or token != state.recovery_id or not self._snapshot_received:
             self._send(sock, {"type": "recovery_rejected", "reason": "stale recovery"})
             return
-        state.ready = True
+        if not state.ready:
+            state.ready = True
+            log(f"RM: {replica} synchronized and ready", kind="state")
         self._bootstrapped = True
         self._send(sock, self._instruction(replica, state))
         self._coordinate()

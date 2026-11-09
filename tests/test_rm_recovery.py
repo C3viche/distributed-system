@@ -60,6 +60,8 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.receive(sock)["type"], "join_accepted")
         self.assertEqual(self.receive(sock)["type"], "ready")
 
+        self.assertEqual(self.logs().count("RM: S2 synchronized and ready"), 1)
+
     def test_waits_for_ready_donor(self):
         waiting = self.join("S2")
         self.send(waiting, {"type": "sync_complete", "replica_id": "S2", "recovery_id": "fake"})
