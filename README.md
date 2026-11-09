@@ -8,7 +8,7 @@ The overall system models an asynchronous distributed application split into nod
 - **Server Replicas (`S1`, `S2`, `S3`)**: Stateful, deterministic server nodes. Each server maintains internal state (`my_state`) and handles incoming client requests and heartbeat checks.
 - **Local Fault Detector (`LFD1`, `LFD2`, `LFD3`)**: Resides on the same physical/virtual host as its assigned server replica. Sends periodic heartbeats to monitor replica health and reports crashes.
 - **Global Fault Detector (`GFD`)**: Aggregates local health notifications from all LFDs, maintains central system group membership, and broadcasts membership updates.
-- **Replication Manager (`RM`)**: Tracks GFD liveness and coordinates replica joins and recovery. Server/GFD integration is pending; automatic replica relaunch is deferred to M5.
+- **Replication Manager (`RM`)**: Tracks GFD liveness and coordinates replica joins and recovery; automatic replica relaunch is deferred to M5.
 - **Clients (`C1`, `C2`, `C3`)**: Independent client processes issuing requests with unique `<client_id, replica_id, request_num>` tuples.
 
 ## Prerequisites & Installation
@@ -486,14 +486,16 @@ Console outputs are timestamped in UTC and the rest of the line is color-coded b
 
 ## Milestone #4: RM and Integration
 
-RM handles membership and recovery control, but GFD and servers do not connect to it yet. Until Sonia's sender is
-connected, RM stays at `RM: 0 members`. Checkpoint transfer and failover integration are still pending.
+The integration branch connects GFD membership, server admission, and RM readiness.
+Real-process tests cover fresh startup, active restart with traffic paused during
+transfer, and passive backup restart. Concurrent request catch-up, server promotion,
+and request deduplication remain unfinished.
 Automatic replica relaunch belongs to M5.
 
 ### RM protocol
 
 Run `uv run rm`, with optional `--host` and `--port` overrides. RM uses
-newline-delimited JSON. This message format still needs agreement with Sonia:
+newline-delimited JSON. GFD sends:
 
 ```json
 {"type":"register_gfd","gfd_id":"GFD"}
@@ -515,14 +517,12 @@ Membership does not indicate whether a recovering replica is ready to serve.
 
 ### Replica recovery protocol
 
-These messages are implemented on RM and tested with simulated replicas. The
-`initialize` and `recover`/`source_id` names follow Cristian’s proposed handler in
-`ce/state-transfer`. His server still needs the control connection, recovery token
-handling, completion reporting, and ready acknowledgment gating. Sonia’s
-`m4-gfd-rm` sender needs to include primary updates supplied by election logic. All control messages use the same JSON-line listener.
+Servers send `join_request`; RM also accepts `join` for compatibility with its
+existing receiver tests. GFD includes the current passive primary in snapshots
+and incremental updates. All control messages use the same JSON-line listener.
 
 1. A replica keeps a control connection to RM and sends
-   `{"type":"join","replica_id":"S2"}`. RM replies `join_accepted`. This does
+   `{"type":"join_request","replica_id":"S2"}`. RM replies `join_accepted`. This does
    not authorize serving requests; the replica waits for a recovery instruction.
 2. After GFD reports it alive and a ready donor is available, RM sends:
 
@@ -564,9 +564,10 @@ Once any replica has become ready, bootstrap cannot bypass recovery. Manual
 restarts must omit this flag. RM state is in memory: restarting RM during a live
 run is not supported by this protocol; restart the whole demo as a fresh cluster.
 
-RM coordinates the transfer but does not move checkpoints, verify server state,
-implement request catch-up, or broadcast ready membership to clients. Server
-readiness gating and client propagation remain integration work.
+RM coordinates the transfer; servers apply checkpoints and wait for its ready
+acknowledgment before becoming SYNCED. RM does not verify application state or
+broadcast ready membership to clients. Active catch-up, deduplication, and
+readiness-aware election still need implementation.
 
 
 ### Running M4
@@ -583,7 +584,8 @@ output goes to `logs/<process>.log`.
 
 Startup order is RM → GFD → LFDs → servers → clients. The script waits up to ten
 seconds for RM's listener before starting GFD. It does not check registration.
-Passive mode still uses the configured `PRIMARY_ID`.
+Passive servers still lack promotion handling. GFD primary announcements alone
+do not make a backup start serving.
 
 For four laptops, share a `.env` with reachable LAN addresses and the same
 `REPLICATION_MODE`. Point `RM_HOST` and `GFD_HOST` at laptop 4.
@@ -595,7 +597,13 @@ For four laptops, share a `.env` with reachable LAN addresses and the same
 | 2: LFD2, S2 | `./run_all.sh replica 2` |
 | 3: LFD3, S3 | `./run_all.sh replica 3` |
 
-Start infrastructure first, then replicas in order. Individual commands:
+Start infrastructure first, then replicas in order. On a fresh four-laptop run,
+start LFD1 with `./run_all.sh lfd 1`, then initialize the first server explicitly:
+`uv run server --id S1 --bootstrap`. Start S2/S3 normally. Local `m4-active` and
+`m4-passive` runs pass `--bootstrap` to S1 automatically; use these only for a
+fresh group. Individual server restart commands never pass that flag.
+
+Individual commands:
 
 ```bash
 ./run_all.sh rm                # start RM separately
@@ -609,19 +617,19 @@ Start infrastructure first, then replicas in order. Individual commands:
 
 | Owner | Work |
 |---|---|
-| Sonia | Agree GFD→RM messages; send registration, snapshots, and membership changes |
+| Sonia + Chris | GFD registration, snapshots, membership and primary updates connected |
 | Nikhil + Sonia | Agree who selects the primary and how promotion is announced |
 | Chris | RM join sessions, donor assignment, completion validation, and ready acknowledgment |
-| Cristian | Connect server recovery messages; transfer/catch up state and enforce readiness |
+| Cristian + Chris | Admission and readiness connected; concurrent request catch-up pending |
 | Joshua | Handle membership/primary changes and client reconnection |
 
 ### Rehearsal checklist
 
 - [x] RM registration, membership tracking, and receiver tests.
 - [x] RM recovery protocol tested with simulated replicas.
-- [ ] Connect server join/transfer/completion handlers and verify ready gating.
+- [x] Connect server join/transfer/completion handlers and verify ready gating.
 - [x] RM launch commands, logs, and cleanup.
-- [ ] Connect GFD; verify matching GFD/RM membership after add/delete/reconnect.
+- [x] Connect GFD; verify matching GFD/RM membership during startup and restart.
 - [ ] Active recovery: crash S1, keep survivors running, restart S1, synchronize
       its state, and verify it resumes serving clients only when ready.
 - [ ] Passive primary failure: crash S1, promote S2, verify clients switch to S2

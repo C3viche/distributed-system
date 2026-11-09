@@ -132,7 +132,7 @@ client_flags() {
 start_rm()     { launch "RM"    "$(env_prefix)uv run rm"; }
 start_gfd()    { launch "GFD"   "$(env_prefix)uv run gfd --heartbeat_freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
 start_lfd()    { launch "LFD$1" "$(env_prefix)uv run lfd --id LFD$1 --heartbeat_freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
-start_server() { launch "S$1"   "$(env_prefix)uv run server --id S$1 $(server_flags)"; }
+start_server() { launch "S$1"   "$(env_prefix)uv run server --id S$1 $(server_flags) ${2:-}"; }
 start_client() { launch "C$1"   "$(env_prefix)uv run client --id C$1 $(client_flags)"; }
 
 # Wait for RM's listener before launching GFD.
@@ -251,14 +251,21 @@ case "$1" in
         check_ports_free GFD LFD1 LFD2 LFD3 S1 S2 S3
         if [ "$WITH_RM" = 1 ]; then
             check_ports_free RM
-            echo "GFD forwarding, recovery, and failover integration are pending."
+            echo "Fresh group: bootstrapping S1. Live-traffic catch-up and primary failover are pending."
             start_rm && wait_for_rm || exit 1
         fi
         start_gfd;               sleep 1
         for n in 1 2 3; do start_lfd "$n"; done;    sleep 1
         # Start S1 first so, in passive mode, the primary can open its outbound
         # checkpoint channel to S2 and S3 as soon as their listen sockets exist.
-        for n in 1 2 3; do start_server "$n"; sleep 1; done
+        for n in 1 2 3; do
+            if [ "$WITH_RM" = 1 ] && [ "$n" = 1 ]; then
+                start_server "$n" --bootstrap
+            else
+                start_server "$n"
+            fi
+            sleep 1
+        done
         sleep 1
         for n in 1 2 3; do start_client "$n"; sleep 1; done
         ;;

@@ -1,6 +1,6 @@
 """Server replica for 18-749 (S1, S2, or S3).
 
-RM admission is a proposed interface: the current RM only accepts GFD reports.
+RM admits replicas through join requests and confirms synchronization.
 Active recovery pulls a point-in-time snapshot from the assigned donor before
 becoming SYNCED. Request-log catch-up during concurrent traffic is not yet
 implemented; recovery currently requires quiescent client traffic for consistency.
@@ -72,6 +72,7 @@ class Server:
         primary_id: str = PRIMARY_ID,
         checkpoint_freq: float = CHECKPOINT_FREQ,
         replica_status: ReplicaStatus = ReplicaStatus.UP,
+        bootstrap: bool = False,
     ):
         """Configure the replica and allocate local state without opening sockets.
 
@@ -89,6 +90,11 @@ class Server:
         self.primary_id: str = primary_id
         self.replica_id: str = replica_id
         self.lfd_id: str = lfd_id_for(replica_id)
+        if bootstrap and replica_id != primary_id:
+            raise ValueError("Only the initial primary can bootstrap a fresh group")
+        self.bootstrap = bootstrap
+        self._recovery_id: str | None = None
+        self._state_synced = False
         self.replica_status: ReplicaStatus = replica_status
         self.state: int = 0
         self._connections: dict[socket.socket, BufferedJsonConnection] = {}
@@ -188,31 +194,65 @@ class Server:
             self.try_connect_to_rm()
         self.try_connect_to_recovery_source()
 
-    # RM admission and recovery: proposed control protocol
+    # RM admission and recovery
 
     def handle_rm(self, msg: dict[str, object]) -> None:
-        """Handle proposed RM instructions, separately from state transfer.
-
-        initialize: explicitly authorize fresh startup with the initial state.
-        recover: select a source; remain UP until state transfer completes.
-        wait: remain UP while the RM decides how to admit this replica.
-        Active replicas pull snapshots directly from their assigned donor.
-        Promotion is not implemented here.
-        """
-        if self.replica_status != ReplicaStatus.UP:
-            return
+        """Apply admission instructions and acknowledge only the current attempt."""
         instruction = msg.get("type")
+        if instruction == "join_accepted":
+            return
+        if instruction == "wait":
+            self.wait_for_admission()
+            return
+        token = msg.get("recovery_id")
+        if instruction in {"recovery_cancelled", "recovery_rejected"}:
+            if token == self._recovery_id:
+                self.wait_for_admission()
+            return
+        if instruction == "ready":
+            if isinstance(token, str) and token == self._recovery_id and self._state_synced:
+                self.replica_status = ReplicaStatus.SYNCED
+                self.bootstrap = False
+                log(f"{self.replica_id}: RM confirmed readiness", kind="state")
+            return
+        if instruction not in {"initialize", "recover"}:
+            raise ValueError("Invalid RM join instruction")
+        if not isinstance(token, str) or not token:
+            raise ValueError("Recovery instruction requires a token")
+        if instruction == "recover":
+            source = msg.get("source_id")
+            if not isinstance(source, str) or source == self.replica_id or source not in get_server_addresses():
+                raise ValueError("Invalid RM recovery source")
+        if token == self._recovery_id:
+            if self._state_synced:
+                self._report_synced()
+            return
+        primary = msg.get("primary_id", self.primary_id)
+        if self.replication_mode == "passive":
+            if primary not in get_server_addresses():
+                raise ValueError("Passive recovery requires a current primary")
+            self.primary_id = primary
+            # Promotion of an existing backup remains separate integration work.
+            if primary != self.replica_id:
+                self.role = "backup"
+        self.wait_for_admission()
+        self._recovery_id = token
         if instruction == "initialize":
             self.initialize_replica()
-        elif instruction == "recover":
-            self.prepare_recovery(msg.get("source_id"))
-        elif instruction == "wait":
-            self.wait_for_admission()
         else:
-            raise ValueError("Invalid RM join instruction")
+            self.prepare_recovery(msg.get("source_id"))
+
+    def _report_synced(self) -> None:
+        """Report installed state; serving waits for RM's ready acknowledgment."""
+        self._state_synced = True
+        self.recovery_source_id = None
+        if self._rm is not None and self._recovery_id is not None:
+            self._send_json(self._rm, {"type": "sync_complete",
+                                      "replica_id": self.replica_id,
+                                      "recovery_id": self._recovery_id})
 
     def initialize_replica(self) -> None:
-        """Authorize the existing initial state: UP -> SYNCED on RM instruction.
+        """Install initial state and report completion, awaiting RM acknowledgment.
 
         Construction already set state to zero. This does not reset state and
         must not be used as a replacement for recovering an existing group.
@@ -224,8 +264,8 @@ class Server:
                 f"{self.replica_id}: initialization ignored; waiting for state synchronization"
             )
             return
-        self.replica_status = ReplicaStatus.SYNCED
-        log(f"{self.replica_id}: RM authorized fresh initialization", kind="info")
+        self._report_synced()
+        log(f"{self.replica_id}: initial state installed; awaiting RM", kind="info")
 
     def prepare_recovery(self, source_id: object) -> None:
         """Assign a donor; the serve loop starts/retries active snapshot pulls.
@@ -255,27 +295,29 @@ class Server:
         )
 
     def complete_recovery(self) -> None:
-        """Mark an active replica SYNCED after installing its donor's snapshot.
+        """Report an installed active snapshot and wait for RM acknowledgment.
 
         The snapshot handler calls this only after validating and installing state.
         This establishes the donor's state at snapshot time; catching up with
         concurrent client requests still requires a request-log protocol.
-        Passive backups become SYNCED through checkpoint application instead.
+        Passive backups report completion through checkpoint application instead.
         """
         if self.replication_mode != "active":
             raise ValueError("Active recovery completion requires active replication")
         if self.replica_status != ReplicaStatus.UP or self.recovery_source_id is None:
             raise ValueError("No active recovery in progress")
         source_id = self.recovery_source_id
-        self.recovery_source_id = None
-        self.replica_status = ReplicaStatus.SYNCED
+        self._report_synced()
         log(
-            f"{self.replica_id}: recovery from {source_id} complete; replica is SYNCED",
+            f"{self.replica_id}: recovery from {source_id} complete; awaiting RM",
             kind="state",
         )
 
     def wait_for_admission(self) -> None:
         """Clear the pending donor while staying UP and available for heartbeats."""
+        self.replica_status = ReplicaStatus.UP
+        self._state_synced = False
+        self._recovery_id = None
         self.recovery_source_id = None
         if self._recovery is not None:
             self._close_sock(self._recovery, "Recovery canceled by RM")
@@ -387,16 +429,18 @@ class Server:
         self.apply_checkpoint(my_state, checkpoint_count)
 
     def apply_checkpoint(self, my_state: int, checkpoint_count: int) -> None:
-        """Replace application state and mark it SYNCED after a valid checkpoint.
+        """Apply a checkpoint and report completion for an admitted recovery attempt.
 
         A synchronized backup still cannot serve clients: its role forbids it.
         This also handles subsequent periodic checkpoints while SYNCED.
         """
+        if self.replica_status != ReplicaStatus.SYNCED and self._recovery_id is None:
+            return
         previous_state = self.state
         self.state = my_state
         self.checkpoint_count = checkpoint_count
-        self.recovery_source_id = None
-        self.replica_status = ReplicaStatus.SYNCED  # replica is now synced
+        if self.replica_status != ReplicaStatus.SYNCED:
+            self._report_synced()
 
         log(
             f"{self.replica_id} applied checkpoint [{checkpoint_count}]: {self.primary_id}: my_state = {previous_state} -> {my_state}",
@@ -534,7 +578,7 @@ class Server:
         Like the client's GFD channel, this uses a bounded connection attempt,
         buffered asynchronous messages, and a one-second reconnect backoff.
         The RM owns membership decisions; this connection does not transfer state.
-        The join protocol still needs implementing in the RM receiver.
+        Completion is reported on this connection after state installation.
         """
         if self._rm is not None or time.monotonic() < self._rm_retry_at:
             return
@@ -564,6 +608,7 @@ class Server:
                 "replica_id": self.replica_id,
                 "replication_mode": self.replication_mode,
                 "status": self.replica_status.name,
+                "bootstrap": self.bootstrap,
             },
         )
         log(
@@ -761,7 +806,7 @@ class Server:
                 break
 
     def _close_sock(self, sock: socket.socket, why: str, kind: str = "failure") -> None:
-        """Remove a channel and schedule reconnection without changing readiness."""
+        """Remove a channel; losing RM revokes readiness until readmitted."""
         # have to unregister or select() keeps waking up on the dead socket
         _ = self.sel.unregister(sock)
         _ = self._connections.pop(sock, None)
@@ -781,6 +826,7 @@ class Server:
                 why = f"{why}; retrying recovery"
         elif sock is self._rm:
             self._rm = None
+            self.wait_for_admission()
             self._rm_retry_at = time.monotonic() + 1.0
             why = "lost connection to RM; will retry"
         elif backup_id:
@@ -826,6 +872,8 @@ def _parse_args() -> argparse.Namespace:
         help=f"checkpoints per second, primary only (default {CHECKPOINT_FREQ})",
     )
 
+    parser.add_argument("--bootstrap", action="store_true",
+                        help="initialize the first replica of a fresh group only")
     return parser.parse_args()
 
 
@@ -841,6 +889,7 @@ def main() -> None:
         replication_mode=cast(str, args.replication_mode),
         primary_id=cast(str, args.primary),
         checkpoint_freq=cast(float, args.checkpoint_freq),
+        bootstrap=args.bootstrap,
     )
     try:
         server.serve()

@@ -1,4 +1,4 @@
-"""Exercise the proposed RM control channel without a running manager."""
+"""Exercise admission and readiness gating over the server control channel."""
 
 # These tests deliberately inspect selector state and mock connection attempts.
 # pyright: reportPrivateUsage=false, reportAny=false
@@ -13,6 +13,14 @@ from distributed_system.server.server import Server
 
 
 class ServerRMTests(unittest.TestCase):
+    def acknowledge(self, server):
+        self.assertEqual(server.replica_status, ReplicaStatus.UP)
+        server.handle_rm({"type": "ready", "recovery_id": server._recovery_id})
+
+    def initialize(self, server):
+        server.handle_rm({"type": "initialize", "recovery_id": "initial"})
+        self.acknowledge(server)
+
     def make_server(self, replica_id: str = "S1", mode: str = "active") -> Server:
         server = Server(replica_id, replication_mode=mode, primary_id="S1")
         self.addCleanup(server.sel.close)
@@ -37,11 +45,13 @@ class ServerRMTests(unittest.TestCase):
                 "replica_id": "S1",
                 "replication_mode": "active",
                 "status": "UP",
+                "bootstrap": False,
             },
         )
         self.assertEqual(server.replica_status, ReplicaStatus.UP)
-        send_json(manager, {"type": "initialize"})
+        send_json(manager, {"type": "initialize", "recovery_id": "initial"})
         server._read_messages(replica, "rm")
+        self.acknowledge(server)
         self.assertEqual(server.replica_status, ReplicaStatus.SYNCED)
 
         manager.close()
@@ -51,7 +61,7 @@ class ServerRMTests(unittest.TestCase):
             server._read_messages(replica, "rm")
         self.assertIsNone(server._rm)
         self.assertEqual(server._rm_retry_at, 11.0)
-        self.assertEqual(server.replica_status, ReplicaStatus.SYNCED)
+        self.assertEqual(server.replica_status, ReplicaStatus.UP)
 
     def test_failed_connection_retries_after_backoff(self) -> None:
         server = self.make_server()
@@ -76,7 +86,7 @@ class ServerRMTests(unittest.TestCase):
 
     def test_recover_and_wait_do_not_authorize_serving(self) -> None:
         server = self.make_server()
-        server.handle_rm({"type": "recover", "source_id": "S2"})
+        server.handle_rm({"type": "recover", "recovery_id": "recovery", "source_id": "S2"})
         self.assertEqual(server.recovery_source_id, "S2")
         self.assertEqual(server.replica_status, ReplicaStatus.UP)
         server.handle_rm({"type": "wait"})
@@ -86,8 +96,8 @@ class ServerRMTests(unittest.TestCase):
     def test_invalid_instruction_preserves_status(self) -> None:
         server = self.make_server()
         messages: list[dict[str, object]] = [
-            {"type": "recover", "source_id": "S1"},
-            {"type": "recover", "source_id": "unknown"},
+            {"type": "recover", "recovery_id": "recovery", "source_id": "S1"},
+            {"type": "recover", "recovery_id": "recovery", "source_id": "unknown"},
             {"type": "recover"},
             {"type": "membership", "members": []},
         ]
@@ -99,7 +109,7 @@ class ServerRMTests(unittest.TestCase):
 
     def test_active_replica_serves_after_explicit_recovery_completion(self) -> None:
         server = self.make_server()
-        server.handle_rm({"type": "recover", "source_id": "S2"})
+        server.handle_rm({"type": "recover", "recovery_id": "recovery", "source_id": "S2"})
         peer = MagicMock(spec=socket.socket)
         request: dict[str, object] = {
             "type": "request",
@@ -114,6 +124,7 @@ class ServerRMTests(unittest.TestCase):
             # Simulate state installation by the future transfer implementation.
             server.state = 7
             server.complete_recovery()
+            self.acknowledge(server)
             self.assertEqual(server.state, 7)
             self.assertEqual(server.replica_status, ReplicaStatus.SYNCED)
             self.assertIsNone(server.recovery_source_id)
@@ -137,7 +148,7 @@ class ServerRMTests(unittest.TestCase):
         self.assertEqual(active.replica_status, ReplicaStatus.UP)
 
         backup = self.make_server(replica_id="S2", mode="passive")
-        backup.handle_rm({"type": "recover", "source_id": "S1"})
+        backup.handle_rm({"type": "recover", "recovery_id": "recovery", "source_id": "S1"})
         with self.assertRaises(ValueError):
             backup.complete_recovery()
         self.assertEqual(backup.replica_status, ReplicaStatus.UP)
@@ -152,6 +163,7 @@ class ServerRMTests(unittest.TestCase):
 
     def test_synced_backup_still_ignores_client_requests(self) -> None:
         server = self.make_server(replica_id="S2", mode="passive")
+        server.handle_rm({"type": "recover", "source_id": "S1", "recovery_id": "checkpoint"})
         server.handle_checkpoint(
             {
                 "type": "checkpoint",
@@ -181,7 +193,7 @@ class ServerRMTests(unittest.TestCase):
             send.assert_not_called()
             self.assertEqual(server.state, 0)
 
-            server.handle_rm({"type": "initialize"})
+            self.initialize(server)
             server.handle_client(peer, request)
             self.assertEqual(server.state, 1)
             self.assertIsNone(server.recovery_source_id)
@@ -198,18 +210,19 @@ class ServerRMTests(unittest.TestCase):
 
     def test_initialize_cannot_bypass_recovery_or_backup_checkpoint(self) -> None:
         active = self.make_server()
-        active.handle_rm({"type": "recover", "source_id": "S2"})
-        active.handle_rm({"type": "initialize"})
+        active.handle_rm({"type": "recover", "recovery_id": "recovery", "source_id": "S2"})
+        active.initialize_replica()
         self.assertEqual(active.replica_status, ReplicaStatus.UP)
         self.assertEqual(active.recovery_source_id, "S2")
         backup = self.make_server(replica_id="S2", mode="passive")
-        backup.handle_rm({"type": "initialize"})
+        backup.initialize_replica()
         self.assertEqual(backup.replica_status, ReplicaStatus.UP)
 
     def test_checkpoint_synchronizes_backup_without_authorizing_client_work(
         self,
     ) -> None:
         server = self.make_server(replica_id="S2", mode="passive")
+        server.handle_rm({"type": "recover", "source_id": "S1", "recovery_id": "checkpoint"})
         server.handle_checkpoint(
             {
                 "type": "checkpoint",
@@ -218,6 +231,7 @@ class ServerRMTests(unittest.TestCase):
                 "checkpoint_count": 3,
             }
         )
+        self.acknowledge(server)
         self.assertEqual(server.replica_status, ReplicaStatus.SYNCED)
         self.assertEqual(server.state, 7)
         self.assertEqual(server.checkpoint_count, 3)
@@ -232,3 +246,35 @@ class ServerRMTests(unittest.TestCase):
             )
         send.assert_not_called()
         self.assertEqual(server.state, 7)
+
+    def test_readiness_requires_current_completion_and_ack(self):
+        server = self.make_server()
+        server.handle_rm({"type": "initialize", "recovery_id": "current"})
+        self.assertEqual(server.replica_status, ReplicaStatus.UP)
+        with patch.object(server, "_send_json") as send:
+            server.handle_client(MagicMock(spec=socket.socket),
+                                 {"type": "request", "client_id": "C1", "request_num": 1})
+            send.assert_not_called()
+        for kind in ("ready", "recovery_rejected", "recovery_cancelled"):
+            server.handle_rm({"type": kind, "recovery_id": "old"})
+            self.assertEqual(server._recovery_id, "current")
+            self.assertEqual(server.replica_status, ReplicaStatus.UP)
+        server.handle_rm({"type": "ready", "recovery_id": "current"})
+        self.assertEqual(server.replica_status, ReplicaStatus.SYNCED)
+        server.handle_rm({"type": "recovery_cancelled", "recovery_id": "current"})
+        self.assertEqual(server.replica_status, ReplicaStatus.UP)
+        self.assertIsNone(server._recovery_id)
+
+    def test_completion_is_sent_to_rm_with_recovery_token(self):
+        server = self.make_server()
+        replica, manager = socket.socketpair()
+        self.addCleanup(replica.close)
+        self.addCleanup(manager.close)
+        manager.settimeout(1)
+        server._rm = replica
+        server._register(replica, "rm")
+        server.handle_rm({"type": "initialize", "recovery_id": "initial"})
+        server._write_pending(replica)
+        self.assertEqual(recv_json(manager), {"type": "sync_complete",
+                                             "replica_id": "S1", "recovery_id": "initial"})
+        self.assertEqual(server.replica_status, ReplicaStatus.UP)

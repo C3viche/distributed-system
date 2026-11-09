@@ -116,7 +116,7 @@ class ReplicationManager:
         if sock is self._gfd:
             raise ValueError("GFD cannot register as a replica")
         state = self.replicas.get(replica)
-        if message["type"] == "join":
+        if message["type"] in {"join", "join_request"}:
             bootstrap = message.get("bootstrap", False)
             if type(bootstrap) is not bool:
                 raise ValueError("bootstrap must be a boolean")
@@ -136,7 +136,8 @@ class ReplicationManager:
             raise ValueError("Replica must join on this connection first")
         token = message.get("recovery_id")
         if not token or token != state.recovery_id or not self._snapshot_received:
-            self._send(sock, {"type": "recovery_rejected", "reason": "stale recovery"})
+            self._send(sock, {"type": "recovery_rejected", "recovery_id": token,
+                              "reason": "stale recovery"})
             return
         if not state.ready:
             state.ready = True
@@ -152,7 +153,7 @@ class ReplicationManager:
         kind = message.get("type")
         if not isinstance(kind, str):
             raise ValueError("Expected a string message type")
-        if kind in {"join", "sync_complete"}:
+        if kind in {"join", "join_request", "sync_complete"}:
             self._handle_replica(sock, message)
             return
         if kind == "register_gfd":

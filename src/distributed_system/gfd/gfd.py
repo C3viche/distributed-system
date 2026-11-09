@@ -336,7 +336,10 @@ class GlobalFaultDetector:
         """Forward one add or delete. A down RM is caught up by the next snapshot."""
         if not self._rm_registered:
             return
-        self._queue_rm({"type": kind, "replica_id": replica_id})
+        message = {"type": kind, "replica_id": replica_id}
+        if REPLICATION_MODE == "passive":
+            message["primary_id"] = self.primary_id
+        self._queue_rm(message)
 
     def _queue_rm(self, message: dict[str, object]) -> None:
         if self._rm_sock is None or self._rm_conn is None or self._rm_connecting:
@@ -407,11 +410,7 @@ class GlobalFaultDetector:
         self._queue_rm({"type": "register_gfd", "gfd_id": "GFD"})
         if not self._rm_registered:
             return
-        self._queue_rm({
-            "type": "membership",
-            "members": list(self.membership),
-            "member_count": self.member_count,
-        })
+        self._queue_rm(self._client_membership())
         if self._rm_registered:
             log("GFD registered with RM", kind="registration")
 

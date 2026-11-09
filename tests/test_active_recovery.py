@@ -31,7 +31,7 @@ class ActiveRecoveryTests(unittest.TestCase):
 
     def start_pull(self, target: Server) -> tuple[socket.socket, socket.socket]:
         local, donor = self.channel()
-        target.handle_rm({"type": "recover", "source_id": "S2"})
+        target.handle_rm({"type": "recover", "source_id": "S2", "recovery_id": "transfer"})
         with patch(
             "distributed_system.server.server.socket.create_connection",
             return_value=local,
@@ -42,7 +42,8 @@ class ActiveRecoveryTests(unittest.TestCase):
     def test_pull_routes_request_installs_snapshot_and_completes_recovery(self) -> None:
         target = self.server("S1")
         donor = self.server("S2")
-        donor.initialize_replica()
+        donor.handle_rm({"type": "initialize", "recovery_id": "initial"})
+        donor.handle_rm({"type": "ready", "recovery_id": "initial"})
         donor.state = 7
         local, remote = self.start_pull(target)
         self.assertEqual(target.replica_status, ReplicaStatus.UP)
@@ -56,6 +57,8 @@ class ActiveRecoveryTests(unittest.TestCase):
         ) as complete:
             target._read_messages(local, "recovery")
         complete.assert_called_once_with()
+        self.assertEqual(target.replica_status, ReplicaStatus.UP)
+        target.handle_rm({"type": "ready", "recovery_id": "transfer"})
         self.assertEqual(target.state, 7)
         self.assertEqual(target.replica_status, ReplicaStatus.SYNCED)
         self.assertIsNone(target._recovery)
