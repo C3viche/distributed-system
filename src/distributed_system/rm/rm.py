@@ -24,6 +24,7 @@ class Recovery:
     recovery_id: str | None = None
     donor: str | None = None
     ready: bool = False
+    waiting_logged: bool = False
 
 
 class ReplicationManager:
@@ -89,14 +90,17 @@ class ReplicationManager:
                           if name in self.replicas and self.replicas[name].ready]
             # A recovering member must not displace a healthy primary.
             if self.primary_id not in candidates:
-                self.primary_id = candidates[0] if candidates else None
+                # nobody synchronized: fall back to PRIMARY_ID so it can bootstrap again
+                self.primary_id = candidates[0] if candidates else PRIMARY_ID
         self._publish_topology()
+        # active mode has no primary, so only passive gates bootstrap on it
+        primary_ok = REPLICATION_MODE == "active" or self.primary_id == PRIMARY_ID
         for replica, state in self.replicas.items():
             if state.ready:
                 continue
             donor = self.replicas.get(state.donor)
             valid = (self._snapshot_received and replica in self.membership
-                     and ((state.donor is None and self.primary_id == PRIMARY_ID) or (
+                     and ((state.donor is None and replica == PRIMARY_ID and primary_ok) or (
                          donor is not None and donor.ready
                          and (REPLICATION_MODE == "active"
                               or state.donor == self.primary_id))))
@@ -110,10 +114,17 @@ class ReplicationManager:
             candidates = [name for name, peer in self.replicas.items()
                           if peer.ready and name in self.membership and name != replica
                           and (REPLICATION_MODE == "active" or name == self.primary_id)]
-            bootstrap = (state.bootstrap and not self._bootstrapped
-                         and replica == PRIMARY_ID and self.primary_id == PRIMARY_ID)
+            # with nobody synchronized there's no state to lose, so S1 may bootstrap again
+            nobody_ready = not any(peer.ready for peer in self.replicas.values())
+            bootstrap = (state.bootstrap and nobody_ready
+                         and replica == PRIMARY_ID and primary_ok)
             if not candidates and not bootstrap:
+                if not state.waiting_logged:
+                    state.waiting_logged = True
+                    hint = f" (start {PRIMARY_ID} with --bootstrap)" if nobody_ready else ""
+                    log(f"RM: {replica} waiting for a ready donor{hint}", kind="info")
                 continue
+            state.waiting_logged = False
             state.donor = sorted(candidates)[0] if candidates else None
             state.recovery_id = uuid4().hex
             self._send(state.sock, self._instruction(replica, state))

@@ -130,13 +130,28 @@ class RecoveryTests(unittest.TestCase):
         self.assertNotEqual(previous["recovery_id"], current["recovery_id"])
         self.assertEqual(self.complete(sock, "S2", current)["type"], "ready")
 
-    def test_bootstrap_cannot_bypass_recovery_after_seed_was_ready(self):
+    def test_bootstrap_cannot_bypass_recovery_while_another_replica_is_ready(self):
+        seed = self.seed()
+        backup = self.join("S2")
+        self.assertEqual(self.complete(backup, "S2", self.receive(backup))["type"], "ready")
+        seed.close()
+        self.send(self.gfd, {"type": "delete_replica", "replica_id": "S1"})
+        self.send(self.gfd, {"type": "add_replica", "replica_id": "S1"})
+        restarted = self.join("S1", bootstrap=True)
+        self.assertEqual(self.receive(restarted)["source_id"], "S2")
+
+    def test_bootstrap_again_after_every_replica_died(self):
         seed = self.seed()
         seed.close()
+        self.send(self.gfd, {"type": "delete_replica", "replica_id": "S1"})
+        waiting = self.join("S2")
+        self.wait_for("RM: S2 waiting for a ready donor (start S1 with --bootstrap)")
+        self.send(self.gfd, {"type": "add_replica", "replica_id": "S1"})
         restarted = self.join("S1", bootstrap=True)
-        self.send(restarted, {"type": "sync_complete", "replica_id": "S1",
-                              "recovery_id": "fake"})
-        self.assertEqual(self.receive(restarted)["type"], "recovery_rejected")
+        instruction = self.receive(restarted)
+        self.assertEqual((instruction["type"], instruction["source_id"]), ("initialize", None))
+        self.assertEqual(self.complete(restarted, "S1", instruction)["type"], "ready")
+        self.assertEqual(self.receive(waiting)["source_id"], "S1")
 
     def test_removed_replica_cannot_complete_old_attempt(self):
         self.seed()
