@@ -302,6 +302,14 @@ class ClientTests(unittest.TestCase):
             self.snapshot(["S2"], primary_id="S2")
             self.assertTrue(self.client._has_request_target())
 
+    def test_active_waits_for_pending_connects(self) -> None:
+        self.client.replication_mode = "active"
+        with patch.object(self.client.conns, "alive", {"S1": object()}):
+            self.client.conns._connecting["S2"] = (MagicMock(), time.monotonic() + 1)
+            self.assertFalse(self.client._has_request_target())
+            del self.client.conns._connecting["S2"]
+            self.assertTrue(self.client._has_request_target())
+
     def test_loop_continues_after_timeout_and_counts_issued_requests(self) -> None:
         with (
             patch.object(self.client, "_has_request_target", return_value=True),

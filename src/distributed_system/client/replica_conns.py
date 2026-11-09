@@ -80,6 +80,10 @@ class ReplicaConnections:
                 log(f"{self.client_id} connection to {replica_id} timed out", kind="failure")
                 self.mark_dead(replica_id)
 
+    @property
+    def connecting(self) -> bool:
+        return bool(self._connecting)
+
     def sync_membership(self, members: list[str]) -> None:
         """Close removed peers and retry missing members with bounded backoff."""
         for replica_id in set(self.alive) | set(self._connecting):
