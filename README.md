@@ -517,8 +517,7 @@ Membership does not indicate whether a recovering replica is ready to serve.
 
 ### Replica recovery protocol
 
-Servers send `join_request`; RM also accepts `join` for compatibility with its
-existing receiver tests. RM chooses the first synchronized, live member as passive
+Servers send `join_request` to RM. RM chooses the first synchronized, live member as passive
 primary and sends the decision to servers and GFD. GFD forwards it to clients. All control messages use the same JSON-line listener.
 
 1. A replica keeps a control connection to RM and sends

@@ -35,7 +35,7 @@ class RecoveryTests(unittest.TestCase):
 
     def join(self, replica, bootstrap=False):
         sock = self.connect(register=False)
-        self.send(sock, {"type": "join", "replica_id": replica, "bootstrap": bootstrap})
+        self.send(sock, {"type": "join_request", "replica_id": replica, "bootstrap": bootstrap})
         self.assertEqual(self.receive(sock)["type"], "join_accepted")
         return sock
 
@@ -59,7 +59,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn("port", instruction["source_address"])
         self.assertEqual(self.complete(sock, "S2", instruction)["type"], "ready")
         self.assertEqual(self.complete(sock, "S2", instruction)["type"], "ready")
-        self.send(sock, {"type": "join", "replica_id": "S2"})
+        self.send(sock, {"type": "join_request", "replica_id": "S2"})
         self.assertEqual(self.receive(sock)["type"], "join_accepted")
         self.assertEqual(self.receive(sock)["type"], "ready")
 
