@@ -1,6 +1,11 @@
 """Server replica for 18-749 (S1, S2, or S3).
 
-Active mode: every replica handles every request.
+RM admission is a proposed interface: the current RM only accepts GFD reports.
+Active recovery pulls a point-in-time snapshot from the assigned donor before
+becoming SYNCED. Request-log catch-up during concurrent traffic is not yet
+implemented; recovery currently requires quiescent client traffic for consistency.
+
+Active mode: every synchronized replica handles every request.
 Passive mode: the configured primary opens a connection to each backup and
 sends a checkpoint of my_state every 1/checkpoint_freq seconds. A backup
 copies my_state and checkpoint_count from each checkpoint and does not answer
@@ -35,6 +40,7 @@ from distributed_system.config import (
     PRIMARY_ID,
     REPLICA_LFDS,
     REPLICATION_MODE,
+    ReplicaStatus,
     get_address,
     get_server_addresses,
 )
@@ -49,6 +55,15 @@ def lfd_id_for(replica_id: str) -> str:
 
 
 class Server:
+    """One replica's lifecycle, application state, and asynchronous channels.
+
+    Role (active/primary/backup) describes replication duties. ReplicaStatus
+    describes readiness: UP waits for admission/state; SYNCED has usable state.
+    Network availability and serving readiness are independent.
+    """
+
+    # Lifecycle: construction and the running event loop
+
     def __init__(
         self,
         replica_id: str,
@@ -56,7 +71,13 @@ class Server:
         replication_mode: str = REPLICATION_MODE,
         primary_id: str = PRIMARY_ID,
         checkpoint_freq: float = CHECKPOINT_FREQ,
+        replica_status: ReplicaStatus = ReplicaStatus.UP,
     ):
+        """Configure the replica and allocate local state without opening sockets.
+
+        The default UP status requires RM initialization or a checkpoint before
+        serving. An explicit replica_status is retained for existing callers.
+        """
         if replication_mode not in {"active", "passive"}:
             raise ValueError("replication_mode must be active or passive")
         if not math.isfinite(checkpoint_freq) or checkpoint_freq <= 0:
@@ -68,12 +89,13 @@ class Server:
         self.primary_id: str = primary_id
         self.replica_id: str = replica_id
         self.lfd_id: str = lfd_id_for(replica_id)
+        self.replica_status: ReplicaStatus = replica_status
         self.state: int = 0
         self._connections: dict[socket.socket, BufferedJsonConnection] = {}
         self._client_ids: dict[socket.socket, str] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
 
-        # here we define the type of server (role)
+        # Role is currently configured statically; RM promotion is not implemented.
         if replication_mode == "active":
             self.role: str = "active"  # M2: every replica handles every request
         elif replica_id == primary_id:
@@ -81,7 +103,7 @@ class Server:
         else:
             self.role = "backup"  # M3: ignores requests, receives checkpoints
 
-        # this section controls the checkpoint timer, only the primary uses it
+        # Replication state and primary-only checkpoint scheduling.
         self.checkpoint_count: int = 1
         self._checkpoint_interval: float = (
             1.0 / checkpoint_freq
@@ -108,6 +130,376 @@ class Server:
 
         # Outbound connection to the assigned LFD; None while we have no LFD.
         self._lfd: socket.socket | None = None
+        self._rm: socket.socket | None = None
+        self._rm_retry_at: float = 0.0
+        self.recovery_source_id: str | None = None
+        self._recovery: socket.socket | None = None
+        self._recovery_retry_at: float = 0.0
+        self._recovery_deadline: float | None = None
+
+    def serve(self) -> None:
+        """Start networking, then advance admission/recovery and serving together.
+
+        UP replicas still accept channels and answer heartbeats. Handlers decide
+        which work is allowed by readiness and role; the event loop never blocks
+        waiting for an RM instruction or a state transfer to finish.
+        """
+        self._start_listener()
+        while True:
+            self._maintain_connections()
+            self._poll_connections()
+            self._send_checkpoint_if_time()
+
+    def _start_listener(self) -> None:
+        """Expose the replica port and start its clock without marking it ready."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # lets us restart right after a ctrl-c instead of "address already in use"
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("0.0.0.0", self.port))
+        listener.listen()
+        log(
+            f"{self.replica_id} starting in {self.replication_mode} mode"
+            + (
+                f", primary={self.primary_id}"
+                if self.replication_mode == "passive"
+                else ""
+            )
+            + f", role={self.role}; waiting for clients on {self.host}:{self.port}",
+            kind="info",
+        )
+
+        # tag each socket so the loop knows what it's looking at
+        _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
+
+        # start the checkpoint clock now that the server is actually running
+        self._next_checkpoint = time.monotonic() + self._checkpoint_interval
+
+    def _maintain_connections(self) -> None:
+        """Retry LFD, checkpoint, and RM channels while preserving readiness.
+
+        Registering with LFD reports liveness. Joining RM requests admission.
+        Neither connection by itself authorizes client processing.
+        """
+        if self._lfd is None:
+            self.try_connect_to_lfd()
+        if self._pending_backups:
+            self.try_connect_to_backups()
+        if self._rm is None:
+            self.try_connect_to_rm()
+        self.try_connect_to_recovery_source()
+
+    # RM admission and recovery: proposed control protocol
+
+    def handle_rm(self, msg: dict[str, object]) -> None:
+        """Handle proposed RM instructions, separately from state transfer.
+
+        initialize: explicitly authorize fresh startup with the initial state.
+        recover: select a source; remain UP until state transfer completes.
+        wait: remain UP while the RM decides how to admit this replica.
+        Active replicas pull snapshots directly from their assigned donor.
+        Promotion is not implemented here.
+        """
+        if self.replica_status != ReplicaStatus.UP:
+            return
+        instruction = msg.get("type")
+        if instruction == "initialize":
+            self.initialize_replica()
+        elif instruction == "recover":
+            self.prepare_recovery(msg.get("source_id"))
+        elif instruction == "wait":
+            self.wait_for_admission()
+        else:
+            raise ValueError("Invalid RM join instruction")
+
+    def initialize_replica(self) -> None:
+        """Authorize the existing initial state: UP -> SYNCED on RM instruction.
+
+        Construction already set state to zero. This does not reset state and
+        must not be used as a replacement for recovering an existing group.
+        """
+        if self.replica_status != ReplicaStatus.UP:
+            return
+        if self.role == "backup" or self.recovery_source_id is not None:
+            log(
+                f"{self.replica_id}: initialization ignored; waiting for state synchronization"
+            )
+            return
+        self.replica_status = ReplicaStatus.SYNCED
+        log(f"{self.replica_id}: RM authorized fresh initialization", kind="info")
+
+    def prepare_recovery(self, source_id: object) -> None:
+        """Assign a donor; the serve loop starts/retries active snapshot pulls.
+
+        Passive backups keep receiving the configured primary's checkpoints.
+        Replacing a donor cancels the previous channel before accepting new state.
+        """
+        if (
+            not isinstance(source_id, str)
+            or source_id == self.replica_id
+            or source_id not in get_server_addresses()
+        ):
+            raise ValueError("Invalid RM recovery source")
+        if self.replication_mode == "passive" and source_id != self.primary_id:
+            raise ValueError("Passive recovery must use the configured primary")
+        if self.replica_status != ReplicaStatus.UP:
+            raise ValueError("Recovery requires an unsynchronized replica")
+        if source_id == self.recovery_source_id:
+            return
+        if self._recovery is not None:
+            self._close_sock(self._recovery, "Recovery donor reassigned")
+        self.recovery_source_id = source_id
+        self._recovery_retry_at = 0.0
+        log(
+            f"{self.replica_id}: RM selected recovery source {source_id}; waiting for state synchronization",
+            kind="info",
+        )
+
+    def complete_recovery(self) -> None:
+        """Mark an active replica SYNCED after installing its donor's snapshot.
+
+        The snapshot handler calls this only after validating and installing state.
+        This establishes the donor's state at snapshot time; catching up with
+        concurrent client requests still requires a request-log protocol.
+        Passive backups become SYNCED through checkpoint application instead.
+        """
+        if self.replication_mode != "active":
+            raise ValueError("Active recovery completion requires active replication")
+        if self.replica_status != ReplicaStatus.UP or self.recovery_source_id is None:
+            raise ValueError("No active recovery in progress")
+        source_id = self.recovery_source_id
+        self.recovery_source_id = None
+        self.replica_status = ReplicaStatus.SYNCED
+        log(
+            f"{self.replica_id}: recovery from {source_id} complete; replica is SYNCED",
+            kind="state",
+        )
+
+    def wait_for_admission(self) -> None:
+        """Clear the pending donor while staying UP and available for heartbeats."""
+        self.recovery_source_id = None
+        if self._recovery is not None:
+            self._close_sock(self._recovery, "Recovery canceled by RM")
+        log(f"{self.replica_id}: waiting for RM join instructions", kind="info")
+
+    def try_connect_to_recovery_source(self) -> None:
+        """Pull an active snapshot with a bounded connect and response deadline."""
+        if (
+            self.replication_mode != "active"
+            or self.replica_status != ReplicaStatus.UP
+            or self.recovery_source_id is None
+        ):
+            return
+        now = time.monotonic()
+        if self._recovery is not None:
+            if self._recovery_deadline is not None and now >= self._recovery_deadline:
+                self._close_sock(self._recovery, "Recovery snapshot timed out")
+            return
+        if now < self._recovery_retry_at:
+            return
+        try:
+            sock = socket.create_connection(
+                get_address(self.recovery_source_id), timeout=0.5
+            )
+        except OSError as exc:
+            self._recovery_retry_at = time.monotonic() + 1.0
+            log(
+                f"Recovery donor {self.recovery_source_id} unavailable: {exc}; retrying",
+                kind="failure",
+            )
+            return
+        self._recovery = sock
+        self._recovery_deadline = time.monotonic() + 2.0
+        self._register(sock, "recovery")
+        self._send_json(
+            sock,
+            {
+                "type": "recovery_request",
+                "replica_id": self.replica_id,
+                "source_id": self.recovery_source_id,
+            },
+        )
+
+    def handle_recovery_request(
+        self, sock: socket.socket, msg: dict[str, object]
+    ) -> None:
+        """Answer an active replica's pull request while the donor is SYNCED."""
+        requester = msg.get("replica_id")
+        if (
+            self.replication_mode != "active"
+            or self.replica_status != ReplicaStatus.SYNCED
+            or msg.get("type") != "recovery_request"
+            or msg.get("source_id") != self.replica_id
+            or not isinstance(requester, str)
+            or requester == self.replica_id
+            or requester not in get_server_addresses()
+        ):
+            raise ValueError("Invalid recovery request or unavailable donor")
+        self._send_json(
+            sock,
+            {
+                "type": "recovery_snapshot",
+                "replica_id": self.replica_id,
+                "target_id": requester,
+                "my_state": self.state,
+            },
+        )
+        log(
+            f"{self.replica_id}: sending recovery snapshot to {requester}: my_state={self.state}",
+            kind="checkpoint",
+        )
+
+    def handle_recovery_snapshot(
+        self, sock: socket.socket, msg: dict[str, object]
+    ) -> None:
+        """Install a valid snapshot from this attempt's donor, then finish recovery."""
+        state = msg.get("my_state")
+        if (
+            self.replication_mode != "active"
+            or self.replica_status != ReplicaStatus.UP
+            or self.recovery_source_id is None
+            or sock is not self._recovery
+            or msg.get("type") != "recovery_snapshot"
+            or msg.get("replica_id") != self.recovery_source_id
+            or msg.get("target_id") != self.replica_id
+            or type(state) is not int
+            or state < 0
+        ):
+            raise ValueError("Invalid recovery snapshot")
+        self.state = state
+        self.complete_recovery()
+        self._close_sock(sock, "Recovery snapshot installed", kind="state")
+
+    # State synchronization: passive checkpoint receive and publish
+
+    def handle_checkpoint(self, msg: dict[str, object]) -> None:
+        """Validate a checkpoint from the configured primary before applying it."""
+        if (
+            self.role != "backup"
+            or msg.get("type") != "checkpoint"
+            or msg.get("replica_id") != self.primary_id
+        ):
+            return
+        my_state = msg.get("my_state")
+        checkpoint_count = msg.get("checkpoint_count")
+        if type(my_state) is not int or type(checkpoint_count) is not int:
+            return
+
+        self.apply_checkpoint(my_state, checkpoint_count)
+
+    def apply_checkpoint(self, my_state: int, checkpoint_count: int) -> None:
+        """Replace application state and mark it SYNCED after a valid checkpoint.
+
+        A synchronized backup still cannot serve clients: its role forbids it.
+        This also handles subsequent periodic checkpoints while SYNCED.
+        """
+        previous_state = self.state
+        self.state = my_state
+        self.checkpoint_count = checkpoint_count
+        self.recovery_source_id = None
+        self.replica_status = ReplicaStatus.SYNCED  # replica is now synced
+
+        log(
+            f"{self.replica_id} applied checkpoint [{checkpoint_count}]: {self.primary_id}: my_state = {previous_state} -> {my_state}",
+            kind="checkpoint",
+        )
+
+    def send_checkpoint(self) -> None:
+        """Push my_state to every connected backup, print it, bump the count."""
+        if self.role != "primary" or self.replica_status != ReplicaStatus.SYNCED:
+            return
+        if not self._backups:
+            # nobody to send to, does'nt bump the count
+            log(
+                f"{self.replica_id}: no backups connected, checkpoint [{self.checkpoint_count}] skipped",
+                kind="checkpoint",
+            )
+            return
+        message: dict[str, object] = {
+            "type": "checkpoint",
+            "replica_id": self.replica_id,
+            "my_state": self.state,
+            "checkpoint_count": self.checkpoint_count,
+        }
+        for sock, backup_id in list(self._backups.items()):
+            self._send_json(sock, message)
+            log(
+                f"{self.replica_id} sending checkpoint [{self.checkpoint_count}] to {backup_id}: my_state={self.state}",
+                kind="checkpoint",
+            )
+        self.checkpoint_count += 1
+
+    # Serving: client admission, application mutation, and health checks
+
+    def handle_client(self, sock: socket.socket, msg: dict[str, object]) -> None:
+        """Gate client traffic by role/readiness, then execute and reply."""
+        if msg.get("type") != "request":
+            return
+
+        client = msg.get("client_id")
+        if isinstance(client, str) and client:
+            self._client_ids[sock] = client
+
+        if self.role == "backup":
+            log(
+                f"{self.replica_id} (backup): ignoring request from {client}",
+                kind="info",
+            )
+            return
+
+        # Check if the replica is actually synced before handling the client
+        if self.replica_status != ReplicaStatus.SYNCED:
+            log(
+                f"{self.replica_id}: ignore request while {self.replica_status.name}",
+                kind="info",
+            )
+            return
+
+        self.process_request(sock, msg)
+
+    def process_request(self, sock: socket.socket, msg: dict[str, object]) -> None:
+        """Increment application state and reply after handle_client admits a request.
+
+        This is the application mutation point. Admission belongs to
+        handle_client; repeated request numbers are not deduplicated.
+        """
+        client = msg.get("client_id")
+        req = msg.get("request_num")
+        payload = msg.get("payload", "")
+        log(f"Received <{client}, {self.replica_id}, {req}, {payload}>", kind="receive")
+        log(f"my_state = {self.state} before processing", kind="state")
+        self.state += 1
+        log(f"my_state = {self.state} after processing", kind="state")
+
+        reply = {
+            "type": "reply",
+            "client_id": client,
+            "replica_id": self.replica_id,
+            "request_num": req,
+            "state": self.state,
+        }
+        log(f"Sending <{client}, {self.replica_id}, {req}, reply>", kind="send")
+        self._send_json(sock, reply)
+
+    def handle_lfd(self, sock: socket.socket, msg: dict[str, object]) -> None:
+        """Answer health checks in both UP and SYNCED states."""
+        if msg.get("type") != "heartbeat":
+            return
+
+        count = msg.get("count")
+        log(
+            f"{self.replica_id} got heartbeat [{count}] from {self.lfd_id}",
+            kind="heartbeat",
+        )
+        self._send_json(
+            sock,
+            {"type": "heartbeat_ack", "replica_id": self.replica_id, "count": count},
+        )
+        log(
+            f"{self.replica_id} sent ack [{count}] back to {self.lfd_id}",
+            kind="heartbeat",
+        )
+
+    # Channel establishment: LFD liveness, RM admission, and backups
 
     def try_connect_to_lfd(self) -> None:
         """Attempt registration with the assigned LFD (up to one second).
@@ -135,6 +527,49 @@ class Server:
         self._register(s, "lfd")
         self._send_json(s, {"type": "registration", "replica_id": self.replica_id})
         log(f"{self.replica_id} registered with {self.lfd_id}", kind="registration")
+
+    def try_connect_to_rm(self) -> None:
+        """Open the RM control channel and request instructions for joining.
+
+        Like the client's GFD channel, this uses a bounded connection attempt,
+        buffered asynchronous messages, and a one-second reconnect backoff.
+        The RM owns membership decisions; this connection does not transfer state.
+        The join protocol still needs implementing in the RM receiver.
+        """
+        if self._rm is not None or time.monotonic() < self._rm_retry_at:
+            return
+        rm_host, rm_port = get_address("RM")
+        log(
+            f"{self.replica_id} trying to connect to RM at {rm_host}:{rm_port}",
+            kind="info",
+        )
+        try:
+            # Short timeout bounds the TCP handshake if the RM is unreachable.
+            s = socket.create_connection((rm_host, rm_port), timeout=1.0)
+        except OSError as exc:
+            log(
+                f"{self.replica_id} could not reach RM ({exc}); retrying in 1s",
+                kind="failure",
+            )
+            self._rm_retry_at = time.monotonic() + 1.0
+            return
+
+        self._rm = s
+        self._register(s, "rm")
+        # This request identifies the replica and asks the RM how it should join.
+        self._send_json(
+            s,
+            {
+                "type": "join_request",
+                "replica_id": self.replica_id,
+                "replication_mode": self.replication_mode,
+                "status": self.replica_status.name,
+            },
+        )
+        log(
+            f"{self.replica_id} requested join instructions from RM",
+            kind="registration",
+        )
 
     def try_connect_to_backups(self) -> None:
         """Open the checkpoint channel to one backup. One try per second so a slow host
@@ -168,35 +603,27 @@ class Server:
             kind="registration",
         )
 
-    def send_checkpoint(self) -> None:
-        """Push my_state to every connected backup, print it, bump the count."""
-        if not self._backups:
-            # nobody to send to, does'nt bump the count
-            log(
-                f"{self.replica_id}: no backups connected, checkpoint [{self.checkpoint_count}] skipped",
-                kind="checkpoint",
-            )
-            return
-        message: dict[str, object] = {
-            "type": "checkpoint",
-            "replica_id": self.replica_id,
-            "my_state": self.state,
-            "checkpoint_count": self.checkpoint_count,
-        }
-        for sock, backup_id in list(self._backups.items()):
-            self._send_json(sock, message)
-            log(
-                f"{self.replica_id} sending checkpoint [{self.checkpoint_count}] to {backup_id}: my_state={self.state}",
-                kind="checkpoint",
-            )
-        self.checkpoint_count += 1
+    # Event scheduling and socket transport
 
     def _seconds_until_next_wakeup(self) -> float | None:
-        # no threads, so the select() timeout is the only clock. 1s while retrying a
-        # connection, until the next checkpoint on the primary, None (forever) otherwise
+        """Wake for the earliest connection retry or checkpoint deadline."""
         waits: list[float] = []
         if self._lfd is None:
             waits.append(1.0)
+        if self._rm is None:
+            waits.append(max(0.0, self._rm_retry_at - time.monotonic()))
+        if (
+            self.replication_mode == "active"
+            and self.replica_status == ReplicaStatus.UP
+            and self.recovery_source_id is not None
+        ):
+            deadline = (
+                self._recovery_deadline
+                if self._recovery is not None
+                else self._recovery_retry_at
+            )
+            if deadline is not None:
+                waits.append(max(0.0, deadline - time.monotonic()))
         if self._pending_backups:
             waits.append(max(0.0, self._next_backup_retry - time.monotonic()))
         if self.role == "primary":
@@ -204,7 +631,7 @@ class Server:
         return min(waits) if waits else None
 
     def _send_checkpoint_if_time(self) -> None:
-        # the other half of the timer: runs once per loop, after select() wakes up
+        """Run the primary's checkpoint timer without drifting its deadline."""
         now = time.monotonic()
         if self.role != "primary" or now < self._next_checkpoint:
             return
@@ -213,75 +640,48 @@ class Server:
         while self._next_checkpoint <= now:
             self._next_checkpoint += self._checkpoint_interval
 
-    def handle_lfd(self, sock: socket.socket, msg: dict[str, object]) -> None:
-        if msg.get("type") != "heartbeat":
-            return
+    def _poll_connections(self) -> None:
+        """Dispatch one batch of socket events, bounded by scheduled work."""
+        for key, events in self.sel.select(timeout=self._seconds_until_next_wakeup()):
+            if not isinstance(key.fileobj, socket.socket):
+                continue
+            sock = key.fileobj
+            kind = cast(str, key.data)
+            if kind == "listener":
+                self._accept_connection(sock)
+            else:
+                self._handle_socket_event(sock, kind, events)
 
-        count = msg.get("count")
+    def _accept_connection(self, listener: socket.socket) -> None:
+        """Accept a peer; primary registration can later relabel its channel."""
+        conn, client_addr = cast(
+            tuple[socket.socket, tuple[str, int]], listener.accept()
+        )
+        self._register(conn, "client")
         log(
-            f"{self.replica_id} got heartbeat [{count}] from {self.lfd_id}",
-            kind="heartbeat",
-        )
-        self._send_json(
-            sock,
-            {"type": "heartbeat_ack", "replica_id": self.replica_id, "count": count},
-        )
-        log(
-            f"{self.replica_id} sent ack [{count}] back to {self.lfd_id}",
-            kind="heartbeat",
+            f"new client connection from {client_addr[0]}:{client_addr[1]}",
+            kind="registration",
         )
 
-    def handle_client(self, sock: socket.socket, msg: dict[str, object]) -> None:
-        if msg.get("type") != "request":
-            return
-
-        client = msg.get("client_id")
-        if isinstance(client, str) and client:
-            self._client_ids[sock] = client
-        req = msg.get("request_num")
-        payload = msg.get("payload", "")
-
-        if self.role == "backup":
-            log(
-                f"{self.replica_id} (backup): ignoring request from {client}",
-                kind="info",
-            )
-            return
-
-        log(f"Received <{client}, {self.replica_id}, {req}, {payload}>", kind="receive")
-        log(f"my_state = {self.state} before processing", kind="state")
-        self.state += 1
-        log(f"my_state = {self.state} after processing", kind="state")
-
-        reply = {
-            "type": "reply",
-            "client_id": client,
-            "replica_id": self.replica_id,
-            "request_num": req,
-            "state": self.state,
-        }
-        log(f"Sending <{client}, {self.replica_id}, {req}, reply>", kind="send")
-        self._send_json(sock, reply)
-
-    def handle_checkpoint(self, msg: dict[str, object]) -> None:
-        if msg.get("type") != "checkpoint" or msg.get("replica_id") != self.primary_id:
-            return
-        my_state = msg.get("my_state")
-        checkpoint_count = msg.get("checkpoint_count")
-        if type(my_state) is not int or type(checkpoint_count) is not int:
-            return
-        self.state = my_state
-        self.checkpoint_count = checkpoint_count
-        log(
-            f"{self.replica_id} received checkpoint from {self.primary_id}: my_state = {my_state}, checkpoint_count = {checkpoint_count}",
-            kind="checkpoint",
-        )
+    def _handle_socket_event(self, sock: socket.socket, kind: str, events: int) -> None:
+        """Read/flush one peer and isolate channel failures from the server loop."""
+        try:
+            if events & selectors.EVENT_READ:
+                self._read_messages(sock, kind)
+            if sock in self._connections and events & selectors.EVENT_WRITE:
+                self._write_pending(sock)
+        except BlockingIOError:
+            pass  # Try again when the selector reports readiness.
+        except (OSError, ValueError) as exc:
+            self._close_sock(sock, f"Connection lost: {exc}")
 
     def _register(self, sock: socket.socket, kind: str) -> None:
+        """Attach JSON buffers and a routing label to a connected socket."""
         self._connections[sock] = BufferedJsonConnection(sock)
         _ = self.sel.register(sock, selectors.EVENT_READ, kind)
 
     def _relabel_socket(self, sock: socket.socket, kind: str) -> None:
+        """Change message routing without disturbing pending read/write events."""
         # every socket in the selector carries a label ("lfd", "client", "backup", "primary")
         # that _read_messages uses to route its messages. the primary connects to a backup
         # through the normal listen port, so it gets labelled "client" on accept. once
@@ -291,6 +691,7 @@ class Server:
         _ = self.sel.modify(sock, key.events, kind)
 
     def _send_json(self, sock: socket.socket, message: dict[str, object]) -> None:
+        """Queue a message and request write readiness; never block on output."""
         self._connections[sock].queue(message)
         key = self.sel.get_key(sock)
         _ = self.sel.modify(
@@ -298,6 +699,7 @@ class Server:
         )
 
     def _write_pending(self, sock: socket.socket) -> None:
+        """Flush buffered output, preserving the socket's latest routing label."""
         connection = self._connections[sock]
         connection.flush()
         if not connection.has_pending_output:
@@ -307,6 +709,7 @@ class Server:
             )
 
     def _read_messages(self, sock: socket.socket, kind: str) -> None:
+        """Decode complete messages and route them to protocol handlers."""
         messages = self._connections[sock].receive()
         if messages is None:
             if kind == "lfd":
@@ -316,20 +719,32 @@ class Server:
                 why = f"lost checkpoint channel to {self._backups.get(sock, '?')}"
             elif kind == "primary":
                 why = "lost connection to primary"
+            elif kind == "rm":
+                why = "lost connection to replication manager"
             else:
                 why = "client disconnected"
             self._close_sock(sock, why)
             return
-        
+
         for raw_message in messages:
             if not isinstance(raw_message, dict):
                 raise ValueError("Expected a JSON object")  # noqa: TRY004 - close malformed peer
             msg = cast(dict[str, object], raw_message)
             if kind == "lfd":
                 self.handle_lfd(sock, msg)
+            elif kind == "rm":
+                self.handle_rm(msg)
+            elif kind == "recovery":
+                self.handle_recovery_snapshot(sock, msg)
+            elif kind == "recovery_peer" or (
+                kind == "client" and msg.get("type") == "recovery_request"
+            ):
+                self.handle_recovery_request(sock, msg)
+                self._relabel_socket(sock, "recovery_peer")
+                kind = "recovery_peer"
             elif kind == "backup":
                 pass  # primary's outbound channel. backups don't send anything back
-            elif (self.role == "backup" and msg.get("type") == "register_primary"):
+            elif self.role == "backup" and msg.get("type") == "register_primary":
                 # this accepted socket is the primary. later messages on it are checkpoints,
                 # including one that arrived in this same read.
                 self._relabel_socket(sock, "primary")
@@ -342,8 +757,11 @@ class Server:
                 self.handle_checkpoint(msg)
             else:
                 self.handle_client(sock, msg)
+            if sock not in self._connections:
+                break
 
-    def _close_sock(self, sock: socket.socket, why: str):
+    def _close_sock(self, sock: socket.socket, why: str, kind: str = "failure") -> None:
+        """Remove a channel and schedule reconnection without changing readiness."""
         # have to unregister or select() keeps waking up on the dead socket
         _ = self.sel.unregister(sock)
         _ = self._connections.pop(sock, None)
@@ -352,6 +770,19 @@ class Server:
         sock.close()
         if sock is self._lfd:
             self._lfd = None  # serve loop will try to re-register
+        elif sock is self._recovery:
+            self._recovery = None
+            self._recovery_deadline = None
+            if (
+                self.replica_status == ReplicaStatus.UP
+                and self.recovery_source_id is not None
+            ):
+                self._recovery_retry_at = time.monotonic() + 1.0
+                why = f"{why}; retrying recovery"
+        elif sock is self._rm:
+            self._rm = None
+            self._rm_retry_at = time.monotonic() + 1.0
+            why = "lost connection to RM; will retry"
         elif backup_id:
             # backup died, put it back in the queue so we reconnect if it comes back up
             self._pending_backups.append(backup_id)
@@ -360,71 +791,7 @@ class Server:
             why = f"{client_id} disconnected"
         elif client_id and why.startswith("Connection lost"):
             why = f"{client_id} disconnected ({why})"
-        log(why, kind="failure")
-
-    def serve(self):
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # lets us restart right after a ctrl-c instead of "address already in use"
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("0.0.0.0", self.port))
-        listener.listen()
-        log(
-            f"{self.replica_id} starting in {self.replication_mode} mode"
-            + (
-                f", primary={self.primary_id}"
-                if self.replication_mode == "passive"
-                else ""
-            )
-            + f", role={self.role}; waiting for clients on {self.host}:{self.port}",
-            kind="info",
-        )
-
-        # tag each socket so the loop knows what it's looking at
-        _ = self.sel.register(listener, selectors.EVENT_READ, "listener")
-
-        # start the checkpoint clock now that the server is actually running
-        self._next_checkpoint = time.monotonic() + self._checkpoint_interval
-
-        while True:
-            if self._lfd is None:
-                self.try_connect_to_lfd()
-            if self._pending_backups:
-                self.try_connect_to_backups()
-
-            for key, events in self.sel.select(
-                timeout=self._seconds_until_next_wakeup()
-            ):
-                # Safely narrow key.fileobj to socket.socket
-                if not isinstance(key.fileobj, socket.socket):
-                    continue
-
-                sock: socket.socket = key.fileobj
-                data = cast(str, key.data)
-
-                if data == "listener":
-                    conn, client_addr = cast(
-                        tuple[socket.socket, tuple[str, int]], listener.accept()
-                    )
-
-                    self._register(conn, "client")
-                    log(
-                        f"new client connection from {client_addr[0]}:{client_addr[1]}",
-                        kind="registration",
-                    )
-
-                else:
-                    try:
-                        if events & selectors.EVENT_READ:
-                            self._read_messages(sock, data)
-                        if sock in self._connections and events & selectors.EVENT_WRITE:
-                            self._write_pending(sock)
-                    except BlockingIOError:
-                        pass  # Try again when the selector reports readiness.
-                    except (OSError, ValueError) as exc:
-                        self._close_sock(sock, f"Connection lost: {exc}")
-
-            # after handling whatever woke select() up, see if it's checkpoint time
-            self._send_checkpoint_if_time()
+        log(why, kind=kind)
 
 
 def positive_float(text: str) -> float:
