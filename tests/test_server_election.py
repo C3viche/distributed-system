@@ -147,3 +147,26 @@ class ServerElectionTests(unittest.TestCase):
         server.handle_rm({"type": "membership", "members": ["S2", "S3"],
                           "member_count": 2, "primary_id": manager.primary_id})
         self.assertEqual(server.role, "primary")
+
+    def test_rm_keeps_ready_primary_when_earlier_members_finish_recovery(self):
+        from distributed_system.rm.rm import Recovery, ReplicationManager
+        manager = ReplicationManager()
+        self.addCleanup(manager._selector.close)
+        manager.membership = ["S2", "S3", "S1"]
+        manager.primary_id = "S1"
+        manager.replicas = {name: Recovery(MagicMock(), ready=True)
+                            for name in manager.membership}
+        manager._bootstrapped = True
+        manager._snapshot_received = True
+        with patch("distributed_system.rm.rm.REPLICATION_MODE", "passive"), patch.object(manager, "_send"):
+            manager._coordinate()
+            self.assertEqual(manager.primary_id, "S1")
+            # Losing readiness still triggers election among eligible replicas.
+            manager.replicas["S1"].ready = False
+            manager._coordinate()
+            self.assertEqual(manager.primary_id, "S2")
+            # Recovery of S1 must not displace the new primary either.
+            manager.replicas["S1"].ready = True
+            manager.membership = ["S1", "S3", "S2"]
+            manager._coordinate()
+            self.assertEqual(manager.primary_id, "S2")

@@ -257,3 +257,35 @@ class AdmissionIntegrationTests(unittest.TestCase):
         self.assertEqual(self.request("S1", 46), 136)
         for replica in ("S2", "S3"):
             self.wait_for(replica, "-> 136")
+
+    def test_backups_start_before_bootstrap_without_displacing_primary(self):
+        self.env["REPLICATION_MODE"] = "passive"
+        self.start("RM", "distributed_system.rm.rm")
+        self.wait_for("RM", "RM listening")
+        self.start("GFD", "distributed_system.gfd.gfd", "--heartbeat-freq", "10", "--timeout", "3")
+        self.wait_for("RM", "GFD registered")
+        for name in ("LFD1", "LFD2", "LFD3"):
+            self.start(name, "distributed_system.lfd.lfd", "--id", name,
+                       "--heartbeat-freq", "10", "--timeout", "3")
+        self.start("S2", "distributed_system.server.server", "--id", "S2")
+        self.wait_for("RM", "RM: 1 member: S2")
+        self.start("S3", "distributed_system.server.server", "--id", "S3")
+        self.wait_for("RM", "RM: 2 members: S2, S3")
+        for replica in ("S2", "S3"):
+            self.assertNotIn("RM confirmed readiness", self.output(replica))
+        self.start("S1", "distributed_system.server.server", "--id", "S1", "--bootstrap",
+                   "--checkpoint-freq", "10")
+        for replica in ("S1", "S2", "S3"):
+            self.wait_for(replica, "RM confirmed readiness")
+        # A GFD client snapshot verifies the selected primary after all are ready.
+        with socket.create_connection(("127.0.0.1", self.ports["GFD"]), timeout=3) as sock:
+            sock.sendall(b'{"type":"register_client","client_id":"startup-check"}\n')
+            with sock.makefile("rb") as stream:
+                snapshot = json.loads(stream.readline())
+        self.assertEqual(snapshot["primary_id"], "S1")
+        self.assertEqual(set(snapshot["members"]), {"S1", "S2", "S3"})
+        self.assertEqual(self.request("S1", 1), 1)
+        for replica in ("S2", "S3"):
+            self.wait_for(replica, "my_state = 0 -> 1")
+            self.assertNotIn("promoted to primary", self.output(replica))
+        self.assertNotIn("role: primary → backup", self.output("S1"))

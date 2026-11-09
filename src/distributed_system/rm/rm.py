@@ -87,7 +87,9 @@ class ReplicationManager:
         if REPLICATION_MODE == "passive" and self._bootstrapped:
             candidates = [name for name in self.membership
                           if name in self.replicas and self.replicas[name].ready]
-            self.primary_id = candidates[0] if candidates else None
+            # A recovering member must not displace a healthy primary.
+            if self.primary_id not in candidates:
+                self.primary_id = candidates[0] if candidates else None
         self._publish_topology()
         for replica, state in self.replicas.items():
             if state.ready:
