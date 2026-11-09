@@ -27,6 +27,8 @@ class ReplicaConnections:
         self._retry_at: dict[str, float] = {}
         self._last_finished: int = 0
         self._last_completed: int = 0
+        # True when the last request lost every target before a reply and should be resent.
+        self.held: bool = False
 
     def connect_all(self, members: list[str] | None = None) -> None:
         """Start connections without waiting for unavailable replicas."""
@@ -116,6 +118,7 @@ class ReplicaConnections:
     def _send_to(self, targets: list[str], request_num: int,
                  payload: str) -> dict[str, object] | None:
         """Sends payload to a directed target n number of times and returns a reply if received"""
+        self.held = False
         if not targets:
             return None
         for replica_id in targets:
@@ -127,16 +130,20 @@ class ReplicaConnections:
             _ = self._selector.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, replica_id)
             log(f"Sent <{self.client_id}, {replica_id}, {request_num}, {payload}>", kind="send")
         reply = self._receive_until(time.monotonic() + self.timeout, request_num, set(targets))
-        self._last_finished = request_num
         if reply is None:
-            log(f"request_num {request_num}: no reply from {', '.join(targets)}; continuing",
-                kind="failure")
             # A timed-out queued write must not accumulate or execute much later.
             # Drop only connections that still have unsent bytes.
             for replica_id in targets:
                 sock = self.alive.get(replica_id)
                 if sock is not None and self._connections[sock].has_pending_output:
                     self.mark_dead(replica_id)
+            # all targets died, hold the number so the resend's reply isn't dropped as late
+            self.held = not set(targets).intersection(self.alive)
+            if self.held:
+                return None
+            log(f"request_num {request_num}: no reply from {', '.join(targets)}; continuing",
+                kind="failure")
+        self._last_finished = request_num
         return reply
 
     def receive_pending(self, duration: float) -> None:

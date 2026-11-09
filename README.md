@@ -375,8 +375,11 @@ The optional field format, for Milestone #4:
 ```
 
 A client request without a reply within its timeout is logged and the next
-request uses a fresh number; requests are not replayed because the current
-server does not deduplicate operations, and late replies are discarded. If the
+request uses a fresh number, and late replies are discarded. The exception is
+when every target dies mid-request (e.g. the primary is killed): the client
+holds that `request_num` and resends it once GFD names a live primary. The
+server doesn't deduplicate yet, so if the old primary ran it and checkpointed
+before dying, the new primary applies it twice. If the
 primary is unreachable, the client keeps looping, retries its connections on a
 one-second backoff, and waits for either reconnection or a GFD snapshot that
 changes the assignment. Clients never promote a backup themselves.

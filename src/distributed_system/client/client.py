@@ -43,6 +43,7 @@ class Client:
         self.count: int | None = count  # None -> loop until Ctrl-C
         self.payload_template: str = payload_template
         self.request_num: int = 1
+        self._holding: bool = False
         self.conns: ReplicaConnections = ReplicaConnections(
             client_id, replicas=self.replicas
         )
@@ -195,6 +196,10 @@ class Client:
                 self._wait_between_requests()
                 continue
             _ = self._send_and_await_reply()
+            if self.conns.held:
+                # Same request_num goes out once GFD names a live target.
+                self._wait_between_requests()
+                continue
             sent += 1
             if self.count is None or sent < self.count:
                 self._wait_between_requests()
@@ -211,10 +216,23 @@ class Client:
             client_id=self.client_id,
             request_num=self.request_num,
         )
+        target = "all replicas" if self.replication_mode == "active" else self.primary_id
+        if self._holding:
+            log(
+                f"{self.client_id}: resending request_num {self.request_num} to {target}",
+                kind="send",
+            )
         if self.replication_mode == "active":
             reply = self.conns.send_active(self.request_num, payload)
         else:
             assert self.primary_id is not None
             reply = self.conns.send_passive(self.request_num, payload, self.primary_id)
+        self._holding = self.conns.held
+        if self._holding:
+            log(
+                f"{self.client_id}: lost {target} mid-request, holding request_num {self.request_num}",
+                kind="failure",
+            )
+            return False
         self.request_num += 1
         return reply is not None
