@@ -142,7 +142,8 @@ class AdmissionIntegrationTests(unittest.TestCase):
             self.wait_for(client, f"Received <{client}, S2,")
         self.start("S1", "distributed_system.server.server", "--id", "S1")
         self.wait_for("S1", "RM confirmed readiness", count=2)
-        self.wait_for("S1", "role: primary → backup; primary is S2")
+        self.wait_for("S1", "role=backup")
+        self.assertNotIn("role: primary → backup", self.output("S1"))
 
     def start_third(self):
         self.start("LFD3", "distributed_system.lfd.lfd", "--id", "LFD3",
