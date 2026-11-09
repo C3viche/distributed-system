@@ -207,7 +207,8 @@ class Client:
     def _has_request_target(self) -> bool:
         """A boolean check to se if the connection is alive and there is a valid primary id available"""
         if self.replication_mode == "active":
-            return bool(self.conns.alive)
+            # wait for connects still opening so every replica gets the request
+            return bool(self.conns.alive) and not self.conns.connecting
         return self.primary_id is not None and self.primary_id in self.conns.alive
 
     def _send_and_await_reply(self) -> bool:
