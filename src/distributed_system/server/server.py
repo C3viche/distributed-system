@@ -9,7 +9,11 @@ Active mode: every synchronized replica handles every request.
 Passive mode: the configured primary opens a connection to each backup and
 sends a checkpoint of my_state every 1/checkpoint_freq seconds. A backup
 copies my_state and checkpoint_count from each checkpoint and does not answer
-client requests. Mode defaults to REPLICATION_MODE (active if unset);
+client requests. On primary crash, GFD/RM membership drops that replica; the
+first remaining member is elected primary. A backup promotes, opens the
+checkpoint channel to whoever is still alive, and starts answering clients.
+A recovered former primary is appended to membership and comes back as a
+backup. Mode defaults to REPLICATION_MODE (active if unset);
 --replication-mode overrides it.
 
 Registration with the paired LFD (S1→LFD1, S2→LFD2, S3→LFD3) uses connection
@@ -44,6 +48,7 @@ from distributed_system.config import (
     get_address,
     get_server_addresses,
 )
+from distributed_system.server.election import backups_for, elect_primary
 
 
 def lfd_id_for(replica_id: str) -> str:
@@ -101,7 +106,8 @@ class Server:
         self._client_ids: dict[socket.socket, str] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
 
-        # Role is currently configured statically; RM promotion is not implemented.
+        # Initial role follows PRIMARY_ID. Passive membership/promote_primary
+        # from GFD/RM can later promote a backup or demote a recovered primary.
         if replication_mode == "active":
             self.role: str = "active"  # M2: every replica handles every request
         elif replica_id == primary_id:
@@ -142,6 +148,7 @@ class Server:
         self._recovery: socket.socket | None = None
         self._recovery_retry_at: float = 0.0
         self._recovery_deadline: float | None = None
+        self.membership: list[str] = []
 
     def serve(self) -> None:
         """Start networking, then advance admission/recovery and serving together.
@@ -188,7 +195,7 @@ class Server:
         """
         if self._lfd is None:
             self.try_connect_to_lfd()
-        if self._pending_backups:
+        if self.role == "primary" and self._pending_backups:
             self.try_connect_to_backups()
         if self._rm is None:
             self.try_connect_to_rm()
@@ -199,6 +206,9 @@ class Server:
     def handle_rm(self, msg: dict[str, object]) -> None:
         """Apply admission instructions and acknowledge only the current attempt."""
         instruction = msg.get("type")
+        if instruction in {"membership", "promote_primary"}:
+            self.handle_election(msg)
+            return
         if instruction == "join_accepted":
             return
         if instruction == "wait":
@@ -232,7 +242,7 @@ class Server:
             if primary not in get_server_addresses():
                 raise ValueError("Passive recovery requires a current primary")
             self.primary_id = primary
-            # Promotion of an existing backup remains separate integration work.
+            # Membership instructions promote only synchronized backups.
             if primary != self.replica_id:
                 self.role = "backup"
         self.wait_for_admission()
@@ -250,6 +260,125 @@ class Server:
             self._send_json(self._rm, {"type": "sync_complete",
                                       "replica_id": self.replica_id,
                                       "recovery_id": self._recovery_id})
+
+    def handle_election(self, msg: dict[str, object]) -> None:
+        """Apply a GFD/RM membership snapshot or explicit promote_primary."""
+        members = self._parse_members(msg)
+        if members is None:
+            return
+        if "primary_id" in msg:
+            primary = msg["primary_id"]
+            if primary is not None and primary not in members:
+                return
+            self.membership = list(members)
+            if self.replication_mode == "passive" and primary is not None:
+                if primary == self.replica_id:
+                    self._become_primary(members)
+                else:
+                    self._become_backup(primary)
+            return
+        self.apply_membership(members)
+
+    def apply_membership(self, members: list[str]) -> None:
+        """Elect from membership order and promote or demote this replica."""
+        self.membership = list(members)
+        if self.replication_mode != "passive":
+            return
+        new_primary = elect_primary(members)
+        if new_primary is None:
+            return
+        if new_primary == self.replica_id:
+            self._become_primary(members)
+        else:
+            self._become_backup(new_primary)
+
+    def _become_primary(self, members: list[str]) -> None:
+        """Take the primary role and open checkpoint channels to remaining backups."""
+        old_role = self.role
+        if old_role != "primary" and self.replica_status != ReplicaStatus.SYNCED:
+            log(f"{self.replica_id}: cannot promote before synchronization", kind="failure")
+            return
+        self.primary_id = self.replica_id
+        if old_role != "primary":
+            self.role = "primary"
+            self.recovery_source_id = None
+            if self._recovery is not None:
+                self._close_sock(self._recovery, "promotion canceled recovery pull")
+            self._next_checkpoint = time.monotonic() + self._checkpoint_interval
+            self._close_inbound_primary_channel()
+            log(f"{self.replica_id} role: {old_role} → primary", kind="membership")
+            log(f"{self.replica_id} promoted to primary", kind="membership")
+        self._sync_backup_targets(members)
+
+    def _become_backup(self, new_primary: str) -> None:
+        """Give up the primary role (or retarget) and wait for checkpoints."""
+        old_role = self.role
+        old_primary = self.primary_id
+        if old_role == "primary":
+            for sock in list(self._backups):
+                self._close_sock(
+                    sock, "demoted; closing checkpoint channel", retry_backup=False
+                )
+            self._pending_backups.clear()
+        self.role = "backup"
+        self.primary_id = new_primary
+        if old_role == "primary":
+            log(
+                f"{self.replica_id} role: primary → backup; primary is {new_primary}",
+                kind="membership",
+            )
+        elif old_primary != new_primary:
+            log(
+                f"{self.replica_id} (backup): primary is now {new_primary}",
+                kind="membership",
+            )
+
+    def _sync_backup_targets(self, members: list[str]) -> None:
+        """Keep outbound checkpoint channels aligned with alive backups."""
+        desired = backups_for(self.replica_id, members)
+        desired_set = set(desired)
+        for sock, backup_id in list(self._backups.items()):
+            if backup_id not in desired_set:
+                self._close_sock(
+                    sock, f"{backup_id} left membership", retry_backup=False
+                )
+        connected = set(self._backups.values())
+        self._pending_backups = [
+            backup_id
+            for backup_id in self._pending_backups
+            if backup_id in desired_set and backup_id not in connected
+        ]
+        pending_set = set(self._pending_backups)
+        for backup_id in desired:
+            if backup_id not in connected and backup_id not in pending_set:
+                self._pending_backups.append(backup_id)
+                pending_set.add(backup_id)
+
+    def _close_inbound_primary_channel(self) -> None:
+        """Drop the old primary's checkpoint socket after we are promoted."""
+        for key in list(self.sel.get_map().values()):
+            if key.data != "primary" or not isinstance(key.fileobj, socket.socket):
+                continue
+            self._close_sock(
+                key.fileobj,
+                "closing inbound checkpoint channel; this replica is now primary",
+            )
+
+    def _parse_members(self, msg: dict[str, object]) -> list[str] | None:
+        raw_members = msg.get("members")
+        if not isinstance(raw_members, list):
+            return None
+        members: list[str] = []
+        seen: set[str] = set()
+        for item in raw_members:
+            if not isinstance(item, str) or item not in REPLICA_LFDS or item in seen:
+                return None
+            members.append(item)
+            seen.add(item)
+        count = msg.get("member_count")
+        if count is not None and (type(count) is not int or count != len(members)):
+            return None
+        return members
 
     def initialize_replica(self) -> None:
         """Install initial state and report completion, awaiting RM acknowledgment.
@@ -669,7 +798,7 @@ class Server:
             )
             if deadline is not None:
                 waits.append(max(0.0, deadline - time.monotonic()))
-        if self._pending_backups:
+        if self.role == "primary" and self._pending_backups:
             waits.append(max(0.0, self._next_backup_retry - time.monotonic()))
         if self.role == "primary":
             waits.append(max(0.0, self._next_checkpoint - time.monotonic()))
@@ -790,12 +919,19 @@ class Server:
             elif kind == "backup":
                 pass  # primary's outbound channel. backups don't send anything back
             elif self.role == "backup" and msg.get("type") == "register_primary":
+                sender = msg.get("replica_id")
+                if sender != self.primary_id:
+                    log(
+                        f"{self.replica_id} (backup): ignoring register_primary from {sender}",
+                        kind="info",
+                    )
+                    continue
                 # this accepted socket is the primary. later messages on it are checkpoints,
                 # including one that arrived in this same read.
                 self._relabel_socket(sock, "primary")
                 kind = "primary"
                 log(
-                    f"{self.replica_id} (backup): checkpoint channel from {msg.get('replica_id')}",
+                    f"{self.replica_id} (backup): checkpoint channel from {sender}",
                     kind="registration",
                 )
             elif kind == "primary":
@@ -805,7 +941,14 @@ class Server:
             if sock not in self._connections:
                 break
 
-    def _close_sock(self, sock: socket.socket, why: str, kind: str = "failure") -> None:
+    def _close_sock(
+        self,
+        sock: socket.socket,
+        why: str,
+        kind: str = "failure",
+        *,
+        retry_backup: bool = True,
+    ) -> None:
         """Remove a channel; losing RM revokes readiness until readmitted."""
         # have to unregister or select() keeps waking up on the dead socket
         _ = self.sel.unregister(sock)
@@ -829,10 +972,12 @@ class Server:
             self.wait_for_admission()
             self._rm_retry_at = time.monotonic() + 1.0
             why = "lost connection to RM; will retry"
-        elif backup_id:
+        elif backup_id and retry_backup and self.role == "primary":
             # backup died, put it back in the queue so we reconnect if it comes back up
             self._pending_backups.append(backup_id)
             why = f"lost checkpoint channel to {backup_id}; will retry"
+        elif backup_id:
+            why = f"lost checkpoint channel to {backup_id}"
         elif client_id and "client disconnected" in why:
             why = f"{client_id} disconnected"
         elif client_id and why.startswith("Connection lost"):

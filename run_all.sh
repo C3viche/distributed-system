@@ -130,8 +130,8 @@ client_flags() {
 }
 
 start_rm()     { launch "RM"    "$(env_prefix)uv run rm"; }
-start_gfd()    { launch "GFD"   "$(env_prefix)uv run gfd --heartbeat_freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
-start_lfd()    { launch "LFD$1" "$(env_prefix)uv run lfd --id LFD$1 --heartbeat_freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
+start_gfd()    { launch "GFD"   "$(env_prefix)uv run gfd --heartbeat-freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
+start_lfd()    { launch "LFD$1" "$(env_prefix)uv run lfd --id LFD$1 --heartbeat-freq $HEARTBEAT_FREQ --timeout $TIMEOUT"; }
 start_server() { launch "S$1"   "$(env_prefix)uv run server --id S$1 $(server_flags) ${2:-}"; }
 start_client() { launch "C$1"   "$(env_prefix)uv run client --id C$1 $(client_flags)"; }
 
@@ -251,7 +251,7 @@ case "$1" in
         check_ports_free GFD LFD1 LFD2 LFD3 S1 S2 S3
         if [ "$WITH_RM" = 1 ]; then
             check_ports_free RM
-            echo "Fresh group: bootstrapping S1. Live-traffic catch-up and primary failover are pending."
+            echo "Fresh group: bootstrapping S1. Live-traffic catch-up and request deduplication are pending."
             start_rm && wait_for_rm || exit 1
         fi
         start_gfd;               sleep 1

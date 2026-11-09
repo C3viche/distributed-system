@@ -1,6 +1,6 @@
 """M2 LFD: monitor one replica and report membership to the GFD.
 
-Run: uv run lfd --id LFD2 --heartbeat_freq 2
+Run: uv run lfd --id LFD2 --heartbeat-freq 2
 Frequency is in Hz. Server and GFD traffic share one nonblocking event loop.
 """
 
@@ -350,7 +350,7 @@ def main() -> None:
     _ = parser.add_argument("--id", choices=list(REPLICA_ASSIGNMENTS), required=True)
     _ = parser.add_argument("--replica-id", choices=list(REPLICA_LFDS), default=None, help="assigned replica (default: matching S1/S2/S3)")
     _ = parser.add_argument(
-        "--freq", "--heartbeat_freq", dest="frequency", type=positive_number,
+        "--freq", "--heartbeat-freq", dest="frequency", type=positive_number,
         default=1.0, help="heartbeats per second (Hz)",
     )
     _ = parser.add_argument("--timeout", type=positive_number, default=2.0, help="ACK/registration timeout in seconds")

@@ -35,7 +35,7 @@ addresses with the corresponding machines' reachable LAN IPs, keeping each
 server and its LFD on the same machine. Use consistent addresses across machines.
 Existing shell environment variables take precedence over `.env` values.
 
-Heartbeat frequency and timeout remain CLI options (`--heartbeat_freq` and
+Heartbeat frequency and timeout remain CLI options (`--heartbeat-freq` and
 `--timeout`); use the same frequency for all three LFDs. GFD uses `GFD_HOST` and `GFD_PORT`; the M4 RM receiver uses `RM_HOST` and `RM_PORT`.
 
 ### Setting up `.env` for a multi-laptop run
@@ -84,13 +84,13 @@ To run everything on one machine for testing:
 
 ```bash
 # Client C1
-uv run client --id C1 --num_replicas 1
+uv run client --id C1 --num-replicas 1
 
 # Client C2
-uv run client --id C2 --num_replicas 1
+uv run client --id C2 --num-replicas 1
 
 # Client C3
-uv run client --id C3 --num_replicas 1
+uv run client --id C3 --num-replicas 1
 ./run_all.sh local
 ```
 
@@ -110,10 +110,10 @@ The script will not start if one of the ports is already in use, which usually m
 Run each command in a separate terminal tab/window:
 
 ```bash
-uv run gfd --heartbeat_freq 1 --timeout 2
-uv run lfd --id LFD1 --heartbeat_freq 1 --timeout 2
-uv run lfd --id LFD2 --heartbeat_freq 1 --timeout 2
-uv run lfd --id LFD3 --heartbeat_freq 1 --timeout 2
+uv run gfd --heartbeat-freq 1 --timeout 2
+uv run lfd --id LFD1 --heartbeat-freq 1 --timeout 2
+uv run lfd --id LFD2 --heartbeat-freq 1 --timeout 2
+uv run lfd --id LFD3 --heartbeat-freq 1 --timeout 2
 uv run server --id S1
 uv run server --id S2
 uv run server --id S3
@@ -122,7 +122,7 @@ uv run client --id C2 --interval 1
 uv run client --id C3 --interval 1
 ```
 
-`--heartbeat_freq` is in heartbeats per second (Hz); use the same value for the GFD and all three LFDs. `--timeout` is how many seconds the LFD waits for an ACK before declaring the server dead. `--interval` is the number of seconds between client requests.
+`--heartbeat-freq` is in heartbeats per second (Hz); use the same value for the GFD and all three LFDs. `--timeout` is how many seconds the LFD waits for an ACK before declaring the server dead. `--interval` is the number of seconds between client requests.
 
 ### What happens at each step
 
@@ -147,7 +147,7 @@ and reports current healthy membership after reconnecting.
 Clients register with GFD before sending requests. GFD immediately sends the
 current replica IDs and member count, then sends a new full snapshot whenever
 membership changes. Both sides log each delivery. Clients use those IDs to
-open or close replica connections; `--num_replicas` is a legacy option and does
+open or close replica connections; `--num-replicas` is a legacy option and does
 not limit GFD membership.
 
 Run the local integration tests with:
@@ -252,10 +252,10 @@ primary) is never killed in Milestone #3.
 Run each command in a separate terminal tab/window:
 
 ```bash
-uv run gfd --heartbeat_freq 1 --timeout 2
-uv run lfd --id LFD1 --heartbeat_freq 1 --timeout 2
-uv run lfd --id LFD2 --heartbeat_freq 1 --timeout 2
-uv run lfd --id LFD3 --heartbeat_freq 1 --timeout 2
+uv run gfd --heartbeat-freq 1 --timeout 2
+uv run lfd --id LFD1 --heartbeat-freq 1 --timeout 2
+uv run lfd --id LFD2 --heartbeat-freq 1 --timeout 2
+uv run lfd --id LFD3 --heartbeat-freq 1 --timeout 2
 uv run server --id S1 --replication-mode passive --primary S1 --checkpoint-freq 1
 uv run server --id S2 --replication-mode passive --primary S1
 uv run server --id S3 --replication-mode passive --primary S1
@@ -488,8 +488,8 @@ Console outputs are timestamped in UTC and the rest of the line is color-coded b
 
 The integration branch connects GFD membership, server admission, and RM readiness.
 Real-process tests cover fresh startup, active restart with traffic paused during
-transfer, and passive backup restart. Concurrent request catch-up, server promotion,
-and request deduplication remain unfinished.
+transfer, passive backup restart, and primary failover with three replicas and
+three clients. Concurrent request catch-up and request deduplication remain unfinished.
 Automatic replica relaunch belongs to M5.
 
 ### RM protocol
@@ -518,8 +518,8 @@ Membership does not indicate whether a recovering replica is ready to serve.
 ### Replica recovery protocol
 
 Servers send `join_request`; RM also accepts `join` for compatibility with its
-existing receiver tests. GFD includes the current passive primary in snapshots
-and incremental updates. All control messages use the same JSON-line listener.
+existing receiver tests. RM chooses the first synchronized, live member as passive
+primary and sends the decision to servers and GFD. GFD forwards it to clients. All control messages use the same JSON-line listener.
 
 1. A replica keeps a control connection to RM and sends
    `{"type":"join_request","replica_id":"S2"}`. RM replies `join_accepted`. This does
@@ -539,10 +539,11 @@ and incremental updates. All control messages use the same JSON-line listener.
 
 RM keeps readiness separate from printed GFD membership. Only ready, live replicas
 can donate state. Active recovery chooses the first eligible replica by ID;
-passive recovery uses only the current primary. GFD forwards the elected
-`primary_id` in a membership snapshot (or null while election is pending). RM
-starts with configured `PRIMARY_ID`, clears it on removal, and does not elect or
-promote replicas itself. Omitting `primary_id` preserves the current value.
+passive recovery uses only the current primary. RM keeps GFD membership order,
+but only synchronized replicas are eligible for election. It sends `membership`
+with an explicit `primary_id` to servers and `primary_update` to GFD. Servers
+apply Nikhil's promotion/demotion logic; GFD publishes the same assignment to
+clients. A recovered former primary rejoins as a backup.
 
 A duplicate join on the same connection repeats the current instruction. A new
 connection replaces the old session and requires synchronization again. Completion
@@ -566,8 +567,7 @@ run is not supported by this protocol; restart the whole demo as a fresh cluster
 
 RM coordinates the transfer; servers apply checkpoints and wait for its ready
 acknowledgment before becoming SYNCED. RM does not verify application state or
-broadcast ready membership to clients. Active catch-up, deduplication, and
-readiness-aware election still need implementation.
+broadcast ready membership to clients. Active catch-up and deduplication still need implementation.
 
 
 ### Running M4
@@ -584,8 +584,8 @@ output goes to `logs/<process>.log`.
 
 Startup order is RM → GFD → LFDs → servers → clients. The script waits up to ten
 seconds for RM's listener before starting GFD. It does not check registration.
-Passive servers still lack promotion handling. GFD primary announcements alone
-do not make a backup start serving.
+Passive failover is coordinated by RM; the promoted server opens checkpoint
+channels to the remaining backups.
 
 For four laptops, share a `.env` with reachable LAN addresses and the same
 `REPLICATION_MODE`. Point `RM_HOST` and `GFD_HOST` at laptop 4.
@@ -618,7 +618,7 @@ Individual commands:
 | Owner | Work |
 |---|---|
 | Sonia + Chris | GFD registration, snapshots, membership and primary updates connected |
-| Nikhil + Sonia | Agree who selects the primary and how promotion is announced |
+| Nikhil + Sonia + Chris | Promotion/demotion connected to RM election and GFD client updates |
 | Chris | RM join sessions, donor assignment, completion validation, and ready acknowledgment |
 | Cristian + Chris | Admission and readiness connected; concurrent request catch-up pending |
 | Joshua | Handle membership/primary changes and client reconnection |
@@ -632,7 +632,7 @@ Individual commands:
 - [x] Connect GFD; verify matching GFD/RM membership during startup and restart.
 - [ ] Active recovery: crash S1, keep survivors running, restart S1, synchronize
       its state, and verify it resumes serving clients only when ready.
-- [ ] Passive primary failure: crash S1, promote S2, verify clients switch to S2
+- [x] Local passive primary failure: crash S1, promote S2, verify clients switch to S2
       and S2 sends checkpoints to S3.
 - [ ] Passive backup recovery: with S1 primary, kill S2 and verify GFD/RM show
       S1 and S3. Restart S2; verify LFD registration and restoration to three

@@ -99,7 +99,6 @@ class ServerRMTests(unittest.TestCase):
             {"type": "recover", "recovery_id": "recovery", "source_id": "S1"},
             {"type": "recover", "recovery_id": "recovery", "source_id": "unknown"},
             {"type": "recover"},
-            {"type": "membership", "members": []},
         ]
         for message in messages:
             with self.subTest(message=message), self.assertRaises(ValueError):

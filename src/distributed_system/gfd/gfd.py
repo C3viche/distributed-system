@@ -88,7 +88,7 @@ class GlobalFaultDetector:
         self.host, self.port = resolve_address("GFD", host_override, port_override)
         self.membership: list[str] = []
         self.member_count: int = 0
-        # Passive mode: the first living member is primary. Active mode leaves this unset.
+        # RM supplies the synchronized passive primary. Active mode leaves this unset.
         self.primary_id: str | None = None
         self._sessions: dict[socket.socket, PeerSession] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
@@ -117,15 +117,9 @@ class GlobalFaultDetector:
             self._notify_rm(rm_event[0], rm_event[1])
 
     def _update_primary(self) -> None:
-        """In passive mode the primary is the first replica still in membership."""
-        if REPLICATION_MODE != "passive":
-            return
-        new = self.membership[0] if self.membership else None
-        if new == self.primary_id:
-            return
-        self.primary_id = new
-        if new is not None:
-            log(f"GFD promotes {new} to primary", kind="membership")
+        """Clear a failed primary; RM selects a synchronized replacement."""
+        if self.primary_id not in self.membership:
+            self.primary_id = None
 
     def _client_membership(self) -> dict[str, object]:
         message: dict[str, object] = {
@@ -429,6 +423,17 @@ class GlobalFaultDetector:
         messages = self._rm_conn.receive()
         if messages is None:
             self._drop_rm("GFD lost RM connection")
+            return
+        for message in messages:
+            if not isinstance(message, dict) or message.get("type") != "primary_update":
+                raise ValueError("Invalid RM primary update")
+            primary = message.get("primary_id")
+            if primary is not None and primary not in self.membership:
+                continue
+            if self.primary_id != primary:
+                self.primary_id = primary
+                log(f"GFD: primary is {primary}", kind="membership")
+                self._publish_membership()
 
     def _write_rm(self) -> None:
         if self._rm_conn is None or self._rm_sock is None:
@@ -547,7 +552,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument(
         "--freq",
-        "--heartbeat_freq",
+        "--heartbeat-freq",
         dest="frequency",
         type=positive_number,
         default=1.0,

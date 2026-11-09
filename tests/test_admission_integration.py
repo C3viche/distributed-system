@@ -68,11 +68,11 @@ class AdmissionIntegrationTests(unittest.TestCase):
         self.env["REPLICATION_MODE"] = mode
         self.start("RM", "distributed_system.rm.rm")
         self.wait_for("RM", "RM listening")
-        self.start("GFD", "distributed_system.gfd.gfd", "--heartbeat_freq", "10", "--timeout", "1")
+        self.start("GFD", "distributed_system.gfd.gfd", "--heartbeat-freq", "10", "--timeout", "1")
         self.wait_for("RM", "GFD registered")
         for name in ("LFD1", "LFD2"):
             self.start(name, "distributed_system.lfd.lfd", "--id", name,
-                       "--heartbeat_freq", "10", "--timeout", "1")
+                       "--heartbeat-freq", "10", "--timeout", "1")
         self.start("S1", "distributed_system.server.server", "--id", "S1", "--bootstrap",
                    "--checkpoint-freq", "10")
         self.wait_for("S1", "RM confirmed readiness")
@@ -113,3 +113,31 @@ class AdmissionIntegrationTests(unittest.TestCase):
 
     def test_passive_backup_restart(self):
         self.restart_backup("passive")
+
+    def test_primary_failure_promotes_backup_and_retargets_clients(self):
+        self.start_group("passive")
+        self.start("LFD3", "distributed_system.lfd.lfd", "--id", "LFD3",
+                   "--heartbeat-freq", "10", "--timeout", "1")
+        self.start("S3", "distributed_system.server.server", "--id", "S3")
+        self.wait_for("S3", "RM confirmed readiness")
+        self.assertEqual(self.request("S1", 1), 1)
+        self.wait_for("S2", "my_state = 0 -> 1")
+        self.wait_for("S3", "my_state = 0 -> 1")
+        # Idle real clients observe GFD's assignment before and after failure.
+        for client in ("C1", "C2", "C3"):
+            self.start(client, "distributed_system.client", "--id", client, "--interval", "0.2")
+            self.wait_for(client, "Received <")
+        primary = next(process for process in self.processes
+                       if "--bootstrap" in process.args)
+        primary.kill()
+        primary.wait(timeout=3)
+        self.wait_for("S2", "promoted to primary")
+        self.wait_for("GFD", "GFD: primary is S2")
+        self.wait_for("S3", "primary is now S2")
+        self.wait_for("S2", "opened checkpoint channel to S3")
+        for client in ("C1", "C2", "C3"):
+            self.wait_for(client, "assigned primary: S2")
+            self.wait_for(client, f"Received <{client}, S2,")
+        self.start("S1", "distributed_system.server.server", "--id", "S1")
+        self.wait_for("S1", "RM confirmed readiness", count=2)
+        self.wait_for("S1", "role: primary → backup; primary is S2")

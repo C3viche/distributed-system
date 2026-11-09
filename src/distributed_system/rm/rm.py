@@ -35,6 +35,7 @@ class ReplicationManager:
         self.primary_id: str | None = PRIMARY_ID
         self._snapshot_received = False
         self._bootstrapped = False
+        self._last_topology = None
         self._gfd: socket.socket | None = None
         self._connections: dict[socket.socket, BufferedJsonConnection] = {}
         self._selector = selectors.DefaultSelector()
@@ -83,6 +84,11 @@ class ReplicationManager:
                 state.ready = False
                 state.recovery_id = None
                 state.donor = None
+        if REPLICATION_MODE == "passive" and self._bootstrapped:
+            candidates = [name for name in self.membership
+                          if name in self.replicas and self.replicas[name].ready]
+            self.primary_id = candidates[0] if candidates else None
+        self._publish_topology()
         for replica, state in self.replicas.items():
             if state.ready:
                 continue
@@ -110,6 +116,23 @@ class ReplicationManager:
             state.recovery_id = uuid4().hex
             self._send(state.sock, self._instruction(replica, state))
 
+    def _publish_topology(self) -> None:
+        """Send election decisions to servers and GFD on membership/readiness changes."""
+        if REPLICATION_MODE != "passive" or not self._snapshot_received:
+            return
+        view = (tuple(self.membership), self.primary_id,
+                tuple((name, peer.ready) for name, peer in self.replicas.items()))
+        if view == self._last_topology:
+            return
+        self._last_topology = view
+        message = {"type": "membership", "members": list(self.membership),
+                   "member_count": self.member_count, "primary_id": self.primary_id}
+        for peer in self.replicas.values():
+            self._send(peer.sock, message)
+        if self._gfd is not None:
+            self._send(self._gfd, {"type": "primary_update",
+                                   "primary_id": self.primary_id if self._bootstrapped else None})
+
     def _handle_replica(self, sock: socket.socket, message: dict) -> None:
         """Handle join requests and completion for the current control connection."""
         replica = self._replica(message.get("replica_id"))
@@ -127,6 +150,7 @@ class ReplicationManager:
                     self._close_peer(state.sock)
                 state = Recovery(sock, bootstrap)
                 self.replicas[replica] = state
+                self._last_topology = None
             self._send(sock, {"type": "join_accepted", "replica_id": replica})
             if state.recovery_id:
                 self._send(sock, self._instruction(replica, state))
@@ -164,6 +188,7 @@ class ReplicationManager:
             if self._gfd is not None and self._gfd is not sock:
                 self._close_peer(self._gfd)
             self._gfd = sock
+            self._last_topology = None
             self._snapshot_received = False
             self._coordinate()
             log("GFD registered with RM", kind="registration")
@@ -172,7 +197,7 @@ class ReplicationManager:
             raise ValueError("GFD must register before reporting membership")
 
         primary = self.primary_id
-        if "primary_id" in message:
+        if REPLICATION_MODE != "passive" and "primary_id" in message:
             primary = message["primary_id"]
             if primary is not None:
                 primary = self._replica(primary)

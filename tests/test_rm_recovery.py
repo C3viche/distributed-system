@@ -28,7 +28,10 @@ class RecoveryTests(unittest.TestCase):
             chunk = sock.recv(1)
             self.assertTrue(chunk, "RM closed control connection")
             data.extend(chunk)
-        return json.loads(data)
+        message = json.loads(data)
+        if message.get("type") == "membership":
+            return self.receive(sock)
+        return message
 
     def join(self, replica, bootstrap=False):
         sock = self.connect(register=False)
