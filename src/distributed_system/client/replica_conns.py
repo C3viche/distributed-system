@@ -15,10 +15,12 @@ class ReplicaConnections:
 
     def __init__(self, client_id: str,
                  replicas: dict[str, tuple[str, int]] | None = None,
-                 timeout: float = 1.0) -> None:
+                 timeout: float = 1.0, reply_timeout: float | None = None) -> None:
         self.client_id: str = client_id
         self.replicas: dict[str, tuple[str, int]] = replicas if replicas is not None else get_server_addresses()
-        self.timeout: float = timeout
+        self.timeout: float = timeout  # connect attempts
+        # how long to wait for a reply before holding; defaults to the connect timeout
+        self.reply_timeout: float = reply_timeout if reply_timeout is not None else timeout
         self.alive: dict[str, socket.socket] = {}
         self.dead: set[str] = set()
         self._selector: selectors.DefaultSelector = selectors.DefaultSelector()
@@ -134,7 +136,7 @@ class ReplicaConnections:
             })
             _ = self._selector.modify(sock, selectors.EVENT_READ | selectors.EVENT_WRITE, replica_id)
             log(f"Sent <{self.client_id}, {replica_id}, {request_num}, {payload}>", kind="send")
-        reply = self._receive_until(time.monotonic() + self.timeout, request_num, set(targets))
+        reply = self._receive_until(time.monotonic() + self.reply_timeout, request_num, set(targets))
         if reply is None:
             # A timed-out queued write must not accumulate or execute much later.
             # Drop only connections that still have unsent bytes.

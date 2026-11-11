@@ -271,6 +271,16 @@ class ClientTests(unittest.TestCase):
         )
         self.client._read_gfd()
 
+    def test_reply_timeout_covers_a_checkpoint_period_in_passive(self) -> None:
+        with patch("distributed_system.client.client.CHECKPOINT_FREQ", 0.5):
+            passive = Client("C2", replication_mode="passive")
+            active = Client("C3", replication_mode="active")
+        self.addCleanup(passive.conns.close)
+        self.addCleanup(active.conns.close)
+        self.assertEqual(passive.conns.reply_timeout, 3.0)
+        self.assertEqual(active.conns.reply_timeout, 1.0)
+        self.assertEqual(passive.conns.timeout, 1.0)
+
     def test_primary_assignment_omission_and_clear(self) -> None:
         self.snapshot(["S1", "S2", "S3"])
         self.assertEqual(self.client.primary_id, PRIMARY_ID)

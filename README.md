@@ -559,12 +559,12 @@ GFD disconnect cancels unfinished transfers; a fresh snapshot is required before
 RM resumes coordination. With no eligible donor, RM waits rather than accepting
 an empty state. A stalled transfer can be retried by reconnecting and joining.
 
-For a **fresh cluster only**, the configured initial primary joins with
-`"bootstrap":true`. RM sends `initialize` with null source fields; the server initializes
-its starting state and sends `sync_complete`. This seeds the first ready donor.
-Once any replica has become ready, bootstrap cannot bypass recovery. Manual
-restarts must omit this flag. RM state is in memory: restarting RM during a live
-run is not supported by this protocol; restart the whole demo as a fresh cluster.
+When no replica is ready, RM sends `initialize` (null source fields) to
+`PRIMARY_ID` once it joins; the server starts from empty state and sends
+`sync_complete`. Replicas that join earlier wait, then recover from it. This also
+covers every replica dying while RM keeps running. Once any replica is ready,
+joiners always recover from a donor. RM state is in memory: restarting RM during
+a live run is not supported; restart the whole demo as a fresh cluster.
 
 RM coordinates the transfer; servers apply checkpoints and wait for its ready
 acknowledgment before becoming SYNCED. RM does not verify application state or
@@ -614,11 +614,8 @@ For four laptops, share a `.env` with reachable LAN addresses and the same
 | 2: LFD2, S2 | `./run_all.sh replica 2` |
 | 3: LFD3, S3 | `./run_all.sh replica 3` |
 
-Start infrastructure first, then replicas in order. On a fresh four-laptop run,
-start LFD1 with `./run_all.sh lfd 1`, then initialize the first server explicitly:
-`uv run server --id S1 --bootstrap`. Start S2/S3 normally. Local `m4-active` and
-`m4-passive` runs pass `--bootstrap` to S1 automatically; use these only for a
-fresh group. Individual server restart commands never pass that flag.
+Start infrastructure first, then replicas in any order. Replicas wait until
+`PRIMARY_ID` joins and seeds the group, then recover from it.
 
 Individual commands:
 

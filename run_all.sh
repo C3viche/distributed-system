@@ -251,7 +251,6 @@ case "$1" in
         check_ports_free GFD LFD1 LFD2 LFD3 S1 S2 S3
         if [ "$WITH_RM" = 1 ]; then
             check_ports_free RM
-            echo "Fresh group: bootstrapping S1. Live-traffic catch-up and request deduplication are pending."
             start_rm && wait_for_rm || exit 1
         fi
         start_gfd;               sleep 1
@@ -259,11 +258,7 @@ case "$1" in
         # Start S1 first so, in passive mode, the primary can open its outbound
         # checkpoint channel to S2 and S3 as soon as their listen sockets exist.
         for n in 1 2 3; do
-            if [ "$WITH_RM" = 1 ] && [ "$n" = 1 ]; then
-                start_server "$n" --bootstrap
-            else
-                start_server "$n"
-            fi
+            start_server "$n"
             sleep 1
         done
         sleep 1

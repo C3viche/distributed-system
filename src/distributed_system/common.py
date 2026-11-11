@@ -27,6 +27,7 @@ all_colors = {
     "state": "green",
     "registration": "blue",
     "membership": "cyan",
+    "role": "cyan",  # printed highlighted so who's primary stands out
     "checkpoint": "light_cyan",
     "failure": "red",
     "info": "white",
@@ -169,6 +170,8 @@ def log(message: str, kind: str = "info") -> None:
     color = all_colors.get(kind, all_colors["info"])
 
     style = attr("bold") if kind in {"send", "membership"} else ""
+    if kind == "role":
+        style = attr("bold") + attr("reverse")
 
     # Process tag in the process's own color, then the message in its kind color.
     tag = ""
