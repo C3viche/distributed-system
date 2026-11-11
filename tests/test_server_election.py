@@ -18,6 +18,20 @@ class ServerElectionTests(unittest.TestCase):
         self.addCleanup(server.sel.close)
         return server
 
+    def test_event_for_socket_closed_earlier_in_batch_is_skipped(self) -> None:
+        # promotion can close a socket that still has an event queued in the same select batch
+        import selectors
+        import socket
+
+        server = self.make_server("S2")
+        sock, peer = socket.socketpair()
+        self.addCleanup(peer.close)
+        server._register(sock, "primary")
+        peer.sendall(b'{"type": "checkpoint"}\n')
+        with patch("distributed_system.server.server.log"):
+            server._close_sock(sock, "promotion closed it")
+            server._handle_socket_event(sock, "primary", selectors.EVENT_READ)
+
     def test_backup_promotes_when_it_becomes_first_member(self) -> None:
         server = self.make_server("S2")
         self.assertEqual(server.role, "backup")
