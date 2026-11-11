@@ -86,7 +86,8 @@ class ServerElectionTests(unittest.TestCase):
 
     def test_passive_servers_print_who_is_primary(self) -> None:
         backup = self.make_server("S2")
-        primary = Server("S1", replication_mode="passive", primary_id="S1", bootstrap=True)
+        primary = Server("S1", replication_mode="passive", primary_id="S1")
+        primary.role = "primary"
         self.addCleanup(primary.sel.close)
         primary._backups = {MagicMock(): "S3", MagicMock(): "S2"}
         with patch("distributed_system.server.server.log") as log:

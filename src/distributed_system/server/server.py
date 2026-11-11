@@ -80,7 +80,6 @@ class Server:
         primary_id: str = PRIMARY_ID,
         checkpoint_freq: float = CHECKPOINT_FREQ,
         replica_status: ReplicaStatus = ReplicaStatus.UP,
-        bootstrap: bool = False,
     ):
         """Configure the replica and allocate local state without opening sockets.
 
@@ -98,9 +97,6 @@ class Server:
         self.primary_id: str = primary_id
         self.replica_id: str = replica_id
         self.lfd_id: str = lfd_id_for(replica_id)
-        if bootstrap and replica_id != primary_id:
-            raise ValueError("Only the initial primary can bootstrap a fresh group")
-        self.bootstrap = bootstrap
         self._recovery_id: str | None = None
         self._state_synced = False
         self.replica_status: ReplicaStatus = replica_status
@@ -115,11 +111,9 @@ class Server:
         self._client_ids: dict[socket.socket, str] = {}
         self.sel: selectors.DefaultSelector = selectors.DefaultSelector()
 
-        # Only a bootstrapped PRIMARY_ID starts as primary; a relaunch waits for RM as a backup.
+        # passive replicas start as backups; RM's initialize makes PRIMARY_ID the primary
         if replication_mode == "active":
             self.role: str = "active"  # M2: every replica handles every request
-        elif replica_id == primary_id and bootstrap:
-            self.role = "primary"  # M3: handles requests, sends checkpoints
         else:
             self.role = "backup"  # M3: ignores requests, receives checkpoints
 
@@ -232,7 +226,6 @@ class Server:
         if instruction == "ready":
             if isinstance(token, str) and token == self._recovery_id and self._state_synced:
                 self.replica_status = ReplicaStatus.SYNCED
-                self.bootstrap = False
                 pending, self._buffered_requests = self._buffered_requests, []
                 for sock, request in pending:
                     self.process_request(sock, request)
@@ -258,6 +251,12 @@ class Server:
             # Membership instructions promote only synchronized backups.
             if primary != self.replica_id:
                 self.role = "backup"
+            elif instruction == "initialize" and self.role != "primary":
+                # fresh group: nothing to sync from, so start as primary
+                self.role = "primary"
+                self._pending_backups = [
+                    rid for rid in get_server_addresses() if rid != self.replica_id
+                ]
         self.wait_for_admission()
         self._recovery_id = token
         if instruction == "initialize":
@@ -788,7 +787,6 @@ class Server:
                 "replica_id": self.replica_id,
                 "replication_mode": self.replication_mode,
                 "status": self.replica_status.name,
-                "bootstrap": self.bootstrap,
             },
         )
         log(
@@ -876,9 +874,9 @@ class Server:
         self._next_role_print = now + ROLE_PRINT_INTERVAL
         if self.role == "primary":
             backups = ", ".join(sorted(self._backups.values())) or "none"
-            log(f"{self.replica_id} (primary): backups {backups}", kind="membership")
+            log(f"{self.replica_id} (primary): backups {backups}", kind="role")
         else:
-            log(f"{self.replica_id} (backup): primary is {self.primary_id}", kind="membership")
+            log(f"{self.replica_id} (backup): primary is {self.primary_id}", kind="role")
 
     def _poll_connections(self) -> None:
         """Dispatch one batch of socket events, bounded by scheduled work."""
@@ -1103,9 +1101,6 @@ def _parse_args() -> argparse.Namespace:
         default=CHECKPOINT_FREQ,
         help=f"checkpoints per second, primary only (default {CHECKPOINT_FREQ})",
     )
-
-    parser.add_argument("--bootstrap", action="store_true",
-                        help="initialize the first replica of a fresh group only")
     return parser.parse_args()
 
 
@@ -1121,7 +1116,6 @@ def main() -> None:
         replication_mode=cast(str, args.replication_mode),
         primary_id=cast(str, args.primary),
         checkpoint_freq=cast(float, args.checkpoint_freq),
-        bootstrap=args.bootstrap,
     )
     try:
         server.serve()

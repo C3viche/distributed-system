@@ -20,16 +20,15 @@ with patch("dotenv.load_dotenv"):
 expected_mode = os.environ.get("REPLICATION_MODE", "active")
 expected_primary = os.environ.get("PRIMARY_ID", "S1")
 client = Client("C1")
-servers = [Server(replica_id, bootstrap=replica_id == expected_primary)
-           for replica_id in ("S1", "S2", "S3")]
+servers = [Server(replica_id) for replica_id in ("S1", "S2", "S3")]
 try:
     assert client.replication_mode == expected_mode
     assert client.primary_id == expected_primary
     for server in servers:
         assert server.replication_mode == expected_mode
         assert server.primary_id == expected_primary
-        expected_role = "active" if expected_mode == "active" else (
-            "primary" if server.replica_id == expected_primary else "backup")
+        # passive replicas wait as backups until RM initializes the primary
+        expected_role = "active" if expected_mode == "active" else "backup"
         assert server.role == expected_role
     with patch("sys.argv", ["client", "--id", "C1"]):
         assert client_args().replication_mode == expected_mode

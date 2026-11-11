@@ -8,11 +8,14 @@ from __future__ import annotations
 import argparse
 import selectors
 import socket
+import time
 from dataclasses import dataclass
 from uuid import uuid4
 
 from distributed_system.common import BufferedJsonConnection, log, set_process_id
 from distributed_system.config import PRIMARY_ID, REPLICATION_MODE, SERVERS, resolve_address
+
+STATUS_PRINT_INTERVAL = 5.0  # seconds between RM status lines, so the demo shows the whole picture
 
 
 @dataclass
@@ -20,7 +23,6 @@ class Recovery:
     """One replica control connection and its current recovery attempt."""
 
     sock: socket.socket
-    bootstrap: bool = False
     recovery_id: str | None = None
     donor: str | None = None
     ready: bool = False
@@ -36,6 +38,7 @@ class ReplicationManager:
         self.primary_id: str | None = PRIMARY_ID
         self._snapshot_received = False
         self._bootstrapped = False
+        self._next_status = 0.0
         self._last_topology = None
         self._gfd: socket.socket | None = None
         self._connections: dict[socket.socket, BufferedJsonConnection] = {}
@@ -90,17 +93,20 @@ class ReplicationManager:
                           if name in self.replicas and self.replicas[name].ready]
             # A recovering member must not displace a healthy primary.
             if self.primary_id not in candidates:
-                # nobody synchronized: fall back to PRIMARY_ID so it can bootstrap again
+                # nobody synchronized: fall back to PRIMARY_ID so it can initialize again
                 self.primary_id = candidates[0] if candidates else PRIMARY_ID
         self._publish_topology()
-        # active mode has no primary, so only passive gates bootstrap on it
-        primary_ok = REPLICATION_MODE == "active" or self.primary_id == PRIMARY_ID
+        # active: whoever joins first seeds; passive: PRIMARY_ID seeds and becomes primary
+        def may_seed(name: str) -> bool:
+            return REPLICATION_MODE == "active" or (
+                name == PRIMARY_ID and self.primary_id == PRIMARY_ID)
+
         for replica, state in self.replicas.items():
             if state.ready:
                 continue
             donor = self.replicas.get(state.donor)
             valid = (self._snapshot_received and replica in self.membership
-                     and ((state.donor is None and replica == PRIMARY_ID and primary_ok) or (
+                     and ((state.donor is None and may_seed(replica)) or (
                          donor is not None and donor.ready
                          and (REPLICATION_MODE == "active"
                               or state.donor == self.primary_id))))
@@ -114,20 +120,53 @@ class ReplicationManager:
             candidates = [name for name, peer in self.replicas.items()
                           if peer.ready and name in self.membership and name != replica
                           and (REPLICATION_MODE == "active" or name == self.primary_id)]
-            # with nobody synchronized there's no state to lose, so S1 may bootstrap again
+            # with nobody synchronized there's no state to lose, so one replica starts fresh
             nobody_ready = not any(peer.ready for peer in self.replicas.values())
-            bootstrap = (state.bootstrap and nobody_ready
-                         and replica == PRIMARY_ID and primary_ok)
-            if not candidates and not bootstrap:
+            seeding = any(peer.recovery_id and peer.donor is None
+                          for name, peer in self.replicas.items() if name != replica)
+            initialize = nobody_ready and not seeding and may_seed(replica)
+            if not candidates and not initialize:
                 if not state.waiting_logged:
                     state.waiting_logged = True
-                    hint = f" (start {PRIMARY_ID} with --bootstrap)" if nobody_ready else ""
+                    hint = (f" (waiting for {PRIMARY_ID} (primary) to start)"
+                            if nobody_ready and REPLICATION_MODE == "passive" else "")
                     log(f"RM: {replica} waiting for a ready donor{hint}", kind="info")
                 continue
             state.waiting_logged = False
             state.donor = sorted(candidates)[0] if candidates else None
             state.recovery_id = uuid4().hex
+            if state.donor is None:
+                log(f"RM: {replica} is starting the group (first donor)", kind="state")
+            else:
+                log(f"RM: {replica} recovering from donor {state.donor}", kind="state")
             self._send(state.sock, self._instruction(replica, state))
+
+    def _print_status_if_time(self) -> None:
+        """Every few seconds, print who's ready, recovering, waiting, and primary."""
+        now = time.monotonic()
+        if now < self._next_status:
+            return
+        self._next_status = now + STATUS_PRINT_INTERVAL
+        ready, recovering, waiting = [], [], []
+        for name in sorted(self.replicas):
+            state = self.replicas[name]
+            if name not in self.membership:
+                continue
+            if state.ready:
+                ready.append(name)
+            elif state.recovery_id:
+                recovering.append(f"{name} <- {state.donor}" if state.donor else f"{name} starting")
+            else:
+                waiting.append(name)
+        parts = []
+        if REPLICATION_MODE == "passive":
+            parts.append(f"primary {self.primary_id if self.primary_id in ready else 'none'}")
+        parts.append(f"ready {', '.join(ready) or 'none'}")
+        if recovering:
+            parts.append(f"recovering {', '.join(recovering)}")
+        if waiting:
+            parts.append(f"waiting {', '.join(waiting)}")
+        log(f"RM status ({REPLICATION_MODE}): {' | '.join(parts)}", kind="role")
 
     def _publish_topology(self) -> None:
         """Send election decisions to servers and GFD on membership/readiness changes."""
@@ -153,15 +192,12 @@ class ReplicationManager:
             raise ValueError("GFD cannot register as a replica")
         state = self.replicas.get(replica)
         if message["type"] == "join_request":
-            bootstrap = message.get("bootstrap", False)
-            if type(bootstrap) is not bool:
-                raise ValueError("bootstrap must be a boolean")
             if any(peer.sock is sock for name, peer in self.replicas.items() if name != replica):
                 raise ValueError("A connection cannot change replica identity")
             if state is None or state.sock is not sock:
                 if state is not None:
                     self._close_peer(state.sock)
-                state = Recovery(sock, bootstrap)
+                state = Recovery(sock)
                 self.replicas[replica] = state
                 self._last_topology = None
             self._send(sock, {"type": "join_accepted", "replica_id": replica})
@@ -274,7 +310,9 @@ class ReplicationManager:
                 log(f"RM listening on {self.host}:{listener.getsockname()[1]}")
                 self._print_membership()
                 while True:
-                    for key, events in self._selector.select():
+                    self._print_status_if_time()
+                    wait = max(0.0, self._next_status - time.monotonic())
+                    for key, events in self._selector.select(timeout=wait):
                         sock = key.fileobj
                         if sock is listener:
                             peer, _ = listener.accept()

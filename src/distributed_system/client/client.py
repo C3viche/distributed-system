@@ -8,6 +8,7 @@ from typing import cast
 from distributed_system.client.replica_conns import ReplicaConnections
 from distributed_system.common import BufferedJsonConnection, log, send_json
 from distributed_system.config import (
+    CHECKPOINT_FREQ,
     PRIMARY_ID,
     REPLICATION_MODE,
     get_address,
@@ -44,8 +45,10 @@ class Client:
         self.payload_template: str = payload_template
         self.request_num: int = 1
         self._holding: bool = False
+        # passive replies wait for a checkpoint ack, so give them one checkpoint period plus slack
+        reply_timeout = 1.0 + 1.0 / CHECKPOINT_FREQ if replication_mode == "passive" else 1.0
         self.conns: ReplicaConnections = ReplicaConnections(
-            client_id, replicas=self.replicas
+            client_id, replicas=self.replicas, reply_timeout=reply_timeout
         )
 
     def run(self) -> None:

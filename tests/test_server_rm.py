@@ -45,7 +45,6 @@ class ServerRMTests(unittest.TestCase):
                 "replica_id": "S1",
                 "replication_mode": "active",
                 "status": "UP",
-                "bootstrap": False,
             },
         )
         self.assertEqual(server.replica_status, ReplicaStatus.UP)

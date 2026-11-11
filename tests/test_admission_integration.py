@@ -74,7 +74,7 @@ class AdmissionIntegrationTests(unittest.TestCase):
         for name in ("LFD1", "LFD2"):
             self.start(name, "distributed_system.lfd.lfd", "--id", name,
                        "--heartbeat-freq", "10", "--timeout", "1")
-        self.start("S1", "distributed_system.server.server", "--id", "S1", "--bootstrap",
+        self.start("S1", "distributed_system.server.server", "--id", "S1",
                    "--checkpoint-freq", "10")
         self.wait_for("S1", "RM confirmed readiness")
         second = self.start("S2", "distributed_system.server.server", "--id", "S2",
@@ -130,7 +130,7 @@ class AdmissionIntegrationTests(unittest.TestCase):
             self.start(client, "distributed_system.client", "--id", client, "--interval", "0.2")
             self.wait_for(client, "Received <")
         primary = next(process for process in self.processes
-                       if "--bootstrap" in process.args)
+                       if "S1" in process.args)
         primary.kill()
         primary.wait(timeout=3)
         self.wait_for("S2", "promoted to primary")
@@ -173,7 +173,7 @@ class AdmissionIntegrationTests(unittest.TestCase):
         for client in clients:
             self.wait_for(client, "Received <", count=5)
         victim = second if crashed == "S2" else next(
-            p for p in self.processes if "--bootstrap" in p.args)
+            p for p in self.processes if "S1" in p.args)
         victim.kill()
         victim.wait(timeout=3)
         survivors = "S1, S3" if crashed == "S2" else "S2, S3"
@@ -205,7 +205,7 @@ class AdmissionIntegrationTests(unittest.TestCase):
                    for client in ("C1", "C2", "C3")}
         for client in clients:
             self.wait_for(client, "Received <", count=4)
-        primary = next(p for p in self.processes if "--bootstrap" in p.args)
+        primary = next(p for p in self.processes if "S1" in p.args)
         primary.kill()
         primary.wait(timeout=3)
         self.wait_for("S2", "promoted to primary")
@@ -228,7 +228,7 @@ class AdmissionIntegrationTests(unittest.TestCase):
             self.wait_for("S2", "my_state = 0 -> 1")
             self.wait_for("S3", "my_state = 0 -> 1")
             # Deliberately never read the reply before killing the primary.
-            primary = next(p for p in self.processes if "--bootstrap" in p.args)
+            primary = next(p for p in self.processes if "S1" in p.args)
             primary.kill()
             primary.wait(timeout=3)
         self.wait_for("S2", "promoted to primary")
@@ -258,7 +258,7 @@ class AdmissionIntegrationTests(unittest.TestCase):
         for replica in ("S2", "S3"):
             self.wait_for(replica, "-> 136")
 
-    def test_backups_start_before_bootstrap_without_displacing_primary(self):
+    def test_backups_start_before_primary_without_displacing_it(self):
         self.env["REPLICATION_MODE"] = "passive"
         self.start("RM", "distributed_system.rm.rm")
         self.wait_for("RM", "RM listening")
@@ -273,7 +273,7 @@ class AdmissionIntegrationTests(unittest.TestCase):
         self.wait_for("RM", "RM: 2 members: S2, S3")
         for replica in ("S2", "S3"):
             self.assertNotIn("RM confirmed readiness", self.output(replica))
-        self.start("S1", "distributed_system.server.server", "--id", "S1", "--bootstrap",
+        self.start("S1", "distributed_system.server.server", "--id", "S1",
                    "--checkpoint-freq", "10")
         for replica in ("S1", "S2", "S3"):
             self.wait_for(replica, "RM confirmed readiness")
