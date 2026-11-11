@@ -903,6 +903,8 @@ class Server:
 
     def _handle_socket_event(self, sock: socket.socket, kind: str, events: int) -> None:
         """Read/flush one peer and isolate channel failures from the server loop."""
+        if sock not in self._connections:
+            return  # closed earlier in this batch (e.g. by a promotion)
         try:
             if events & selectors.EVENT_READ:
                 self._read_messages(sock, kind)
