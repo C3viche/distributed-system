@@ -32,6 +32,21 @@ class ServerElectionTests(unittest.TestCase):
             server._close_sock(sock, "promotion closed it")
             server._handle_socket_event(sock, "primary", selectors.EVENT_READ)
 
+    def test_backup_closes_channel_from_unrecognized_primary(self) -> None:
+        # a just-promoted S3 can dial S2 before S2 hears about it; S3 must see the close and redial
+        import socket
+
+        server = self.make_server("S2")  # still thinks S1 is primary
+        sock, peer = socket.socketpair()
+        self.addCleanup(peer.close)
+        server._register(sock, "client")
+        peer.sendall(b'{"type": "register_primary", "replica_id": "S3"}\n')
+        with patch("distributed_system.server.server.log"):
+            server._read_messages(sock, "client")
+        self.assertNotIn(sock, server._connections)
+        peer.settimeout(1)
+        self.assertEqual(peer.recv(1), b"")
+
     def test_backup_promotes_when_it_becomes_first_member(self) -> None:
         server = self.make_server("S2")
         self.assertEqual(server.role, "backup")
