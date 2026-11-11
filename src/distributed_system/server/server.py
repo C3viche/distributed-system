@@ -1004,11 +1004,15 @@ class Server:
             elif self.role == "backup" and msg.get("type") == "register_primary":
                 sender = msg.get("replica_id")
                 if sender != self.primary_id:
-                    log(
-                        f"{self.replica_id} (backup): ignoring register_primary from {sender}",
+                    # close instead of ignoring: the new primary would otherwise wait on this
+                    # channel's acks forever. it redials, and by then we know who's primary.
+                    self._close_sock(
+                        sock,
+                        f"{self.replica_id} (backup): rejected register_primary from {sender} "
+                        f"(primary is {self.primary_id}); it will retry",
                         kind="info",
                     )
-                    continue
+                    break
                 # this accepted socket is the primary. later messages on it are checkpoints,
                 # including one that arrived in this same read.
                 self._relabel_socket(sock, "primary")
