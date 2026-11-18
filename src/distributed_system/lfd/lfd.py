@@ -1,16 +1,32 @@
-"""M2 LFD: monitor one replica and report membership to the GFD.
+"""LFD: monitor one replica, report membership to the GFD, and relaunch it.
 
 Run: uv run lfd --id LFD2 --heartbeat-freq 2
 Frequency is in Hz. Server and GFD traffic share one nonblocking event loop.
+
+Auto-recovery (M5): the RM asks for a dead replica to come back with
+relaunch_replica, which reaches this LFD through the GFD. The LFD is the only
+component on the replica's laptop, so it does the restart itself: kill any
+leftover copy (using the pid from the server's registration, which also covers
+a frozen server), then open a new Terminal window running the same
+`uv run server --id Sx` the operator types today. The new server registers and
+joins through the normal M4 path. If the server cannot be started, the LFD
+sends relaunch_failed back to the GFD.
 """
 
 import argparse
 import errno
 import itertools
 import math
+import os
 import selectors
+import shlex
+import shutil
+import signal
 import socket
+import subprocess
+import sys
 import time
+from collections.abc import Callable
 from typing import cast
 
 from distributed_system.common import (
@@ -22,6 +38,49 @@ from distributed_system.common import (
 from distributed_system.config import REPLICA_LFDS, get_address
 
 REPLICA_ASSIGNMENTS = {lfd: replica for replica, lfd in REPLICA_LFDS.items()}
+
+# {replica_id} is substituted; this is the command typed by hand in M1-M4.
+DEFAULT_SERVER_COMMAND = "uv run server --id {replica_id}"
+# Ignore repeat relaunch requests this soon after starting one. The RM retries
+# after about 10s, so a slow-starting server is not launched twice.
+RELAUNCH_COOLDOWN = 5.0
+# How often to check whether the terminal launcher itself has failed.
+LAUNCH_POLL_INTERVAL = 0.2
+
+# (shell command, working directory) -> the process that opened the window.
+Launcher = Callable[[str, str], "subprocess.Popen[bytes]"]
+
+
+def open_terminal_window(command: str, workdir: str) -> "subprocess.Popen[bytes]":
+    """Run command in a new visible terminal window without blocking the LFD.
+
+    macOS opens Terminal.app via osascript. Elsewhere gnome-terminal is used
+    when present, otherwise the command runs detached (no visible window).
+    """
+    shell_line = f"cd {shlex.quote(workdir)} && {command}"
+    if sys.platform == "darwin":
+        escaped = shell_line.replace("\\", "\\\\").replace('"', '\\"')
+        return subprocess.Popen(
+            [
+                "osascript",
+                "-e", f'tell application "Terminal" to do script "{escaped}"',
+                "-e", 'tell application "Terminal" to activate',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    if shutil.which("gnome-terminal"):
+        return subprocess.Popen(
+            ["gnome-terminal", "--", "bash", "-lc", f"{shell_line}; exec bash"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    return subprocess.Popen(
+        ["bash", "-lc", shell_line],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
 
 
 def positive_number(value: str) -> float:
@@ -86,6 +145,10 @@ class LocalFaultDetector:
         replica_id: str | None = None,
         frequency: float = 1.0,
         timeout: float = 2.0,
+        server_command: str = DEFAULT_SERVER_COMMAND,
+        workdir: str | None = None,
+        launcher: Launcher = open_terminal_window,
+        relaunch_cooldown: float = RELAUNCH_COOLDOWN,
     ) -> None:
         self.lfd_id: str = lfd_id
         self.replica_id: str = REPLICA_ASSIGNMENTS[lfd_id] if replica_id is None else replica_id
@@ -103,6 +166,15 @@ class LocalFaultDetector:
         self._server: ServerSession | None = None
         self._absent_notice_at: float | None = None
         self._gfd: GFDSession = GFDSession(get_address("GFD"))
+        # Relaunch state. The pid outlives the server's session on purpose: a
+        # frozen server is dropped by heartbeat timeout but is still running.
+        self._server_command: str = server_command
+        self._workdir: str = workdir if workdir is not None else os.getcwd()
+        self._launcher: Launcher = launcher
+        self._relaunch_cooldown: float = relaunch_cooldown
+        self._server_pid: int | None = None
+        self._relaunch_at: float | None = None
+        self._relaunch_proc: subprocess.Popen[bytes] | None = None
 
     def _membership_changed(self, added: bool) -> None:
         """Queue a membership transition if the GFD connection is ready."""
@@ -155,8 +227,86 @@ class LocalFaultDetector:
         if self._server is not None and self._server.healthy:
             self._membership_changed(added=True)
 
+    def _server_present(self) -> bool:
+        """True if any server connection exists, even one still registering."""
+        return any(isinstance(session, ServerSession) for session in self._connections.values())
+
+    def _kill_leftover(self) -> None:
+        """Make sure the previous server process is gone before starting another.
+
+        SIGKILL also ends a process stopped with SIGSTOP, and frees its port.
+        A missing pid (older server, or never registered) is not an error.
+        """
+        pid, self._server_pid = self._server_pid, None
+        if pid is None or pid <= 1 or pid == os.getpid():
+            return
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return  # already dead
+        except OSError as exc:
+            log(f"{self.lfd_id}: could not kill leftover {self.replica_id} (pid {pid}): {exc}", kind="failure")
+            return
+        log(f"{self.lfd_id}: killed leftover {self.replica_id} (pid {pid})", kind="failure")
+
+    def _relaunch_failed(self, reason: str) -> None:
+        """Tell the RM (through the GFD) that this attempt could not start a server."""
+        self._relaunch_at = None  # the RM decides whether to try again
+        log(f"{self.lfd_id}: relaunch of {self.replica_id} failed: {reason}", kind="failure")
+        if self._gfd.sock is None or self._gfd.connecting:
+            return
+        self._queue(self._gfd.sock, {
+            "type": "relaunch_failed", "replica_id": self.replica_id, "reason": reason,
+        })
+
+    def _handle_relaunch(self, message: dict[str, object]) -> None:
+        """Restart the monitored server if it is really gone.
+
+        Ignored when the replica is already up, or a relaunch just started, so a
+        duplicate or late request from the RM never produces two servers.
+        """
+        attempt = message.get("attempt")
+        if message.get("replica_id") != self.replica_id or type(attempt) is not int or attempt < 1:
+            log(f"{self.lfd_id}: ignoring invalid relaunch_replica {message}", kind="failure")
+            return
+        now = time.monotonic()
+        if self._server_present():
+            log(f"{self.lfd_id}: ignoring relaunch_replica {self.replica_id} "
+                f"(attempt {attempt}): {self.replica_id} is already up", kind="info")
+            return
+        if self._relaunch_at is not None and now - self._relaunch_at < self._relaunch_cooldown:
+            log(f"{self.lfd_id}: ignoring relaunch_replica {self.replica_id} "
+                f"(attempt {attempt}): relaunch already in progress", kind="info")
+            return
+        self._relaunch_at = now
+        self._kill_leftover()
+        command = self._server_command.replace("{replica_id}", self.replica_id)
+        log(f"{self.lfd_id}: relaunching {self.replica_id}", kind="registration")
+        try:
+            self._relaunch_proc = self._launcher(command, self._workdir)
+        except OSError as exc:
+            self._relaunch_proc = None
+            self._relaunch_failed(f"could not start '{command}': {exc}")
+
+    def _poll_relaunch(self) -> None:
+        """Report a terminal launcher that exited with an error (non-blocking)."""
+        proc = self._relaunch_proc
+        if proc is None:
+            return
+        code = proc.poll()
+        if code is None:
+            return
+        self._relaunch_proc = None
+        if code == 0:
+            return
+        detail = proc.stderr.read().decode(errors="replace").strip() if proc.stderr else ""
+        self._relaunch_failed(f"launcher exited with status {code}: {detail}"[:200])
+
     def _handle_gfd(self, message: dict[str, object]) -> None:
-        """Validate and answer a heartbeat on the GFD channel."""
+        """Answer a GFD heartbeat or act on a relaunch request."""
+        if message.get("type") == "relaunch_replica":
+            self._handle_relaunch(message)
+            return
         count = message.get("count")
         if (message.get("type") != "heartbeat" or message.get("from") != "GFD"
             or message.get("to") != self.lfd_id or type(count) is not int or count < 1):
@@ -217,6 +367,9 @@ class LocalFaultDetector:
             session.registration_deadline = None
             self._server = session
             session.next_heartbeat = time.monotonic()
+            pid = message.get("pid")
+            self._server_pid = pid if type(pid) is int and pid > 1 else None
+            self._relaunch_at = None  # a server is up; the next death may relaunch at once
             log(f"{self.replica_id} registered with {self.lfd_id}", kind="registration")
             return
 
@@ -241,6 +394,7 @@ class LocalFaultDetector:
 
     def _tick(self, now: float) -> None:
         """Service connection deadlines and schedule server heartbeats."""
+        self._poll_relaunch()
         if self._gfd.sock is None and now >= self._gfd.retry_at:
             self._connect_gfd(now)
         elif (self._gfd.sock is not None and self._gfd.connect_deadline is not None
@@ -281,6 +435,8 @@ class LocalFaultDetector:
         deadlines.append(self._gfd.next_deadline())
         if self._server is None:
             deadlines.append(self._absent_notice_at)
+        if self._relaunch_proc is not None:
+            deadlines.append(time.monotonic() + LAUNCH_POLL_INTERVAL)
         pending = [deadline for deadline in deadlines if deadline is not None]
         return max(0.0, min(pending) - time.monotonic()) if pending else None
 
@@ -354,6 +510,15 @@ def main() -> None:
         default=1.0, help="heartbeats per second (Hz)",
     )
     _ = parser.add_argument("--timeout", type=positive_number, default=2.0, help="ACK/registration timeout in seconds")
+    _ = parser.add_argument(
+        "--server-command", default=DEFAULT_SERVER_COMMAND,
+        help="command run in a new terminal window to relaunch the server; "
+             "{replica_id} is substituted (default: %(default)s)",
+    )
+    _ = parser.add_argument(
+        "--workdir", default=None,
+        help="directory to run the relaunch command in (default: current directory)",
+    )
     args = parser.parse_args()
     lfd_id = cast(str, args.id)
     replica_id = cast(str | None, args.replica_id)
@@ -363,6 +528,8 @@ def main() -> None:
     detector = LocalFaultDetector(
         lfd_id=cast(str, args.id), replica_id=cast(str | None, args.replica_id),
         frequency=cast(float, args.frequency), timeout=cast(float, args.timeout),
+        server_command=cast(str, args.server_command),
+        workdir=cast(str | None, args.workdir),
     )
     try:
         detector.run()
