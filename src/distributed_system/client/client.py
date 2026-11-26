@@ -45,6 +45,8 @@ class Client:
         self.payload_template: str = payload_template
         self.request_num: int = 1
         self._holding: bool = False
+        self._last_reply_at: float | None = None
+        self._longest_reply_gap: float | None = None
         # passive replies wait for a checkpoint ack, so give them one checkpoint period plus slack
         reply_timeout = 1.0 + 1.0 / CHECKPOINT_FREQ if replication_mode == "passive" else 1.0
         self.conns: ReplicaConnections = ReplicaConnections(
@@ -67,6 +69,11 @@ class Client:
         except KeyboardInterrupt:
             log(f"{self.client_id} shutting down", kind="info")
         finally:
+            if self._longest_reply_gap is None:
+                gap = "unavailable (fewer than two replies)"
+            else:
+                gap = f"{self._longest_reply_gap:.3f} s"
+            log(f"{self.client_id} longest reply gap: {gap}", kind="info")
             if self._gfd is not None:
                 self._gfd.sock.close()
             self.conns.close()
@@ -239,4 +246,12 @@ class Client:
             )
             return False
         self.request_num += 1
-        return reply is not None
+        if reply is None:
+            return False
+        now = time.monotonic()
+        if self._last_reply_at is not None:
+            self._longest_reply_gap = max(
+                self._longest_reply_gap or 0.0, now - self._last_reply_at
+            )
+        self._last_reply_at = now
+        return True
