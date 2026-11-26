@@ -3,13 +3,15 @@
 import json
 import os
 import re
-from pathlib import Path
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from itertools import groupby
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -155,6 +157,120 @@ class AdmissionIntegrationTests(unittest.TestCase):
     def assert_client_completed(self, client, count):
         numbers = re.findall(r"Received <" + client + r", S[123], (\d+), reply", self.output(client))
         self.assertEqual([int(number) for number in numbers], list(range(1, count + 1)))
+
+    def test_m5_active_fault_sequence(self):
+        self.run_m5_scenario("active", ("S2", "S2", "S3"))
+
+    def test_m5_passive_fault_sequence(self):
+        self.run_m5_scenario("passive", ("S3", "S3", "S2"))
+
+    @unittest.skipUnless(hasattr(signal, "SIGSTOP"), "requires POSIX SIGSTOP")
+    def test_m5_frozen_replica_is_replaced(self):
+        self.run_m5_scenario("active", ("S2",), freeze=True)
+
+    def run_m5_scenario(self, mode, faults, *, freeze=False):
+        primary = "S3" if mode == "passive" else "S1"
+        replica_ids = ("S1", "S2", "S3")
+        self.env.update(REPLICATION_MODE=mode, PRIMARY_ID=primary, CHECKPOINT_FREQ="20")
+
+        # A1/P1: bring up the fault detectors before launching any replicas.
+        self.start("RM", "distributed_system.rm.rm")
+        self.wait_for("RM", "RM listening")
+        self.start("GFD", "distributed_system.gfd.gfd", "--heartbeat-freq", "10", "--timeout", "1")
+        self.wait_for("RM", "GFD registered")
+        for index in range(1, 4):
+            lfd = f"LFD{index}"
+            self.start(lfd, "distributed_system.lfd.lfd", "--id", lfd,
+                       "--heartbeat-freq", "10", "--timeout", "0.5")
+            self.wait_for("GFD", f"{lfd} registered with GFD")
+        self.assertNotIn("synchronized and ready", self.output("RM"))
+
+        # A2/P2: get three ready replicas, including the configured passive primary.
+        replicas = {}
+        for replica in (primary, *(name for name in replica_ids if name != primary)):
+            replicas[replica] = self.start(replica, "distributed_system.server.server", "--id", replica)
+            self.wait_for(replica, "RM confirmed readiness")
+        if mode == "passive":
+            self.wait_for("GFD", f"GFD: primary is {primary}")
+
+        # A3/P3: keep the same three client processes alive throughout the faults.
+        request_count = 100
+        clients = {
+            client: self.start(client, "distributed_system.client", "--id", client,
+                               "--interval", "0.06", "--count", str(request_count))
+            for client in ("C1", "C2", "C3")
+        }
+        for client in clients:
+            for replica in replicas:
+                self.wait_for(client, f"connected to {replica} at")
+            self.wait_for(client, "Received <", count=5)
+
+        # A4–A7/P4–P7: first failure/recovery, same replica again, then a different one.
+        generations = dict.fromkeys(replicas, 1)
+        for phase, replica in enumerate(faults, start=1):
+            with self.subTest(fault=phase, replica=replica):
+                generation = generations[replica]
+                victim = replicas[replica]
+                losses = self.output("RM").count("RM: 2 members:")
+                if freeze:
+                    victim.send_signal(signal.SIGSTOP)
+                else:
+                    victim.kill()
+                    self.assertEqual(victim.wait(timeout=3), -signal.SIGKILL)
+                self.wait_for(f"LFD{replica[1:]}", f"{replica} has died", count=generation)
+                self.wait_for("RM", "RM: 2 members:", count=losses + 1)
+                if freeze:
+                    self.assertIsNone(victim.poll(), "LFD must detect a live but frozen process")
+                self.wait_for_client_progress(clients)
+
+                connected = f"connected to {replica} at"
+                connections = {client: self.output(client).count(connected) for client in clients}
+                replicas[replica] = self.relaunch_for_m5_test(replica, victim)
+                generations[replica] += 1
+                self.wait_for(replica, "RM confirmed readiness", count=generations[replica])
+                for client in clients:
+                    self.wait_for(client, connected, count=connections[client] + 1)
+                self.wait_for_client_progress(clients)
+
+        for client, process in clients.items():
+            self.assertEqual(process.wait(timeout=20), 0, self.output(client))
+            self.assert_client_completed(client, request_count)
+            output = self.output(client)
+            gap = re.search(r"longest reply gap: (\d+\.\d+) s", output)
+            self.assertIsNotNone(gap, output)
+            # Allow heartbeat and failover detection plus scheduling slack on localhost.
+            limit = 2.5 if mode == "passive" else 1.5
+            self.assertLess(float(gap[1]), limit, f"{client} longest reply gap was {gap[1]} s")
+            if mode == "passive":
+                sources = re.findall(r"Received <" + client + r", (S[123]), \d+, reply", output)
+                self.assertEqual([replica for replica, _ in groupby(sources)], [primary, "S1"])
+
+        final_state = request_count * len(clients)
+        for replica in replicas:
+            if mode == "passive" and replica != "S1":
+                self.wait_for(replica, f" -> {final_state}")
+                states = re.findall(r"my_state = \d+ -> (\d+)", self.output(replica))
+            else:
+                self.wait_for(replica, f"my_state = {final_state} after processing")
+                states = re.findall(r"my_state = (\d+) after processing", self.output(replica))
+            self.assertEqual(int(states[-1]), final_state, f"final state on {replica}")
+        if mode == "passive":
+            self.assertEqual(re.findall(r"GFD: primary is (S[123])", self.output("GFD")), [primary, "S1"])
+            for replica in replicas:
+                self.assertEqual(self.output(replica).count("promoted to primary"), int(replica == "S1"))
+
+    def wait_for_client_progress(self, clients):
+        counts = {client: self.output(client).count("Received <") for client in clients}
+        for client, process in clients.items():
+            self.wait_for(client, "Received <", count=counts[client] + 2)
+            self.assertIsNone(process.poll(), f"{client} exited during fault injection")
+
+    def relaunch_for_m5_test(self, replica, victim):
+        """Stand in for RM-driven relaunch while that feature is in development."""
+        if victim.poll() is None:
+            victim.kill()
+            self.assertEqual(victim.wait(timeout=3), -signal.SIGKILL)
+        return self.start(replica, "distributed_system.server.server", "--id", replica)
 
     def test_active_recovery_with_three_clients_under_live_traffic(self):
         self.active_recovery_with_live_traffic("S2")
