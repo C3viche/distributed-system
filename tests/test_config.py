@@ -68,6 +68,24 @@ class ConfigTests(unittest.TestCase):
             ):
                 _ = self.read_config({"CHECKPOINT_FREQ": frequency})
 
+    def test_relaunch_defaults_and_overrides(self) -> None:
+        config = self.read_config({})
+        self.assertEqual(config["SERVER_COMMAND"], "uv run server --id {replica_id}")
+        self.assertEqual(config["RELAUNCH_COOLDOWN"], 5.0)
+        config = self.read_config(
+            {"SERVER_COMMAND": "uv run server --id {replica_id} --x", "RELAUNCH_COOLDOWN": "2.5"}
+        )
+        self.assertEqual(config["SERVER_COMMAND"], "uv run server --id {replica_id} --x")
+        self.assertEqual(config["RELAUNCH_COOLDOWN"], 2.5)
+
+    def test_invalid_relaunch_cooldown(self) -> None:
+        for cooldown in ("", "abc", "0", "-1", "nan", "inf"):
+            with (
+                self.subTest(cooldown=cooldown),
+                self.assertRaisesRegex(ValueError, "RELAUNCH_COOLDOWN must be"),
+            ):
+                _ = self.read_config({"RELAUNCH_COOLDOWN": cooldown})
+
     def test_dotenv_values_and_environment_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             dotenv_path = Path(directory) / ".env"

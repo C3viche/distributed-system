@@ -4,6 +4,7 @@ Public API:
     REPLICATION_MODE: active or passive (default active)
     PRIMARY_ID: configured primary replica (default S1)
     CHECKPOINT_FREQ: checkpoints per second (default 1 Hz)
+    SERVER_COMMAND / RELAUNCH_COOLDOWN / LAUNCH_POLL_INTERVAL: LFD auto-relaunch
     get_address(process_id) -> (host, port)
     resolve_address(process_id, host_override, port_override) -> (host, port)
 """
@@ -59,6 +60,21 @@ except ValueError as exc:
     raise ValueError("CHECKPOINT_FREQ must be a finite, positive number in Hz") from exc
 if not math.isfinite(CHECKPOINT_FREQ) or CHECKPOINT_FREQ <= 0:
     raise ValueError("CHECKPOINT_FREQ must be a finite, positive number in Hz")
+
+# Auto-recovery: how the LFD restarts a dead server. {replica_id} is substituted.
+SERVER_COMMAND = os.getenv("SERVER_COMMAND", "uv run server --id {replica_id}")
+
+try:
+    # Ignore repeat relaunch requests this soon after starting one. The RM
+    # retries after about 10s, so a slow-starting server is not launched twice.
+    RELAUNCH_COOLDOWN = float(os.getenv("RELAUNCH_COOLDOWN", "5"))
+except ValueError as exc:
+    raise ValueError("RELAUNCH_COOLDOWN must be a finite, positive number of seconds") from exc
+if not math.isfinite(RELAUNCH_COOLDOWN) or RELAUNCH_COOLDOWN <= 0:
+    raise ValueError("RELAUNCH_COOLDOWN must be a finite, positive number of seconds")
+
+# How often the LFD checks whether the terminal launcher itself has failed.
+LAUNCH_POLL_INTERVAL = 0.2
 
 LFDS: dict[str, dict[str, str | int]] = {
     "LFD1": {
