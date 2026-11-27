@@ -35,17 +35,19 @@ from distributed_system.common import (
     log,
     set_process_id,
 )
-from distributed_system.config import REPLICA_LFDS, get_address
+from distributed_system.config import (
+    LAUNCH_POLL_INTERVAL,
+    RELAUNCH_COOLDOWN,
+    REPLICA_LFDS,
+    SERVER_COMMAND,
+    get_address,
+)
 
 REPLICA_ASSIGNMENTS = {lfd: replica for replica, lfd in REPLICA_LFDS.items()}
 
-# {replica_id} is substituted; this is the command typed by hand in M1-M4.
-DEFAULT_SERVER_COMMAND = "uv run server --id {replica_id}"
-# Ignore repeat relaunch requests this soon after starting one. The RM retries
-# after about 10s, so a slow-starting server is not launched twice.
-RELAUNCH_COOLDOWN = 5.0
-# How often to check whether the terminal launcher itself has failed.
-LAUNCH_POLL_INTERVAL = 0.2
+# SIGKILL also ends a SIGSTOPped process. Windows has no SIGKILL, but os.kill
+# with SIGTERM calls TerminateProcess there, which is equally unconditional.
+KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 # (shell command, working directory) -> the process that opened the window.
 Launcher = Callable[[str, str], "subprocess.Popen[bytes]"]
@@ -54,9 +56,18 @@ Launcher = Callable[[str, str], "subprocess.Popen[bytes]"]
 def open_terminal_window(command: str, workdir: str) -> "subprocess.Popen[bytes]":
     """Run command in a new visible terminal window without blocking the LFD.
 
-    macOS opens Terminal.app via osascript. Elsewhere gnome-terminal is used
-    when present, otherwise the command runs detached (no visible window).
+    macOS opens Terminal.app via osascript. Windows opens a new console with
+    cmd. Elsewhere gnome-terminal is used when present, otherwise the command
+    runs detached (no visible window). The Windows path is untested.
     """
+    if sys.platform == "win32":
+        # A string, not a list, so cmd sees the command unquoted. No pipes:
+        # redirecting stdio would stop the new console from showing output.
+        return subprocess.Popen(
+            f"cmd /k {command}",
+            cwd=workdir,
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        )
     shell_line = f"cd {shlex.quote(workdir)} && {command}"
     if sys.platform == "darwin":
         escaped = shell_line.replace("\\", "\\\\").replace('"', '\\"')
@@ -145,7 +156,7 @@ class LocalFaultDetector:
         replica_id: str | None = None,
         frequency: float = 1.0,
         timeout: float = 2.0,
-        server_command: str = DEFAULT_SERVER_COMMAND,
+        server_command: str = SERVER_COMMAND,
         workdir: str | None = None,
         launcher: Launcher = open_terminal_window,
         relaunch_cooldown: float = RELAUNCH_COOLDOWN,
@@ -234,14 +245,14 @@ class LocalFaultDetector:
     def _kill_leftover(self) -> None:
         """Make sure the previous server process is gone before starting another.
 
-        SIGKILL also ends a process stopped with SIGSTOP, and frees its port.
+        KILL_SIGNAL ends even a process stopped with SIGSTOP, and frees its port.
         A missing pid (older server, or never registered) is not an error.
         """
         pid, self._server_pid = self._server_pid, None
         if pid is None or pid <= 1 or pid == os.getpid():
             return
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, KILL_SIGNAL)
         except ProcessLookupError:
             return  # already dead
         except OSError as exc:
@@ -511,7 +522,7 @@ def main() -> None:
     )
     _ = parser.add_argument("--timeout", type=positive_number, default=2.0, help="ACK/registration timeout in seconds")
     _ = parser.add_argument(
-        "--server-command", default=DEFAULT_SERVER_COMMAND,
+        "--server-command", default=SERVER_COMMAND,
         help="command run in a new terminal window to relaunch the server; "
              "{replica_id} is substituted (default: %(default)s)",
     )

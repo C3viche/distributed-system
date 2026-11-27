@@ -14,7 +14,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from distributed_system.common import BufferedJsonConnection, recv_json
+from distributed_system.config import RELAUNCH_COOLDOWN, SERVER_COMMAND
 from distributed_system.lfd.lfd import (
+    KILL_SIGNAL,
     LocalFaultDetector,
     ServerSession,
     open_terminal_window,
@@ -87,7 +89,7 @@ class LFDRelaunchTests(unittest.TestCase):
         lfd._drop(server)
         with patch("distributed_system.lfd.lfd.os.kill") as kill:
             lfd._handle_gfd(relaunch())
-        kill.assert_called_once_with(4242, signal.SIGKILL)
+        kill.assert_called_once_with(4242, KILL_SIGNAL)
         self.launcher.assert_called_once_with("uv run server --id S2", "/repo")
         self.assertIsNone(lfd._server_pid)
 
@@ -146,7 +148,7 @@ class LFDRelaunchTests(unittest.TestCase):
         lfd._drop(server)
         with patch("distributed_system.lfd.lfd.os.kill") as kill:
             lfd._handle_gfd(relaunch())
-        kill.assert_called_once_with(5000, signal.SIGKILL)
+        kill.assert_called_once_with(5000, KILL_SIGNAL)
         self.assertEqual(self.launcher.call_count, 2)
 
     def test_invalid_requests_are_ignored_and_keep_gfd_connection(self) -> None:
@@ -231,6 +233,7 @@ class LFDRelaunchTests(unittest.TestCase):
             "uv run server --id S2 --checkpoint-freq 2", "/repo"
         )
 
+    @unittest.skipUnless(hasattr(signal, "SIGSTOP"), "needs POSIX job-control signals")
     def test_frozen_server_is_killed_and_replaced(self) -> None:
         """A SIGSTOPped server never answers heartbeats but is still running."""
         frozen = subprocess.Popen(["sleep", "60"])
@@ -240,8 +243,16 @@ class LFDRelaunchTests(unittest.TestCase):
         server = self.register_server(lfd, pid=frozen.pid)
         lfd._drop(server)  # heartbeat timeout drops it
         lfd._handle_gfd(relaunch())
-        self.assertEqual(frozen.wait(timeout=5), -signal.SIGKILL)
+        self.assertEqual(frozen.wait(timeout=5), -KILL_SIGNAL)
         self.launcher.assert_called_once_with("uv run server --id S2", "/repo")
+
+
+class ConfigDefaultsTests(unittest.TestCase):
+    def test_lfd_uses_config_values_by_default(self) -> None:
+        lfd = LocalFaultDetector("LFD2")
+        self.addCleanup(lfd._selector.close)
+        self.assertEqual(lfd._server_command, SERVER_COMMAND)
+        self.assertEqual(lfd._relaunch_cooldown, RELAUNCH_COOLDOWN)
 
 
 class OpenTerminalWindowTests(unittest.TestCase):
@@ -257,6 +268,16 @@ class OpenTerminalWindowTests(unittest.TestCase):
         self.assertIn('tell application "Terminal" to do script', script)
         self.assertIn("uv run server --id S2", script)
         self.assertIn('\\"quote\\"', script)
+
+    def test_windows_opens_a_new_console_in_the_workdir(self) -> None:
+        with (
+            patch("distributed_system.lfd.lfd.sys.platform", "win32"),
+            patch("distributed_system.lfd.lfd.subprocess.Popen") as popen,
+        ):
+            _ = open_terminal_window("uv run server --id S2", "C:\\repo")
+        self.assertEqual(popen.call_args.args[0], "cmd /k uv run server --id S2")
+        self.assertEqual(popen.call_args.kwargs["cwd"], "C:\\repo")
+        self.assertNotIn("stderr", popen.call_args.kwargs)
 
     def test_fallback_runs_detached_without_a_terminal(self) -> None:
         with (
