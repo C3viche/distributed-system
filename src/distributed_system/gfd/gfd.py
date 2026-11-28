@@ -278,6 +278,8 @@ class GlobalFaultDetector:
             self._handle_delete(session, msg)
         elif kind == "heartbeat_ack":
             self._handle_ack(session, msg)
+        elif kind == "relaunch_failed":
+            self._forward_relaunch_failed(session, msg)
         else:
             log(f"GFD ignored unexpected message type: {kind}", kind="info")
 
@@ -424,8 +426,14 @@ class GlobalFaultDetector:
         if messages is None:
             self._drop_rm("GFD lost RM connection")
             return
-        for message in messages:
-            if not isinstance(message, dict) or message.get("type") != "primary_update":
+        for raw_message in messages:
+            if not isinstance(raw_message, dict):
+                raise ValueError("Invalid RM primary update")
+            message = cast(dict[str, object], raw_message)
+            if message.get("type") == "relaunch_replica":
+                self._forward_relaunch(message)
+                continue
+            if message.get("type") != "primary_update":
                 raise ValueError("Invalid RM primary update")
             primary = message.get("primary_id")
             if primary is not None and primary not in self.membership:
@@ -434,6 +442,50 @@ class GlobalFaultDetector:
                 self.primary_id = primary
                 log(f"GFD: primary is {primary}", kind="membership")
                 self._publish_membership()
+
+    def _forward_relaunch(self, message: dict[str, object]) -> None:
+        """Pass an RM relaunch to that replica's LFD, or report that the LFD is down."""
+        replica_id = message.get("replica_id")
+        lfd_id = REPLICA_LFDS.get(replica_id) if isinstance(replica_id, str) else None
+        if lfd_id is None:
+            return
+        session = next(
+            (peer for peer in self._sessions.values() if peer.lfd_id == lfd_id),
+            None,
+        )
+        if session is None:
+            reason = f"{lfd_id} is not connected"
+            log(f"GFD: relaunch_failed {replica_id}: {reason}", kind="failure")
+            self._queue_rm({
+                "type": "relaunch_failed",
+                "replica_id": replica_id,
+                "reason": reason,
+            })
+            return
+        log(
+            f"GFD forwards relaunch_replica for {replica_id} to {lfd_id} (attempt {message.get('attempt')})",
+            kind="info",
+        )
+        try:
+            self._send_json(session, message)
+        except (OSError, KeyError, ValueError):
+            reason = f"{lfd_id} is not connected"
+            log(f"GFD: relaunch_failed {replica_id}: {reason}", kind="failure")
+            self._queue_rm({
+                "type": "relaunch_failed",
+                "replica_id": replica_id,
+                "reason": reason,
+            })
+
+    def _forward_relaunch_failed(self, session: PeerSession, message: dict[str, object]) -> None:
+        """Pass an LFD relaunch failure back to the RM unchanged."""
+        if session.lfd_id is None:
+            return
+        log(
+            f"{session.lfd_id}: relaunch_failed {message.get('replica_id')}: {message.get('reason')}",
+            kind="failure",
+        )
+        self._queue_rm(message)
 
     def _write_rm(self) -> None:
         if self._rm_conn is None or self._rm_sock is None:

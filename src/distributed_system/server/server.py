@@ -32,6 +32,7 @@ To Run:
 
 import argparse
 import math
+import os
 import selectors
 import socket
 import time
@@ -690,7 +691,13 @@ class Server:
         """Reply after connected passive backups have checkpointed the operation."""
         durable_state = self.state
         if self.role == "primary" and self._backups:
-            durable_state = min(self._checkpoint_acks.get(peer, -1) for peer in self._backups)
+            acked = [
+                self._checkpoint_acks[peer]
+                for peer in self._backups
+                if peer in self._checkpoint_acks
+            ]
+            if acked:
+                durable_state = min(acked)
         waiting = []
         for sock, reply in self._pending_replies:
             if sock not in self._connections:
@@ -748,7 +755,11 @@ class Server:
 
         self._lfd = s
         self._register(s, "lfd")
-        self._send_json(s, {"type": "registration", "replica_id": self.replica_id})
+        self._send_json(s, {
+            "type": "registration",
+            "replica_id": self.replica_id,
+            "pid": os.getpid(),
+        })
         log(f"{self.replica_id} registered with {self.lfd_id}", kind="registration")
 
     def try_connect_to_rm(self) -> None:
